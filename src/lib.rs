@@ -14,3 +14,4 @@ pub mod ecosystem;
 pub mod model;
 pub mod plugin;
 pub mod policy;
+pub mod scan;

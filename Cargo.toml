@@ -30,6 +30,13 @@ rand = "0.10.3"
 # unconstrained `cargo update` would otherwise silently re-bump uuid and
 # break the build. Remove this pin once the toolchain is bumped past 1.89.
 uuid = "=1.11.0"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+sha2 = "0.10"
+thiserror = "1"
+bytes = "1"
+futures-util = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util"] }
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"

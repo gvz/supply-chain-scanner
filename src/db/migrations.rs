@@ -33,6 +33,18 @@ pub const MIGRATIONS: &[&str] = &[
         UNIQUE(ecosystem, package, version, filename, sha256)
     )
     "#,
+    // 1: index_cache — the raw body of the last successfully fetched PEP
+    // 503 simple index page for a package, keyed by its normalized name.
+    // Populated on every successful upstream fetch (task 4's `Upstream`);
+    // read back only when upstream is unreachable, so a PyPI outage
+    // degrades to "serve what we already know" rather than an empty page.
+    r#"
+    CREATE TABLE index_cache (
+        package     TEXT PRIMARY KEY,
+        body        TEXT NOT NULL,
+        fetched_at  INTEGER NOT NULL
+    )
+    "#,
 ];
 
 /// Applies every migration in [`MIGRATIONS`] that hasn't already run

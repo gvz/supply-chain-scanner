@@ -44,6 +44,28 @@ use crate::model::{ArtifactKey, RefusalReason};
 /// also the ceiling task 11's own budget can use.
 const PLUGIN_DETAIL_MAX_BYTES: usize = 200;
 
+/// Code suffix for a plugin that could not be run at all (an unreadable
+/// binary, a sandbox that would not start, a task that did not complete).
+pub const CODE_SUFFIX_ERROR: &str = ":error";
+
+/// Code suffix for a plugin killed at its timeout without reaching a
+/// verdict.
+pub const CODE_SUFFIX_TIMEOUT: &str = ":timeout";
+
+/// Whether `reason` means "this check could not be performed" rather than
+/// "this check ran and the artifact failed it".
+///
+/// Both still refuse — nothing here ever fails open — but they must not
+/// look the same, and in particular a check that never ran must not be
+/// stored as a durable `Blocked` verdict: that would outlive the broken
+/// plugin and leave a developer reading "we found malware" about an
+/// artifact nothing ever examined. See
+/// [`crate::scan::Scanner::run_full_scan`], the only caller.
+pub fn is_check_failure(reason: &RefusalReason) -> bool {
+    reason.code.starts_with("plugin:")
+        && (reason.code.ends_with(CODE_SUFFIX_ERROR) || reason.code.ends_with(CODE_SUFFIX_TIMEOUT))
+}
+
 /// Runs the organization's configured plugin binaries over an unpacked
 /// artifact.
 pub struct PluginRunner {
@@ -124,7 +146,10 @@ impl PluginRunner {
 
         if outcome.timed_out {
             return Some(RefusalReason {
-                code: format!("plugin:{}:timeout", sanitize_detail(&plugin.name)),
+                code: format!(
+                    "plugin:{}{CODE_SUFFIX_TIMEOUT}",
+                    sanitize_detail(&plugin.name)
+                ),
                 detail: sanitize_detail(&format!(
                     "plugin {} exceeded its {:?} timeout",
                     plugin.name, plugin.timeout
@@ -151,7 +176,7 @@ impl PluginRunner {
 /// The refusal for a plugin that could not be run or could not finish.
 fn error_refusal(name: &str, cause: &str) -> RefusalReason {
     RefusalReason {
-        code: format!("plugin:{}:error", sanitize_detail(name)),
+        code: format!("plugin:{}{CODE_SUFFIX_ERROR}", sanitize_detail(name)),
         detail: sanitize_detail(&format!("plugin {name} could not run: {cause}")),
     }
 }

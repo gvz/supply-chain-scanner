@@ -886,10 +886,10 @@ async fn config_reload_signal_applies_a_new_allowlist_entry() {
 
     // Install the SIGHUP watcher, then rewrite the config file on disk
     // with a new allowlist entry, then signal this process.
-    let config_handle = std::sync::Arc::clone(&wired.state.config);
+    let reloader = std::sync::Arc::clone(&wired.reloader);
     let watcher_path = config_path.clone();
     tokio::spawn(async move {
-        let _ = watch_for_reload(config_handle, watcher_path).await;
+        let _ = watch_for_reload(reloader, watcher_path).await;
     });
     // Give the spawned task a chance to actually run and register the
     // SIGHUP handler (via `tokio::signal::unix::signal`) before this

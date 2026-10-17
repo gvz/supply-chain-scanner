@@ -62,9 +62,21 @@ async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
     spawn_advisory_sync_ticker(db_path.clone(), advisory_source_url, advisory_sync_interval);
     spawn_cache_eviction_ticker(db_path, cache_dir, cache_ttl);
 
-    let config_handle = Arc::clone(&wired.state.config);
+    // Say up front which fields a later SIGHUP can and cannot change, so
+    // an operator learns it from the log rather than from a reload that
+    // appeared to succeed.
+    tracing::info!(
+        reloadable = "cve, plugins, allowlist, public_url, scan_budget",
+        restart_only = "bind, db_path, cache_dir, upstream_url, advisory_source_url, \
+                        advisory_sync_interval, cache_ttl",
+        "SIGHUP reloads the fields under `reloadable` (rebuilding the policy, the \
+         fingerprint and the plugin sandbox); a SIGHUP whose file changes any field \
+         under `restart_only` is rejected in full and names the field"
+    );
+
+    let reloader = Arc::clone(&wired.reloader);
     tokio::spawn(async move {
-        if let Err(err) = watch_for_reload(config_handle, config_path).await {
+        if let Err(err) = watch_for_reload(reloader, config_path).await {
             tracing::error!(error = %err, "SIGHUP reload handler exited");
         }
     });

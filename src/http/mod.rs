@@ -132,6 +132,11 @@ pub struct Wired {
     pub router: Router,
     pub state: AppState,
     pub db: Db,
+    /// Applies a `SIGHUP` reload to this already-running wiring; hand it
+    /// to [`watch_for_reload`]. Built here rather than in `main` because
+    /// it has to capture the exact [`Config`] this process booted under
+    /// (see [`RESTART_ONLY_FIELDS`]).
+    pub reloader: Arc<Reloader>,
 }
 
 /// The fail-closed startup sequence, in order: open the database
@@ -157,13 +162,8 @@ pub async fn bootstrap(config: Config) -> anyhow::Result<Wired> {
     let policy = Policy::build(Arc::clone(&config))
         .context("building policy (a configured plugin binary may be missing or unreadable)")?;
 
-    let sandbox: Arc<dyn SandboxRunner> = if config.plugins.is_empty() {
-        Arc::new(NeverCalledSandbox)
-    } else {
-        Arc::new(BubblewrapSandbox::detect().context(
-            "detecting the bubblewrap sandbox (required because plugins are configured)",
-        )?)
-    };
+    let sandbox_factory = default_sandbox_factory();
+    let sandbox = sandbox_factory(&config)?;
     let plugin_runner = PluginRunner::new(sandbox);
 
     let index_cache = IndexCache::new(db.clone());
@@ -215,13 +215,25 @@ pub async fn bootstrap(config: Config) -> anyhow::Result<Wired> {
     let state = AppState {
         scanner: Arc::new(scanner),
         verdicts: Arc::new(VerdictStore::new(db.clone())),
-        config: config_handle,
+        config: Arc::clone(&config_handle),
         ecosystem: pypi,
     };
 
+    let reloader = Arc::new(Reloader::with_sandbox_factory(
+        config_handle,
+        Arc::clone(&state.scanner),
+        &config,
+        sandbox_factory,
+    ));
+
     let router = router(state.clone(), ecosystem_upstream);
 
-    Ok(Wired { router, state, db })
+    Ok(Wired {
+        router,
+        state,
+        db,
+        reloader,
+    })
 }
 
 /// A [`SandboxRunner`] that must never actually be invoked: used only
@@ -238,32 +250,248 @@ impl SandboxRunner for NeverCalledSandbox {
     }
 }
 
-/// Loops forever, reloading `config_handle` from `config_path` on every
+// ---------------------------------------------------------------------------
+// Configuration reload
+// ---------------------------------------------------------------------------
+
+/// Builds the sandbox a configuration calls for. Injectable so a test can
+/// exercise a reload that adds a plugin without `bwrap` being involved;
+/// production always uses [`default_sandbox_factory`].
+pub type SandboxFactory =
+    Arc<dyn Fn(&Config) -> anyhow::Result<Arc<dyn SandboxRunner>> + Send + Sync>;
+
+/// The production sandbox: a real [`BubblewrapSandbox`] when plugins are
+/// configured (failing if `bwrap` is absent, so the proxy never runs
+/// fewer checks than the org asked for), and the panicking
+/// [`NeverCalledSandbox`] stub when the plugin list is empty and
+/// [`PluginRunner::run_all`]'s loop can therefore never reach it.
+pub fn default_sandbox_factory() -> SandboxFactory {
+    Arc::new(
+        |config: &Config| -> anyhow::Result<Arc<dyn SandboxRunner>> {
+            if config.plugins.is_empty() {
+                Ok(Arc::new(NeverCalledSandbox))
+            } else {
+                Ok(Arc::new(BubblewrapSandbox::detect().context(
+                    "detecting the bubblewrap sandbox (required because plugins are configured)",
+                )?))
+            }
+        },
+    )
+}
+
+/// Configuration fields that only take effect at process startup, with the
+/// reason each one is stuck there.
+///
+/// Every entry here is captured as a local in `main::run` or baked into
+/// something built once by [`bootstrap`]: `bind` into the bound listener,
+/// `db_path` into every open connection pool, `cache_dir` into the
+/// [`ArtifactCache`] root, `upstream_url` into both HTTP clients' base
+/// URLs, `advisory_source_url`/`advisory_sync_interval` into the sync
+/// ticker, and `cache_ttl` into the eviction ticker.
+///
+/// A reload that changes any of them is **rejected in full**. That is a
+/// deliberate choice over the alternative of applying the rest: applying
+/// part of a file while logging "configuration reloaded" is how an
+/// operator comes to believe a tightened CVE line is live when it is not.
+/// Rejecting, and naming the field, sends them to a restart instead.
+const RESTART_ONLY_FIELDS: &[&str] = &[
+    "bind",
+    "db_path",
+    "cache_dir",
+    "upstream_url",
+    "advisory_source_url",
+    "advisory_sync_interval",
+    "cache_ttl",
+];
+
+/// Configuration fields a reload genuinely applies, for the log line that
+/// says so.
+const RELOADABLE_FIELDS: &[&str] = &["cve", "plugins", "allowlist", "public_url", "scan_budget"];
+
+/// Which restart-only fields `candidate` changes relative to the values
+/// this process actually booted under.
+fn restart_only_changes(boot: &Config, candidate: &Config) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    if boot.bind != candidate.bind {
+        changed.push("bind");
+    }
+    if boot.db_path != candidate.db_path {
+        changed.push("db_path");
+    }
+    if boot.cache_dir != candidate.cache_dir {
+        changed.push("cache_dir");
+    }
+    if boot.upstream_url != candidate.upstream_url {
+        changed.push("upstream_url");
+    }
+    if boot.advisory_source_url != candidate.advisory_source_url {
+        changed.push("advisory_source_url");
+    }
+    if boot.advisory_sync_interval != candidate.advisory_sync_interval {
+        changed.push("advisory_sync_interval");
+    }
+    if boot.cache_ttl != candidate.cache_ttl {
+        changed.push("cache_ttl");
+    }
+    changed
+}
+
+/// What a successful [`Reloader::apply`] changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReloadSummary {
+    pub old_fingerprint: String,
+    pub new_fingerprint: String,
+    pub plugins: usize,
+    pub allowlist: usize,
+}
+
+impl ReloadSummary {
+    pub fn fingerprint_changed(&self) -> bool {
+        self.old_fingerprint != self.new_fingerprint
+    }
+}
+
+/// Applies a configuration file to a *running* proxy, as one atomic
+/// all-or-nothing step.
+///
+/// This exists because swapping the [`ConfigHandle`] alone is not a
+/// reload. The policy fingerprint and the CVE line are compiled into a
+/// [`Policy`], and the plugin list needs a [`SandboxRunner`] built for
+/// it, so a handle-only swap left the CVE line frozen while the plugin
+/// list went live — a reload that logged success and changed nothing for
+/// most of the file, with the fingerprint column no longer identifying
+/// the checks that produced a row.
+///
+/// `apply` therefore parses, validates, builds the new `Policy` and the
+/// new sandbox *first*, and only swaps anything in once all of that has
+/// succeeded. A failure anywhere — malformed TOML, a `scan_budget` over
+/// the ceiling, a plugin binary that cannot be read, no usable `bwrap`
+/// for a newly added plugin, a restart-only field that changed — returns
+/// `Err` with the previous configuration, policy and sandbox all still in
+/// force. That is [`Policy::build`]'s fail-closed contract extended
+/// across reload.
+pub struct Reloader {
+    config: Arc<ConfigHandle>,
+    scanner: Arc<Scanner>,
+    /// The values this process booted under, for [`restart_only_changes`].
+    boot: Config,
+    sandbox_factory: SandboxFactory,
+}
+
+impl Reloader {
+    /// The production constructor: [`default_sandbox_factory`].
+    pub fn new(config: Arc<ConfigHandle>, scanner: Arc<Scanner>, boot: &Config) -> Self {
+        Self::with_sandbox_factory(config, scanner, boot, default_sandbox_factory())
+    }
+
+    pub fn with_sandbox_factory(
+        config: Arc<ConfigHandle>,
+        scanner: Arc<Scanner>,
+        boot: &Config,
+        sandbox_factory: SandboxFactory,
+    ) -> Self {
+        Self {
+            config,
+            scanner,
+            boot: boot.clone(),
+            sandbox_factory,
+        }
+    }
+
+    /// Reads `path` and applies it, or returns `Err` having changed
+    /// nothing. See the type docs.
+    pub fn apply(&self, path: &std::path::Path) -> anyhow::Result<ReloadSummary> {
+        let candidate = Config::load(path)?;
+
+        let frozen = restart_only_changes(&self.boot, &candidate);
+        if !frozen.is_empty() {
+            anyhow::bail!(
+                "reload rejected: {} can only change at startup and this process \
+                 is already running under the previous value(s). Nothing was \
+                 applied — the whole reload was refused rather than applying the \
+                 rest and logging a success this proxy did not deliver. Restart \
+                 to pick these up.",
+                frozen.join(", ")
+            );
+        }
+
+        let candidate = Arc::new(candidate);
+        let policy = Policy::build(Arc::clone(&candidate)).context(
+            "building the policy for the reloaded configuration (a configured plugin \
+             binary may be missing or unreadable); keeping the previous policy",
+        )?;
+        let sandbox = (self.sandbox_factory)(&candidate).context(
+            "building the sandbox for the reloaded configuration; keeping the \
+             previous policy",
+        )?;
+
+        let summary = ReloadSummary {
+            old_fingerprint: self.scanner.fingerprint(),
+            new_fingerprint: policy.fingerprint().to_string(),
+            plugins: candidate.plugins.len(),
+            allowlist: candidate.allowlist.len(),
+        };
+
+        // Everything above succeeded, so from here nothing can fail and
+        // leave the proxy half-reloaded.
+        self.config.store((*candidate).clone());
+        self.scanner.apply_reloaded_rules(
+            policy,
+            PluginRunner::new(sandbox),
+            candidate.plugins.clone(),
+        );
+
+        tracing::info!(
+            path = %path.display(),
+            applied = %RELOADABLE_FIELDS.join(", "),
+            restart_only = %RESTART_ONLY_FIELDS.join(", "),
+            plugins = summary.plugins,
+            allowlist = summary.allowlist,
+            policy_fingerprint_changed = summary.fingerprint_changed(),
+            old_fingerprint = %summary.old_fingerprint,
+            new_fingerprint = %summary.new_fingerprint,
+            "configuration reloaded; the fields under `applied` are now live, and \
+             a change to any field under `restart_only` would have rejected this \
+             reload outright rather than being ignored"
+        );
+        if summary.fingerprint_changed() {
+            tracing::warn!(
+                old_fingerprint = %summary.old_fingerprint,
+                new_fingerprint = %summary.new_fingerprint,
+                "the policy fingerprint changed: every verdict stored under the \
+                 previous fingerprint is now disregarded, and the next request for \
+                 each affected artifact triggers a full rescan under the new checks"
+            );
+        }
+
+        Ok(summary)
+    }
+}
+
+/// Loops forever, applying `config_path` through `reloader` on every
 /// `SIGHUP` received, until the signal stream itself ends (which only
 /// happens if the underlying OS facility is torn down — effectively
 /// never in this process's lifetime). A failed reload (malformed TOML, a
-/// validation failure) is logged and leaves the previously running
-/// configuration in place, per [`ConfigHandle::reload`]'s own guarantee.
-pub async fn watch_for_reload(
-    config_handle: Arc<ConfigHandle>,
-    config_path: PathBuf,
-) -> anyhow::Result<()> {
+/// validation failure, a missing plugin binary, a restart-only field
+/// that changed) is logged and leaves the previously running
+/// configuration, policy and sandbox all in place, per
+/// [`Reloader::apply`]'s own guarantee.
+pub async fn watch_for_reload(reloader: Arc<Reloader>, config_path: PathBuf) -> anyhow::Result<()> {
     let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .context("installing the SIGHUP handler")?;
 
     loop {
         match signal.recv().await {
-            Some(()) => match config_handle.reload(&config_path) {
-                Ok(()) => tracing::info!(
-                    path = %config_path.display(),
-                    "configuration reloaded on SIGHUP"
-                ),
-                Err(err) => tracing::warn!(
-                    path = %config_path.display(),
-                    error = %err,
-                    "configuration reload failed; keeping the previous configuration"
-                ),
-            },
+            Some(()) => {
+                if let Err(err) = reloader.apply(&config_path) {
+                    tracing::warn!(
+                        path = %config_path.display(),
+                        error = %format!("{err:#}"),
+                        "configuration reload failed; keeping the previous \
+                         configuration, policy and sandbox"
+                    );
+                }
+            }
             None => return Ok(()),
         }
     }

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use supply_chain_scanner::config::{AllowEntry, Config, CveLine, PluginConfig, UnknownSeverity};
+use supply_chain_scanner::config::{Config, CveLine, PluginConfig, UnknownSeverity};
 use supply_chain_scanner::policy::{policy_fingerprint, AdvisoryVerdictInput, Policy};
 
 /// A minimal, fully valid `Config` with no plugins and no allowlist
@@ -146,29 +146,13 @@ fn build_errors_when_a_plugin_binary_is_missing() {
     );
 }
 
-#[test]
-fn allows_matches_regardless_of_name_spelling() {
-    let mut cfg = base_config();
-    cfg.allowlist = vec![AllowEntry {
-        package: "Flask_X".to_string(),
-        version: "1.0.0".to_string(),
-    }];
-
-    let policy = Policy::build(Arc::new(cfg)).expect("build policy");
-
-    assert!(
-        policy.allows("flask-x", "1.0.0"),
-        "allowlist matching must use PEP 503 normalization"
-    );
-    assert!(
-        !policy.allows("flask-x", "2.0.0"),
-        "a different version must not be allowlisted"
-    );
-    assert!(
-        !policy.allows("some-other-package", "1.0.0"),
-        "a different package must not be allowlisted"
-    );
-}
+// The allowlist test that used to live here, against `Policy::allows`,
+// has moved to `src/scan/mod.rs`'s unit tests
+// (`allowlist_matching_uses_pep_503_normalization`). `Policy::allows` had
+// no callers outside this file; the live comparison is
+// `scan::is_allowlisted`, which is `pub(crate)` and therefore only
+// reachable from a unit test. Testing the dead copy while the two live
+// ones went untested is how a divergence between them would have shipped.
 
 #[test]
 fn unknown_severity_allow_does_not_block() {

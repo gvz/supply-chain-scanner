@@ -45,11 +45,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
+use arc_swap::ArcSwap;
+use tokio::sync::Semaphore;
 
 use crate::advisory::matching::first_blocking;
 use crate::advisory::Advisory;
 use crate::artifact_cache::ArtifactCache;
-use crate::config::{Config, ConfigHandle};
+use crate::config::{Config, ConfigHandle, PluginConfig};
 use crate::db::advisory::AdvisoryStore;
 use crate::db::verdict::{StoredVerdict, VerdictStore};
 use crate::ecosystem::pypi::index::{normalize_name, IndexEntry};
@@ -68,6 +70,35 @@ use coordinator::{FinishGuard, ScanCoordinator};
 /// the same discipline [`crate::advisory::matching`] and
 /// [`crate::plugin`] already apply to their own refusal details.
 const DETAIL_MAX_CHARS: usize = 200;
+
+/// How many full scans may run at once, as a multiple of the host's
+/// available parallelism, and the floor/ceiling that multiple is clamped
+/// to.
+///
+/// A full scan is the expensive path: it holds a `spawn_blocking` slot for
+/// the whole of each plugin's timeout, and [`crate::plugin::sandbox`]
+/// spends three further OS threads per sandbox run (two pipe readers and a
+/// `wait`). The *same* blocking pool serves every SQLite call this crate
+/// makes, so without a bound, a parallel dependency resolution or a pip
+/// retry storm starves verdict lookups and turns ordinary requests into
+/// `Unverifiable`/`InProgress` — a self-inflicted outage that reads to a
+/// developer as the proxy being broken.
+///
+/// The bound is deliberately on *concurrent full scans*, not on requests:
+/// a request that cannot get a slot returns the retryable
+/// [`Decision::InProgress`] (HTTP 429) while its scan waits, which is the
+/// same contract a scan that merely exceeds its budget already has.
+const FULL_SCAN_SLOTS_PER_CPU: usize = 2;
+const FULL_SCAN_SLOTS_MIN: usize = 2;
+const FULL_SCAN_SLOTS_MAX: usize = 16;
+
+/// The configured bound on concurrent full scans for this host.
+fn full_scan_slots() -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    (cpus * FULL_SCAN_SLOTS_PER_CPU).clamp(FULL_SCAN_SLOTS_MIN, FULL_SCAN_SLOTS_MAX)
+}
 
 /// The outcome of [`Scanner::decide`] for one artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,23 +138,64 @@ enum FetchError {
     Mismatch(RefusalReason),
 }
 
+/// The checks one decision runs under, swapped as a single unit on a
+/// configuration reload.
+///
+/// These three travel together deliberately. A `SIGHUP` that only swapped
+/// some of them produced exactly the defect this type exists to prevent:
+/// the plugin list was read live from `ConfigHandle` while the fingerprint
+/// and the CVE line came from a `Policy` frozen at startup, so a reload
+/// could add a plugin that ran on new scans while already-`Clean`
+/// artifacts kept serving from a verdict that had never met it — and the
+/// fingerprint column, whose entire job is to identify which checks
+/// produced a row, stopped doing so. `sandbox` is in here for the same
+/// reason: a proxy that booted with no plugins holds a panicking stub
+/// sandbox, so a reload that adds a plugin has to bring a real one with
+/// it or every subsequent scan refuses.
+///
+/// [`Scanner::decide`] loads one snapshot of this at its entry point and
+/// uses that same snapshot all the way down, so a reload landing mid-scan
+/// can never give one decision a mixture of old and new checks.
+pub struct ScanRules {
+    policy: Arc<Policy>,
+    plugins: Vec<PluginConfig>,
+    plugin_runner: Arc<PluginRunner>,
+}
+
+impl ScanRules {
+    fn new(policy: Policy, plugin_runner: PluginRunner, plugins: Vec<PluginConfig>) -> Self {
+        Self {
+            policy: Arc::new(policy),
+            plugins,
+            plugin_runner: Arc::new(plugin_runner),
+        }
+    }
+}
+
 /// Composes every scanning dependency into the one place that decides
 /// whether an artifact may be served.
 ///
 /// Cheap to clone: every field is an `Arc`, so a clone can be moved into a
 /// detached `tokio::spawn`'d scan without borrowing from the caller's
 /// stack frame — which is exactly what letting a scan outlive a caller's
-/// budget timeout requires.
+/// budget timeout requires. The clone also shares the `ArcSwap` holding
+/// the [`ScanRules`], so a reload applied through any clone is visible to
+/// all of them.
 #[derive(Clone)]
 pub struct Scanner {
     verdict_store: Arc<VerdictStore>,
     upstream: Arc<Upstream>,
-    policy: Arc<Policy>,
+    rules: Arc<ArcSwap<ScanRules>>,
     advisory_store: Arc<AdvisoryStore>,
-    plugin_runner: Arc<PluginRunner>,
     artifact_cache: Arc<ArtifactCache>,
     config: Arc<ConfigHandle>,
     coordinator: Arc<ScanCoordinator>,
+    /// Single-flight dedup for the hash-verified fetch path (allowlist
+    /// hits and stored-clean re-serves), kept separate from
+    /// `coordinator` — see [`Scanner::fetch_decision`].
+    fetch_coordinator: Arc<ScanCoordinator>,
+    /// The bound on concurrent full scans; see [`FULL_SCAN_SLOTS_PER_CPU`].
+    full_scan_slots: Arc<Semaphore>,
 }
 
 impl Scanner {
@@ -136,21 +208,62 @@ impl Scanner {
         artifact_cache: ArtifactCache,
         config: Arc<ConfigHandle>,
     ) -> Self {
+        let plugins = config.current().plugins.clone();
         Self {
             verdict_store: Arc::new(verdict_store),
             upstream: Arc::new(upstream),
-            policy: Arc::new(policy),
+            rules: Arc::new(ArcSwap::from_pointee(ScanRules::new(
+                policy,
+                plugin_runner,
+                plugins,
+            ))),
             advisory_store: Arc::new(advisory_store),
-            plugin_runner: Arc::new(plugin_runner),
             artifact_cache: Arc::new(artifact_cache),
             config,
             coordinator: Arc::new(ScanCoordinator::new()),
+            fetch_coordinator: Arc::new(ScanCoordinator::new()),
+            full_scan_slots: Arc::new(Semaphore::new(full_scan_slots())),
         }
+    }
+
+    /// Replaces the checks every *subsequent* decision runs under, as one
+    /// atomic swap.
+    ///
+    /// A decision already in flight keeps the snapshot it loaded at its
+    /// entry point, so it finishes under the rules it started with — the
+    /// invariant [`crate::policy::Policy`]'s immutability was always
+    /// meant to provide, now preserved by snapshotting rather than by
+    /// never rebuilding.
+    ///
+    /// The caller is responsible for having built `policy`, `sandbox` and
+    /// the plugin list successfully *before* calling this; see
+    /// [`crate::http::Reloader::apply`], which is the only caller and
+    /// which keeps the previous rules in place if any part of that build
+    /// fails.
+    pub fn apply_reloaded_rules(
+        &self,
+        policy: Policy,
+        plugin_runner: PluginRunner,
+        plugins: Vec<PluginConfig>,
+    ) {
+        self.rules
+            .store(Arc::new(ScanRules::new(policy, plugin_runner, plugins)));
+    }
+
+    /// The fingerprint of the policy currently in force.
+    pub fn fingerprint(&self) -> String {
+        self.rules.load().policy.fingerprint().to_string()
     }
 
     /// Decides whether `key` (as offered by `entry` in the simple index)
     /// may be served. See the module docs for the decision path.
     pub async fn decide(&self, key: &ArtifactKey, entry: &IndexEntry) -> Decision {
+        let decision = self.decide_inner(key, entry).await;
+        log_decision(key, &decision);
+        decision
+    }
+
+    async fn decide_inner(&self, key: &ArtifactKey, entry: &IndexEntry) -> Decision {
         if entry.sha256.is_none() {
             // Absolute, ahead of every other rule: there is nothing to
             // verify a download against, so this artifact can never be
@@ -165,7 +278,9 @@ impl Scanner {
             return self.fetch_decision(key, entry).await;
         }
 
-        let fingerprint = self.policy.fingerprint().to_string();
+        // One snapshot for the whole decision: see [`ScanRules`].
+        let rules = self.rules.load_full();
+        let fingerprint = rules.policy.fingerprint().to_string();
 
         match self.lookup_stored_verdict(key, &fingerprint).await {
             Ok(Some(stored)) => match stored.verdict {
@@ -173,12 +288,18 @@ impl Scanner {
                     reason,
                     why_id: Some(stored.why_id),
                 },
-                Verdict::Clean => self.serve_known_clean(key, entry, &fingerprint).await,
+                Verdict::Clean => {
+                    self.serve_known_clean(key, entry, &rules, &fingerprint)
+                        .await
+                }
             },
             // No verdict stored under today's policy — either this
             // artifact has never been scanned, or the policy changed
             // since it last was. Either way, a full scan is required.
-            Ok(None) => self.scan_with_budget(key, entry, &fingerprint).await,
+            Ok(None) => {
+                self.scan_with_budget(key, entry, &rules, &fingerprint)
+                    .await
+            }
             Err(_) => Decision::Unverifiable(internal_error_reason_simple(
                 "looking up the stored verdict",
             )),
@@ -193,7 +314,7 @@ impl Scanner {
     /// to an empty set rather than propagating an error that this
     /// signature has no way to report.
     pub async fn blocked_filenames(&self, ecosystem: &str, package: &str) -> HashSet<String> {
-        let fingerprint = self.policy.fingerprint().to_string();
+        let fingerprint = self.fingerprint();
         let store = Arc::clone(&self.verdict_store);
         let ecosystem_owned = ecosystem.to_string();
         let package_owned = package.to_string();
@@ -242,6 +363,7 @@ impl Scanner {
         &self,
         key: &ArtifactKey,
         entry: &IndexEntry,
+        rules: &ScanRules,
         fingerprint: &str,
     ) -> Decision {
         let advisories = match self.advisory_lookup(&key.ecosystem, &key.package).await {
@@ -253,7 +375,7 @@ impl Scanner {
             }
         };
 
-        if let Some(reason) = first_blocking(&advisories, &key.version, &self.policy) {
+        if let Some(reason) = first_blocking(&advisories, &key.version, &rules.policy) {
             let why_id = self
                 .store_verdict(key, &Verdict::Blocked(reason.clone()), fingerprint)
                 .await
@@ -275,6 +397,7 @@ impl Scanner {
         &self,
         key: &ArtifactKey,
         entry: &IndexEntry,
+        rules: &Arc<ScanRules>,
         fingerprint: &str,
     ) -> Decision {
         let sha256 = key.sha256.clone();
@@ -285,6 +408,7 @@ impl Scanner {
                 let scanner = self.clone();
                 let key = key.clone();
                 let entry = entry.clone();
+                let rules = Arc::clone(rules);
                 let fingerprint = fingerprint.to_string();
                 let coordinator = Arc::clone(&self.coordinator);
                 let sha256_for_cleanup = sha256.clone();
@@ -302,7 +426,28 @@ impl Scanner {
                 // for the rest of the process's life.
                 let handle = tokio::spawn(async move {
                     let _finish_guard = FinishGuard::new(coordinator, sha256_for_cleanup);
-                    let decision = scanner.run_full_scan(&key, &entry, &fingerprint).await;
+                    // The permit is taken *inside* the detached task, not
+                    // by the caller: a caller that gives up on its budget
+                    // must not hold a slot, and a caller still waiting
+                    // sees `InProgress` (a retryable 429) rather than a
+                    // thread of the blocking pool being tied up on its
+                    // behalf. See `FULL_SCAN_CONCURRENCY`.
+                    let permit = scanner.full_scan_slots.clone().acquire_owned().await;
+                    let decision = match permit {
+                        Ok(permit) => {
+                            let decision = scanner
+                                .run_full_scan(&key, &entry, &rules, &fingerprint)
+                                .await;
+                            drop(permit);
+                            decision
+                        }
+                        // The semaphore is owned by this `Scanner` and is
+                        // never closed, so this is unreachable in
+                        // practice; refuse rather than scan unbounded.
+                        Err(_) => Decision::Unverifiable(internal_error_reason_simple(
+                            "the scan concurrency limiter was closed",
+                        )),
+                    };
                     let _ = tx.send(verdict_for_dedup(&decision));
                     decision
                 });
@@ -363,6 +508,7 @@ impl Scanner {
         &self,
         key: &ArtifactKey,
         entry: &IndexEntry,
+        rules: &ScanRules,
         fingerprint: &str,
     ) -> Decision {
         let advisories = match self.advisory_lookup(&key.ecosystem, &key.package).await {
@@ -373,7 +519,7 @@ impl Scanner {
                 ))
             }
         };
-        if let Some(reason) = first_blocking(&advisories, &key.version, &self.policy) {
+        if let Some(reason) = first_blocking(&advisories, &key.version, &rules.policy) {
             let why_id = self
                 .store_verdict(key, &Verdict::Blocked(reason.clone()), fingerprint)
                 .await
@@ -410,6 +556,7 @@ impl Scanner {
                     Err(err) => return Decision::Unverifiable(upstream_error_reason(&err)),
                 };
                 if actual != expected {
+                    log_hash_mismatch(key, &expected, &actual);
                     return Decision::Refuse {
                         reason: hash_mismatch_reason(&expected, &actual),
                         why_id: None,
@@ -466,15 +613,20 @@ impl Scanner {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 cleanup_fresh_download(&artifact_path, freshly_downloaded);
-                let reason = RefusalReason {
-                    code: "unpack-failed".to_string(),
+                // Deliberately `Unverifiable`, not `Blocked`: an archive
+                // this unpacker cannot read is a gap in *our* coverage —
+                // an unsupported format, a tar quirk, a truncated
+                // download — and storing it as `Blocked` made a format
+                // gap permanently indistinguishable from a malware
+                // finding, which reads to a developer as "we found
+                // malware in your package" and is precisely how this
+                // proxy earns being routed around. Nothing is stored, so
+                // the next request re-attempts rather than being stuck
+                // behind a verdict no check ever justified.
+                return Decision::Unverifiable(RefusalReason {
+                    code: "unverifiable:unpack-failed".to_string(),
                     detail: sanitize_text(&format!("{err:#}"), DETAIL_MAX_CHARS),
-                };
-                let why_id = self
-                    .store_verdict(key, &Verdict::Blocked(reason.clone()), fingerprint)
-                    .await
-                    .ok();
-                return Decision::Refuse { reason, why_id };
+                });
             }
             Err(join_error) => {
                 cleanup_fresh_download(&artifact_path, freshly_downloaded);
@@ -485,13 +637,23 @@ impl Scanner {
             }
         }
 
-        let plugins = self.config.current().plugins.clone();
-        if let Some(reason) = self
+        // The plugin list comes from the same `ScanRules` snapshot the
+        // fingerprint above came from, so the row this scan stores
+        // actually identifies the checks that produced it.
+        if let Some(reason) = rules
             .plugin_runner
-            .run_all(&plugins, key, unpack_dir.path())
+            .run_all(&rules.plugins, key, unpack_dir.path())
             .await
         {
             cleanup_fresh_download(&artifact_path, freshly_downloaded);
+            // A plugin that could not be run, or that never reached a
+            // verdict before its timeout, has not examined this artifact
+            // — so this is "we could not check", not "we checked and it
+            // is bad", and it must not be stored as a `Blocked` verdict
+            // that outlives the broken plugin.
+            if crate::plugin::is_check_failure(&reason) {
+                return Decision::Unverifiable(reason);
+            }
             let why_id = self
                 .store_verdict(key, &Verdict::Blocked(reason.clone()), fingerprint)
                 .await
@@ -540,32 +702,75 @@ impl Scanner {
     /// and by a stored-clean re-check that passed its advisory recheck —
     /// neither of those paths runs plugins again, so neither goes through
     /// [`Scanner::run_full_scan`].
+    /// Deduplicated by sha256 through [`Scanner::fetch_coordinator`] —
+    /// its own coordinator, not the full-scan one, so the two paths can
+    /// never hand each other a verdict the other's rules did not produce
+    /// (a joiner on the allowlist path must not inherit a `Blocked`
+    /// verdict from a full scan it was entitled to override). Without
+    /// this dedup, a pip retry storm against one large allowlisted
+    /// artifact launched one fresh download per request.
     async fn fetch_decision(&self, key: &ArtifactKey, entry: &IndexEntry) -> Decision {
         let budget = self.config.current().scan_budget;
-        let scanner = self.clone();
-        let key = key.clone();
-        let entry = entry.clone();
+        let sha256 = key.sha256.clone();
 
-        // Detached, exactly like the full-scan owner in `scan_with_budget`:
-        // a slow-but-reachable upstream must not make this call block past
-        // the budget, but the download it's not cancelled on elapse — it
-        // keeps running, so a retried request shortly after can find the
-        // artifact already sitting in the warm cache instead of paying for
-        // the download all over again.
-        let handle =
-            tokio::spawn(async move { scanner.fetch_verified_and_cache(&key, &entry).await });
+        match self.fetch_coordinator.start_or_join(&sha256) {
+            Ok(tx) => {
+                let scanner = self.clone();
+                let key = key.clone();
+                let entry = entry.clone();
+                let coordinator = Arc::clone(&self.fetch_coordinator);
+                let sha256_for_cleanup = sha256.clone();
 
-        match tokio::time::timeout(budget, handle).await {
-            Ok(Ok(Ok(path))) => Decision::Serve(path),
-            Ok(Ok(Err(FetchError::Unverifiable(reason)))) => Decision::Unverifiable(reason),
-            Ok(Ok(Err(FetchError::Mismatch(reason)))) => Decision::Refuse {
-                reason,
-                why_id: None,
-            },
-            Ok(Err(_join_error)) => {
-                Decision::Unverifiable(internal_error_reason_simple("fetch task panicked"))
+                // Detached, exactly like the full-scan owner in
+                // `scan_with_budget`: a slow-but-reachable upstream must
+                // not make this call block past the budget, and the
+                // download is not cancelled when the budget elapses — it
+                // keeps running, so a retried request shortly after finds
+                // the artifact already sitting in the warm cache instead
+                // of paying for the download all over again.
+                let handle = tokio::spawn(async move {
+                    let _finish_guard = FinishGuard::new(coordinator, sha256_for_cleanup);
+                    let result = scanner.fetch_verified_and_cache(&key, &entry).await;
+                    let _ = tx.send(match &result {
+                        Ok(_) => Some(Verdict::Clean),
+                        // A mismatch is worth sharing with a joiner (it
+                        // is a property of the bytes upstream served, not
+                        // of this caller), but it is still never stored.
+                        Err(FetchError::Mismatch(reason)) => Some(Verdict::Blocked(reason.clone())),
+                        Err(FetchError::Unverifiable(_)) => None,
+                    });
+                    result
+                });
+
+                match tokio::time::timeout(budget, handle).await {
+                    Ok(Ok(Ok(path))) => Decision::Serve(path),
+                    Ok(Ok(Err(FetchError::Unverifiable(reason)))) => Decision::Unverifiable(reason),
+                    Ok(Ok(Err(FetchError::Mismatch(reason)))) => Decision::Refuse {
+                        reason,
+                        why_id: None,
+                    },
+                    Ok(Err(_join_error)) => {
+                        Decision::Unverifiable(internal_error_reason_simple("fetch task panicked"))
+                    }
+                    Err(_elapsed) => Decision::InProgress,
+                }
             }
-            Err(_elapsed) => Decision::InProgress,
+            Err(rx) => {
+                match tokio::time::timeout(budget, coordinator::wait_for_verdict(rx)).await {
+                    Ok(Some(Verdict::Clean)) => match self.cache_get(key).await {
+                        Ok(Some(path)) => Decision::Serve(path),
+                        _ => Decision::Unverifiable(internal_error_reason_simple(
+                            "a verified artifact was missing from the cache",
+                        )),
+                    },
+                    Ok(Some(Verdict::Blocked(reason))) => Decision::Refuse {
+                        reason,
+                        why_id: None,
+                    },
+                    Ok(None) => Decision::Unverifiable(scan_incomplete_reason()),
+                    Err(_elapsed) => Decision::InProgress,
+                }
+            }
         }
     }
 
@@ -599,6 +804,7 @@ impl Scanner {
             .to_lowercase();
 
         if actual != expected {
+            log_hash_mismatch(key, &expected, &actual);
             return Err(FetchError::Mismatch(hash_mismatch_reason(
                 &expected, &actual,
             )));
@@ -727,25 +933,90 @@ fn cleanup_fresh_download(path: &std::path::Path, freshly_downloaded: bool) {
     }
 }
 
+/// Logs every refusal, in one place, so an organization can both see that
+/// it happened and measure how often it happens.
+///
+/// Measuring the refusal rate is the only way an org notices the
+/// false-positive anti-goal firing — a developer who quietly switches back
+/// to `--index-url https://pypi.org/simple` generates no signal at all
+/// otherwise. A served artifact is logged at `debug!` so the default
+/// `info` filter carries refusals only; the request-level access log in
+/// [`crate::http`] records the rest.
+fn log_decision(key: &ArtifactKey, decision: &Decision) {
+    match decision {
+        Decision::Serve(_) => tracing::debug!(
+            package = %key.package,
+            version = %key.version,
+            filename = %key.filename,
+            "artifact served"
+        ),
+        Decision::Refuse { reason, why_id } => tracing::warn!(
+            code = %reason.code,
+            package = %key.package,
+            version = %key.version,
+            filename = %key.filename,
+            why_id = why_id.as_deref().unwrap_or("-"),
+            detail = %reason.detail,
+            "refused: artifact was checked and blocked"
+        ),
+        Decision::Unverifiable(reason) => tracing::warn!(
+            code = %reason.code,
+            package = %key.package,
+            version = %key.version,
+            filename = %key.filename,
+            detail = %reason.detail,
+            "refused: artifact could not be checked"
+        ),
+        Decision::InProgress => tracing::debug!(
+            package = %key.package,
+            version = %key.version,
+            filename = %key.filename,
+            "scan still running; returned retryable scan-in-progress"
+        ),
+    }
+}
+
+/// Logs a hash mismatch at `error!`, with both digests.
+///
+/// This is the most security-significant event this system can detect: the
+/// bytes upstream served are not the bytes the index declared, which is
+/// either a tampered mirror/CDN or an active man-in-the-middle. The
+/// computed digests exist nowhere else an operator can reach them — the
+/// refusal is never persisted (it may be transient download corruption,
+/// not a property of the artifact), so there is no `/why` page for it —
+/// which means without this line an org being fed tampered bytes gets no
+/// signal whatsoever.
+fn log_hash_mismatch(key: &ArtifactKey, expected: &str, actual: &str) {
+    tracing::error!(
+        package = %key.package,
+        version = %key.version,
+        filename = %key.filename,
+        expected_sha256 = %expected,
+        actual_sha256 = %actual,
+        "HASH MISMATCH: upstream bytes do not match the index-declared sha256; \
+         refusing. This is either a tampered upstream or a corrupted transfer \
+         and should be investigated, not retried blindly."
+    );
+}
+
 /// Whether `package`@`version` is explicitly allowlisted by the org,
 /// overriding any stored verdict (but never the hash check).
 ///
-/// Deliberately reads `config` — the live snapshot behind
-/// [`crate::config::ConfigHandle`] — rather than going through
-/// [`Policy::allows`], even though the two compare identically today.
-/// [`Policy`] is built once at startup and never rebuilt (its own module
-/// docs are explicit that it must stay immutable so an in-flight scan
-/// finishes under the policy it started with), while those same docs
-/// also say the allowlist "is an override applied at request time, not
-/// an input that changes what a scan examines" — i.e. it is meant to
-/// take effect immediately on a config reload (task 12's `SIGHUP`
-/// handler), unlike the fingerprinted parts of policy. Reading it here,
-/// straight from `ConfigHandle::current()`, is what makes that true;
-/// going through the frozen `Policy` snapshot instead would silently
-/// make a reloaded allowlist entry inert for the lifetime of the
-/// process. Matches [`Policy::allows`]'s own comparison rules exactly
-/// (package names normalized per PEP 503, versions compared verbatim).
-fn is_allowlisted(config: &Config, package: &str, version: &str) -> bool {
+/// Reads `config` — the live snapshot behind
+/// [`crate::config::ConfigHandle`] — rather than the [`Policy`], because
+/// the allowlist "is an override applied at request time, not an input
+/// that changes what a scan examines" (see [`crate::policy`]'s module
+/// docs): it is deliberately excluded from the fingerprint, so adding an
+/// entry must take effect immediately without invalidating any stored
+/// verdict. Package names are compared after PEP 503 normalization,
+/// versions verbatim.
+///
+/// `pub(crate)` and the *only* implementation of this comparison in the
+/// crate. It used to be one of three: a `Policy::allows` whose only
+/// callers were its own tests, plus two untested live copies here and in
+/// `http::simple`. The tested copy being the dead one is how a divergence
+/// between them would have shipped unnoticed.
+pub(crate) fn is_allowlisted(config: &Config, package: &str, version: &str) -> bool {
     let normalized = normalize_name(package);
     config
         .allowlist
@@ -846,9 +1117,61 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use crate::config::{Config, CveLine, UnknownSeverity};
+    use crate::config::{AllowEntry, Config, CveLine, UnknownSeverity};
     use crate::db::index_cache::IndexCache;
     use crate::plugin::{SandboxOutcome, SandboxRunner, SandboxSpec};
+
+    /// Moved here from `tests/policy.rs`, where it tested
+    /// `Policy::allows` — a copy of this comparison with no callers
+    /// outside that test. This is the surviving implementation, and the
+    /// one both the download gate and the index-page filter actually use.
+    #[test]
+    fn allowlist_matching_uses_pep_503_normalization() {
+        let mut cfg = base_config(std::time::Duration::from_secs(12));
+        cfg.allowlist = vec![AllowEntry {
+            package: "Flask_X".to_string(),
+            version: "1.0.0".to_string(),
+        }];
+
+        assert!(
+            is_allowlisted(&cfg, "flask-x", "1.0.0"),
+            "allowlist matching must use PEP 503 normalization"
+        );
+        assert!(
+            !is_allowlisted(&cfg, "flask-x", "2.0.0"),
+            "a different version must not be allowlisted"
+        );
+        assert!(
+            !is_allowlisted(&cfg, "some-other-package", "1.0.0"),
+            "a different package must not be allowlisted"
+        );
+    }
+
+    #[test]
+    fn a_plugin_that_could_not_run_is_a_check_failure_and_a_real_block_is_not() {
+        use crate::plugin::is_check_failure;
+
+        assert!(is_check_failure(&RefusalReason {
+            code: "plugin:yara:error".to_string(),
+            detail: String::new(),
+        }));
+        assert!(is_check_failure(&RefusalReason {
+            code: "plugin:yara:timeout".to_string(),
+            detail: String::new(),
+        }));
+        assert!(
+            !is_check_failure(&RefusalReason {
+                code: "plugin:yara".to_string(),
+                detail: String::new(),
+            }),
+            "a plugin that ran and exited non-zero is a genuine block, not a \
+             check failure"
+        );
+        assert!(!is_check_failure(&RefusalReason {
+            code: "cve:high".to_string(),
+            detail: String::new(),
+        }));
+    }
 
     /// No plugins are configured in this test, so this must never run.
     struct NeverCalledSandbox;

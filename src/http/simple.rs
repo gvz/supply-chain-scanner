@@ -17,9 +17,9 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 
-use crate::config::AllowEntry;
-use crate::ecosystem::pypi::index::{normalize_name, render_simple_page, IndexEntry};
+use crate::ecosystem::pypi::index::{render_simple_page, IndexEntry};
 use crate::ecosystem::pypi::upstream::UpstreamError;
+use crate::scan::is_allowlisted;
 
 use super::{bad_request_response, not_found_response, AppState};
 
@@ -53,7 +53,7 @@ pub async fn simple_handler(
             let parsed = state.ecosystem.parse_filename(&entry.filename)?;
 
             if blocked.contains(&entry.filename)
-                && !is_allowlisted(&config.allowlist, &package, &parsed.version)
+                && !is_allowlisted(&config, &package, &parsed.version)
             {
                 return None;
             }
@@ -78,21 +78,6 @@ pub async fn simple_handler(
         .header(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
         .body(axum::body::Body::from(page))
         .unwrap_or_else(|_| not_found_response())
-}
-
-/// Whether `package`@`version` is explicitly allowlisted, overriding the
-/// blocked-filename filter so the entry stays visible on the index page.
-/// Mirrors [`crate::policy::Policy::allows`] exactly (package names
-/// compared after PEP 503 normalization, versions compared verbatim) —
-/// duplicated rather than reused because this is a display-only decision
-/// with no [`crate::policy::Policy`] handle available here, while
-/// [`crate::scan::Scanner::decide`] independently re-applies the real
-/// allowlist check on every download regardless of what this page shows.
-fn is_allowlisted(allowlist: &[AllowEntry], package: &str, version: &str) -> bool {
-    let normalized = normalize_name(package);
-    allowlist
-        .iter()
-        .any(|entry| normalize_name(&entry.package) == normalized && entry.version == version)
 }
 
 fn upstream_unverifiable(err: &UpstreamError) -> crate::model::RefusalReason {

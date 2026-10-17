@@ -141,9 +141,30 @@ impl ConfigHandle {
     /// Reloads the config from `path`. The file is fully parsed and
     /// validated before anything is swapped in, so a bad file leaves the
     /// previously running config untouched and returns `Err`.
+    ///
+    /// Swapping *only* this handle is not a complete reload: the policy
+    /// fingerprint and the CVE line are compiled into
+    /// [`crate::policy::Policy`], and the plugin list needs a sandbox
+    /// built for it, so a `SIGHUP` goes through
+    /// [`crate::http::Reloader::apply`] instead — which builds all of
+    /// those from the new file first and calls [`ConfigHandle::store`]
+    /// only once they have all succeeded. This method remains for callers
+    /// that genuinely only want the config snapshot replaced.
     pub fn reload(&self, path: &Path) -> anyhow::Result<()> {
         let config = Config::load(path)?;
-        self.current.store(Arc::new(config));
+        self.store(config);
         Ok(())
+    }
+
+    /// Replaces the active config with one the caller has already parsed
+    /// and validated.
+    ///
+    /// Separate from [`ConfigHandle::reload`] so a reload that must also
+    /// rebuild the policy and the sandbox can do all of that *before*
+    /// anything becomes visible to concurrent readers. That keeps the "a
+    /// bad reload never replaces a good running configuration" guarantee
+    /// across the whole reload, not just across TOML parsing.
+    pub fn store(&self, config: Config) {
+        self.current.store(Arc::new(config));
     }
 }

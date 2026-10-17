@@ -13,7 +13,9 @@
 //! scan examines, so adding an allowlist entry must never invalidate
 //! verdicts already stored under the current policy. The same reasoning
 //! excludes `bind` and `cache_ttl`: they are operational knobs, not scan
-//! inputs.
+//! inputs. The one implementation of that request-time override is
+//! [`crate::scan::is_allowlisted`], which reads the live config snapshot;
+//! this module deliberately offers no second copy of that comparison.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -22,7 +24,6 @@ use anyhow::Context;
 use sha2::{Digest, Sha256};
 
 use crate::config::{Config, CveLine, UnknownSeverity};
-use crate::ecosystem::pypi::index::normalize_name;
 
 /// Separates each hashed field so that, e.g., a plugin named `"ab"` with
 /// binary hash `"cd..."` can never hash identically to a plugin named
@@ -81,9 +82,12 @@ fn hash_file(path: &Path) -> anyhow::Result<String> {
 /// fingerprint identifying which rules produced a verdict, an allowlist
 /// override, and the CVE severity line.
 ///
-/// Built from `Arc<Config>` and kept immutable: a config reload produces a
-/// brand new `Policy` rather than mutating this one in place, so an
-/// in-flight scan always finishes under the policy it started with.
+/// Built from `Arc<Config>` and kept immutable: a config reload builds a
+/// brand new `Policy` and swaps it in behind
+/// [`crate::scan::Scanner`]'s `ArcSwap` rather than mutating this one in
+/// place. [`crate::scan::Scanner::decide`] loads one snapshot at its entry
+/// point and uses it for the whole decision, so an in-flight scan always
+/// finishes under the policy it started with *and* a reload is not inert.
 pub struct Policy {
     cfg: Arc<Config>,
     fingerprint: String,
@@ -102,18 +106,6 @@ impl Policy {
     /// this policy.
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
-    }
-
-    /// Whether `package`@`version` is explicitly allowlisted by the org,
-    /// overriding any stored verdict. Package names are compared after PEP
-    /// 503 normalization, so `Flask_X` in config matches a request for
-    /// `flask-x`; versions are compared verbatim.
-    pub fn allows(&self, package: &str, version: &str) -> bool {
-        let normalized = normalize_name(package);
-        self.cfg
-            .allowlist
-            .iter()
-            .any(|entry| normalize_name(&entry.package) == normalized && entry.version == version)
     }
 
     /// Whether a matched advisory blocks the artifact under the org's CVE

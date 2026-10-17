@@ -753,3 +753,98 @@ fn bubblewrap_timeout_kills_a_plugin_that_ignores_sigterm() {
         started.elapsed()
     );
 }
+
+#[test]
+#[ignore = "requires bwrap and usable namespaces"]
+fn bubblewrap_clears_the_environment_and_bounds_memory_and_forks() {
+    let shell = dynamic_shell();
+    let pkg = TempDir::new().unwrap();
+
+    // A secret the operator "exported". Without `--clearenv` this reaches
+    // the plugin, and a plugin's first stdout line becomes `reason.detail`
+    // and is rendered on `/why/<id>` to anyone who can reach the proxy.
+    std::env::set_var("SCS_FAKE_SECRET", "exfiltrate-me");
+
+    let sandbox = BubblewrapSandbox::detect().expect("bwrap must be on PATH");
+
+    // 1. The environment is empty, and in particular the secret is gone.
+    let outcome = sandbox
+        .run(&SandboxSpec {
+            binary: shell.clone(),
+            package_dir: pkg.path().to_path_buf(),
+            args: vec![
+                "-c".to_string(),
+                "if [ -n \"$SCS_FAKE_SECRET\" ]; then echo \"LEAKED $SCS_FAKE_SECRET\"; exit 1; fi; \
+                 echo clean"
+                    .to_string(),
+            ],
+            timeout: Duration::from_secs(10),
+            max_output_bytes: 200,
+        })
+        .expect("bwrap should run the plugin");
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "the proxy's environment reached the plugin: {}",
+        outcome.output
+    );
+
+    // 2. A plugin that tries to take a huge anonymous allocation fails
+    //    rather than succeeding inside its timeout. `dd` writing to a
+    //    tmpfs-backed file would hit the tmpfs cap instead, so this uses
+    //    an allocation the kernel must back with address space: a shell
+    //    variable grown far past RLIMIT_AS.
+    let outcome = sandbox
+        .run(&SandboxSpec {
+            binary: shell.clone(),
+            package_dir: pkg.path().to_path_buf(),
+            args: vec![
+                "-c".to_string(),
+                // Doubles a shell string towards 2^40 bytes using only
+                // builtins (nothing from the bind set, no `seq`), so it
+                // must hit RLIMIT_AS long before finishing.
+                "s=x; i=0; while [ $i -lt 40 ]; do s=\"$s$s\"; i=$((i+1)); done; \
+                 echo survived"
+                    .to_string(),
+            ],
+            timeout: Duration::from_secs(20),
+            max_output_bytes: 200,
+        })
+        .expect("the sandbox must report an outcome, not fail to run");
+    assert_ne!(
+        outcome.exit_code,
+        Some(0),
+        "an unbounded allocation succeeded inside the sandbox: {}",
+        outcome.output
+    );
+    assert!(
+        !outcome.output.contains("survived"),
+        "RLIMIT_AS did not bound the plugin's address space: {}",
+        outcome.output
+    );
+
+    // 3. `--new-session` must not have broken the timeout kill path: a
+    //    plugin that forks a long-lived child and then hangs must still be
+    //    reported as timed out promptly, not wedge the pipe readers.
+    let started = std::time::Instant::now();
+    let outcome = sandbox
+        .run(&SandboxSpec {
+            binary: shell,
+            package_dir: pkg.path().to_path_buf(),
+            args: vec![
+                "-c".to_string(),
+                "(while :; do :; done) & trap '' TERM; while :; do :; done".to_string(),
+            ],
+            timeout: Duration::from_secs(1),
+            max_output_bytes: 200,
+        })
+        .expect("the sandbox reports a timeout rather than failing");
+    assert!(outcome.timed_out, "the run was not reported as timed out");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "a forked grandchild outside the process group wedged the kill path: {:?}",
+        started.elapsed()
+    );
+
+    std::env::remove_var("SCS_FAKE_SECRET");
+}

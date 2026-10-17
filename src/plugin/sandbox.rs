@@ -30,14 +30,34 @@
 //! dynamically linked binary can `exec` at all. See
 //! [`RUNTIME_RO_BIND_PATHS`] for what that gives up and what it does not.
 //!
+//! Resource use is bounded by POSIX rlimits set in `pre_exec` and
+//! inherited across `exec` into the namespace — see [`apply_rlimits`] for
+//! each limit and the reasoning behind its value. Without them, `--size
+//! 64MiB` capped only the tmpfs: anonymous memory, `fork` and CPU were all
+//! unbounded, and the timeout is wall-clock only, so a plugin that
+//! `malloc`ed 10 GB or fork-bombed the host succeeded *within* its
+//! timeout.
+//!
+//! Also cleared: the proxy's environment (`--clearenv`), so a third-party
+//! plugin cannot read whatever the operator exported — which matters
+//! because a plugin's first line of stdout becomes `reason.detail` and is
+//! rendered on `/why/<id>` to anyone who can reach the proxy, i.e. it was
+//! a working exfiltration path for every secret in the proxy's
+//! environment. And the controlling terminal (`--new-session`, which
+//! bubblewrap's own docs recommend against `TIOCSTI` injection while
+//! `--dev` does bind a `/dev/tty`).
+//!
 //! Not contained:
 //!
-//! - **Resource consumption beyond a hard tmpfs cap.** There is no cgroup,
-//!   no rlimit and no CPU quota. The writable tmpfs mounted at `/` and
-//!   `/tmp` is capped at [`TMPFS_SIZE_BYTES`] (RAM-backed storage is bounded
-//!   so a plugin cannot fill host memory through either mount), but nothing
-//!   bounds CPU use or the number of processes a plugin forks within its
-//!   timeout — the timeout remains the only bound on those.
+//! - **Resource consumption beyond those per-process rlimits.** There is
+//!   still no cgroup, so the limits are per *process*, not per sandbox: a
+//!   plugin may hold [`PLUGIN_MAX_PROCESSES`] processes each with its own
+//!   [`PLUGIN_MAX_ADDRESS_SPACE_BYTES`] of address space and its own CPU
+//!   allowance. That bounds the blast radius rather than making it small.
+//!   `RLIMIT_AS` also bounds *virtual* address space, not resident memory,
+//!   which is the only portable handle Linux offers (`RLIMIT_RSS` is a
+//!   no-op) — a plugin can still touch a lot of real memory under a
+//!   generous virtual cap.
 //! - **Kernel attack surface.** No seccomp filter is installed, so the
 //!   plugin reaches the full syscall table from inside the namespace.
 //! - **Read access to the host's installed software.** A plugin can read
@@ -122,6 +142,66 @@ const RUNTIME_RO_BIND_PATHS: &[&str] = &[
 /// and small enough that even several plugins' worth of it does not
 /// threaten the host.
 const TMPFS_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// `RLIMIT_AS`: per-process virtual address space.
+///
+/// Closes the cheapest denial-of-service a plugin had: `malloc` 10 GB and
+/// take the host down inside a timeout it never exceeds. 2 GiB is
+/// generous for a scanner working over at most 512 MiB of unpacked
+/// content (the unpacker's own hard cap) plus its own rule database.
+///
+/// Note two things an operator may need to know. `RLIMIT_AS` bounds
+/// *virtual* address space, not resident memory — it is the only limit
+/// Linux actually enforces for anonymous memory (`RLIMIT_RSS` has been a
+/// no-op for years, and `RLIMIT_DATA` misses much of what `mmap`
+/// provides). And a plugin whose runtime reserves a large virtual arena
+/// up front — a JVM, a Go binary with a big heap target, anything built
+/// with a sanitizer — can fail to start under a limit like this even
+/// though it would never touch that much memory.
+const PLUGIN_MAX_ADDRESS_SPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// How many tasks beyond the host's current count the sandbox may create
+/// — the headroom `RLIMIT_NPROC` is set to, via
+/// [`nproc_limit_for_this_host`].
+///
+/// `RLIMIT_NPROC` cannot be a flat constant here, and getting that wrong
+/// is a live hazard rather than a theoretical one. The kernel charges it
+/// per `(user namespace, uid)` and counts *threads*, not processes; this
+/// limit is set before `bwrap` clones into its new user namespace, so
+/// `bwrap`'s own first `clone` is checked against the proxy user's
+/// existing thread count on the host. A flat 1024 was tried first and
+/// `bwrap` failed immediately with `Creating new namespace failed:
+/// Resource temporarily unavailable` on a developer machine whose uid
+/// already held 1066 threads — which, shipped, would have refused *every
+/// artifact* on any busy host: the false-positive anti-goal, triggered by
+/// nothing more than the machine being in use.
+///
+/// So the limit is measured-plus-headroom instead. Inside the sandbox's
+/// fresh user namespace the count starts from zero, so this headroom is
+/// the real bound on a fork bomb: 512 tasks, against the ~125,000 the
+/// kernel's own default ceiling would otherwise allow. They also live in
+/// a PID namespace torn down with the sandbox, so none outlive the run.
+const PLUGIN_PROCESS_HEADROOM: u64 = 512;
+
+/// `RLIMIT_FSIZE`: largest single file the plugin may create.
+///
+/// Matched to [`TMPFS_SIZE_BYTES`] on purpose: the writable space inside
+/// the sandbox is that one tmpfs, so a per-file cap above it would be
+/// meaningless, and one below it would arbitrarily forbid a plugin from
+/// using the scratch space it was given.
+const PLUGIN_MAX_FILE_BYTES: u64 = TMPFS_SIZE_BYTES;
+
+/// Seconds of slack added to the plugin's wall-clock timeout to derive
+/// `RLIMIT_CPU`.
+///
+/// `RLIMIT_CPU` is CPU-seconds, not wall-clock, so for a single-threaded
+/// plugin it is a slightly looser bound than the timeout already is. Its
+/// value is against a plugin that *multiplies*: with the timeout alone, N
+/// forked workers could burn N × timeout core-seconds inside one timeout.
+/// The slack keeps an honest plugin that genuinely uses its whole budget
+/// from being killed by `SIGXCPU` a moment before the runner's own
+/// timeout would have reported it as a clean timeout instead.
+const PLUGIN_CPU_SLACK_SECONDS: u64 = 1;
 
 /// One plugin invocation.
 #[derive(Debug, Clone)]
@@ -217,6 +297,22 @@ impl BubblewrapSandbox {
         command
             .arg("--unshare-all")
             .arg("--die-with-parent")
+            // The plugin is third-party and its first line of stdout is
+            // published on `/why/<id>`, so it must not inherit the
+            // proxy's environment: that was a working exfiltration path
+            // for anything the operator exported. Everything a plugin
+            // needs arrives in argv (see `crate::plugin`'s contract).
+            .arg("--clearenv")
+            // Recommended by bubblewrap's own documentation against
+            // TIOCSTI terminal-injection, and `--dev` does bind a
+            // `/dev/tty`. The timeout kill path does not depend on
+            // process groups surviving this: `kill_process_group` kills
+            // `bwrap` itself (which stays in the group this `Command`
+            // created), `--die-with-parent` SIGKILLs the sandbox init
+            // when `bwrap` dies, and that init is PID 1 of the
+            // `--unshare-all` PID namespace, so the kernel reaps
+            // everything else in it.
+            .arg("--new-session")
             .arg("--size")
             .arg(TMPFS_SIZE_BYTES.to_string())
             .arg("--tmpfs")
@@ -276,6 +372,36 @@ impl SandboxRunner for BubblewrapSandbox {
         // Put the sandbox in its own process group so the timeout can kill
         // every process it spawned, not just `bwrap` itself.
         command.process_group(0);
+
+        // `RLIMIT_CPU` is derived per run from this plugin's own timeout;
+        // the rest are constants. Set in the forked child just before
+        // `exec`, so they apply to `bwrap` and are inherited by
+        // everything it starts inside the namespace.
+        let cpu_seconds = spec
+            .timeout
+            .as_secs()
+            .saturating_add(PLUGIN_CPU_SLACK_SECONDS)
+            .max(1);
+        let nproc = nproc_limit_for_this_host();
+        if nproc.is_none() {
+            tracing::warn!(
+                "could not read this host's thread count from /proc, so the \
+                 sandbox's RLIMIT_NPROC is left at whatever this process \
+                 inherited: a plugin's fork count is unbounded for this run. \
+                 Every other limit (address space, file size, CPU) still applies."
+            );
+        }
+        // SAFETY: `pre_exec` runs in the forked child between `fork` and
+        // `exec`, where only async-signal-safe work is permitted.
+        // `apply_rlimits` does nothing but issue `getrlimit`/`setrlimit`
+        // syscalls and construct `libc::rlimit` values on the stack: no
+        // allocation, no locks, no inherited mutex, nothing that could
+        // deadlock against a thread that existed in the parent. The
+        // `/proc` walk that produced `nproc` happened above, in the
+        // parent, precisely so it is not done here.
+        unsafe {
+            command.pre_exec(move || apply_rlimits(cpu_seconds, nproc));
+        }
 
         let mut child = command
             .spawn()
@@ -396,6 +522,122 @@ fn join_reader(
     }
 }
 
+/// Applies every per-process resource limit to the calling process,
+/// between `fork` and `exec`, so `bwrap` and everything it starts inside
+/// the namespace inherit them.
+///
+/// Each limit is **clamped to the existing hard limit** rather than set
+/// outright. Raising a hard limit requires `CAP_SYS_RESOURCE`, so an
+/// unconditional `setrlimit` would return `EPERM` — and therefore refuse
+/// every artifact — on any host whose operator had already set a hard
+/// limit tighter than the value here. Clamping means this can only ever
+/// tighten, never fail for trying to loosen.
+///
+/// Returns `Err` if a limit genuinely cannot be applied, which fails the
+/// spawn and therefore refuses the artifact: a plugin running with fewer
+/// limits than this module promises is not something to proceed with
+/// quietly.
+fn apply_rlimits(cpu_seconds: u64, nproc: Option<u64>) -> std::io::Result<()> {
+    set_limit(libc::RLIMIT_AS, PLUGIN_MAX_ADDRESS_SPACE_BYTES)?;
+    set_limit(libc::RLIMIT_FSIZE, PLUGIN_MAX_FILE_BYTES)?;
+    set_limit(libc::RLIMIT_CPU, cpu_seconds)?;
+    // `None` means the host's thread count could not be read, so any
+    // value chosen here could be *below* it and would make `bwrap` fail
+    // to clone at all — refusing every artifact. Leaving the inherited
+    // limit in place is the lesser evil, and the caller logs it.
+    if let Some(nproc) = nproc {
+        set_limit(libc::RLIMIT_NPROC, nproc)?;
+    }
+    Ok(())
+}
+
+/// The `RLIMIT_NPROC` value to use on this host right now: the number of
+/// threads currently charged to this uid, plus
+/// [`PLUGIN_PROCESS_HEADROOM`]. `None` if `/proc` could not be read well
+/// enough to be sure.
+///
+/// Computed per run, before the fork (so it may allocate freely), because
+/// the host's count moves and a value below it makes `bwrap` fail to
+/// start. The walk reads one small `status` file per process — a few
+/// milliseconds against a plugin timeout measured in seconds.
+fn nproc_limit_for_this_host() -> Option<u64> {
+    // SAFETY: `geteuid` takes no arguments, touches no memory of ours,
+    // and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let mut threads: u64 = 0;
+    let mut saw_any = false;
+
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        // A process can exit between the readdir and this read; that is
+        // normal and simply means it no longer counts.
+        let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
+            continue;
+        };
+
+        let mut matches_uid = false;
+        let mut count = 1u64;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("Uid:") {
+                // "Uid:\t<real>\t<effective>\t<saved>\t<fs>"
+                matches_uid = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .map(|real| real == uid)
+                    .unwrap_or(false);
+            } else if let Some(rest) = line.strip_prefix("Threads:") {
+                count = rest.trim().parse::<u64>().unwrap_or(1);
+            }
+        }
+        if matches_uid {
+            saw_any = true;
+            threads = threads.saturating_add(count);
+        }
+    }
+
+    // This process itself is charged to this uid, so finding nothing at
+    // all means the walk did not work, not that the count is zero.
+    if !saw_any {
+        return None;
+    }
+    Some(threads.saturating_add(PLUGIN_PROCESS_HEADROOM))
+}
+
+/// Lowers `resource`'s soft and hard limits to `value`, or leaves them
+/// alone if they are already tighter. See [`apply_rlimits`].
+fn set_limit(resource: u32, value: u64) -> std::io::Result<()> {
+    let resource = resource as libc::c_int;
+
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` writes only into `current`, which is a live,
+    // correctly typed, stack-allocated `libc::rlimit`.
+    if unsafe { libc::getrlimit(resource as _, &mut current) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let capped = value.min(current.rlim_max) as libc::rlim_t;
+    let limit = libc::rlimit {
+        rlim_cur: capped,
+        rlim_max: capped,
+    };
+    // SAFETY: `setrlimit` reads only from `limit`, which is a live,
+    // correctly typed, stack-allocated `libc::rlimit`, and `capped` is by
+    // construction no greater than the current hard limit, so this can
+    // only tighten.
+    if unsafe { libc::setrlimit(resource as _, &limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `SIGKILL`s every process in `process_group`.
 fn kill_process_group(process_group: i32) {
     // SAFETY: `killpg` takes a process group id and a signal number and
@@ -467,13 +709,66 @@ mod tests {
     fn root_tmpfs_is_mounted_before_any_other_bind() {
         // The capped root must be the very first mount, or later binds
         // under `/` would be hidden rather than contained (verified
-        // against real bwrap during implementation).
+        // against real bwrap during implementation). The flags ahead of
+        // it are namespace/env/session settings, not mounts.
         let args = built_args();
         assert_eq!(args[0], "--unshare-all");
         assert_eq!(args[1], "--die-with-parent");
-        assert_eq!(args[2], "--size");
-        assert_eq!(args[4], "--tmpfs");
-        assert_eq!(args[5], "/");
+        assert_eq!(args[2], "--clearenv");
+        assert_eq!(args[3], "--new-session");
+        assert_eq!(args[4], "--size");
+        assert_eq!(args[6], "--tmpfs");
+        assert_eq!(args[7], "/");
+    }
+
+    #[test]
+    fn the_environment_is_cleared_and_the_terminal_session_is_new() {
+        let args = built_args();
+        assert!(
+            args.iter().any(|a| a == "--clearenv"),
+            "without --clearenv a third-party plugin inherits the proxy's \
+             whole environment, and its first stdout line is published on \
+             /why/<id>: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "--new-session"),
+            "--new-session is bubblewrap's own recommendation against \
+             TIOCSTI injection, and --dev does bind a /dev/tty: {args:?}"
+        );
+    }
+
+    #[test]
+    fn rlimits_are_clamped_rather_than_raised() {
+        // The real `apply_rlimits` runs only in a forked child, so test
+        // `set_limit`'s clamping contract directly in this process: ask
+        // for an absurdly high `RLIMIT_NPROC` and confirm it did not
+        // raise the hard limit (which would have returned EPERM and so
+        // failed every plugin spawn).
+        let mut before = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: writes only into the live local above.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NPROC as _, &mut before) },
+            0
+        );
+
+        set_limit(libc::RLIMIT_NPROC, u64::MAX).expect("asking for more must clamp, not fail");
+
+        let mut after = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NPROC as _, &mut after) },
+            0
+        );
+        assert_eq!(
+            after.rlim_max, before.rlim_max,
+            "set_limit must never raise a hard limit"
+        );
     }
 
     #[test]

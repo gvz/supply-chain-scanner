@@ -33,18 +33,26 @@ use crate::policy::{AdvisoryVerdictInput, Policy};
 /// `adv` carries any ranges, the version is treated as affected: there is
 /// no way to prove it falls outside every range, and failing open here
 /// would let an unparseable version slip through unscanned.
+///
+/// An enumerated entry that itself fails to parse as PEP 440 falls back to
+/// a raw, trimmed, case-insensitive string comparison against `version`,
+/// rather than silently never matching (fail open) or, the other extreme,
+/// blocking every version of the package just because one entry in the
+/// list is malformed (over-block). This only affects that one entry's
+/// comparison; it never substitutes for the PEP 440 comparison when the
+/// entry does parse.
 pub fn affects(adv: &Advisory, version: &str) -> bool {
     let parsed_version = Version::from_str(version).ok();
 
-    if let Some(v) = &parsed_version {
-        let in_enumerated_list = adv.versions.iter().any(|enumerated| {
-            Version::from_str(enumerated)
-                .map(|ev| ev == *v)
-                .unwrap_or(false)
-        });
-        if in_enumerated_list {
-            return true;
-        }
+    let in_enumerated_list =
+        adv.versions
+            .iter()
+            .any(|enumerated| match Version::from_str(enumerated) {
+                Ok(ev) => parsed_version.as_ref().is_some_and(|v| ev == *v),
+                Err(_) => enumerated.trim().eq_ignore_ascii_case(version.trim()),
+            });
+    if in_enumerated_list {
+        return true;
     }
 
     if adv.ranges.is_empty() {
@@ -133,12 +141,23 @@ fn refusal_reason(adv: &Advisory) -> RefusalReason {
     }
 }
 
+/// The cap, in characters, on the sanitized summary portion of `detail`.
+/// `adv.summary` comes from upstream OSV data with no length guarantee;
+/// task 11 caps the whole HTTP reason phrase at 120 bytes, so 200
+/// characters of summary is already more than that budget allows and
+/// anything past it would be dead weight even before task 11's own
+/// truncation. Capping here keeps `detail` itself bounded rather than
+/// relying on that downstream step.
+const SUMMARY_MAX_CHARS: usize = 200;
+
 /// Strips anything that could make `text` dangerous or malformed inside an
 /// HTTP reason phrase later: ASCII control characters (including CR/LF, the
-/// bytes a response-splitting attack needs) and non-ASCII characters.
-/// Everything else passes through unchanged.
+/// bytes a response-splitting attack needs) and non-ASCII characters, then
+/// truncates to [`SUMMARY_MAX_CHARS`]. Everything else passes through
+/// unchanged.
 fn sanitize_detail_text(text: &str) -> String {
     text.chars()
         .filter(|c| c.is_ascii() && !c.is_ascii_control())
+        .take(SUMMARY_MAX_CHARS)
         .collect()
 }

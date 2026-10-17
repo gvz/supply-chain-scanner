@@ -250,3 +250,62 @@ fn first_blocking_returns_none_when_nothing_matches() {
         "no advisory affects this version, so first_blocking must return None"
     );
 }
+
+#[test]
+fn refusal_detail_strips_control_chars_non_ascii_and_caps_length() {
+    let mut cfg = base_config();
+    cfg.cve.min_severity = 7.0;
+    let policy = Policy::build(Arc::new(cfg)).expect("build policy");
+
+    // CR, LF (the response-splitting bytes task 11 guards against), a
+    // non-ASCII character, and a summary much longer than the cap, all in
+    // one go.
+    let malicious_summary = format!("evil\r\nheader-injection-\u{00f1}-{}", "a".repeat(500));
+    let adv = Advisory {
+        versions: vec!["1.2.3".to_string()],
+        summary: malicious_summary,
+        ..advisory("GHSA-malicious", Some(9.0))
+    };
+
+    let reason = first_blocking(&[adv], "1.2.3", &policy).expect("expected a blocking advisory");
+
+    assert!(!reason.detail.contains('\r'), "detail must not contain CR");
+    assert!(!reason.detail.contains('\n'), "detail must not contain LF");
+    assert!(
+        reason.detail.is_ascii(),
+        "detail must be ASCII only, got {:?}",
+        reason.detail
+    );
+
+    let (summary_part, _) = reason
+        .detail
+        .split_once(" (severity")
+        .expect("detail must contain the severity suffix");
+    assert!(
+        summary_part.chars().count() <= 200,
+        "sanitized summary must be capped at 200 characters, got {} chars: {:?}",
+        summary_part.chars().count(),
+        summary_part
+    );
+}
+
+#[test]
+fn malformed_enumerated_version_falls_back_to_raw_string_match() {
+    let adv = Advisory {
+        versions: vec!["not-a-pep440-version".to_string()],
+        ..advisory("GHSA-malformed-enum", Some(9.0))
+    };
+
+    assert!(
+        affects(&adv, "not-a-pep440-version"),
+        "a malformed enumerated entry must still match an identical raw version string"
+    );
+    assert!(
+        affects(&adv, "NOT-A-PEP440-VERSION"),
+        "the raw-string fallback must be case-insensitive"
+    );
+    assert!(
+        !affects(&adv, "some-other-version"),
+        "a malformed enumerated entry must not match an unrelated version"
+    );
+}

@@ -200,16 +200,22 @@ impl Upstream {
         let result = stream_to_file(response, &tmp_path).await;
 
         match result {
-            Ok(digest) => {
-                tokio::fs::rename(&tmp_path, dest).await.with_context(|| {
-                    format!(
-                        "renaming {} to {} after a successful download",
-                        tmp_path.display(),
-                        dest.display()
-                    )
-                })?;
-                Ok(digest)
-            }
+            Ok(digest) => match tokio::fs::rename(&tmp_path, dest).await {
+                Ok(()) => Ok(digest),
+                Err(err) => {
+                    // Best-effort cleanup: the rename failed, so the fully
+                    // written temp file must not be left orphaned beside
+                    // dest.
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    Err(UpstreamError::Other(anyhow::Error::new(err).context(
+                        format!(
+                            "renaming {} to {} after a successful download",
+                            tmp_path.display(),
+                            dest.display()
+                        ),
+                    )))
+                }
+            },
             Err(err) => {
                 // Best-effort cleanup: the download already failed, so a
                 // failure to remove the temp file must not mask the

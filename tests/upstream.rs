@@ -238,6 +238,67 @@ async fn download_streams_to_file_and_returns_sha256() {
 }
 
 #[tokio::test]
+async fn download_cleans_up_temp_file_when_rename_fails() {
+    let server = MockServer::start().await;
+    let body = b"rename failure body".to_vec();
+    Mock::given(method("GET"))
+        .and(path("/packages/rename-fail-1.0.0.tar.gz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .mount(&server)
+        .await;
+
+    let (_dir, db) = open_db();
+    let cache = IndexCache::new(db);
+    let base = Url::parse(&format!("{}/simple/", server.uri())).expect("valid base url");
+    let upstream = Upstream::new(base, cache).expect("construct upstream");
+
+    let entry_url = Url::parse(&format!(
+        "{}/packages/rename-fail-1.0.0.tar.gz",
+        server.uri()
+    ))
+    .expect("valid artifact url");
+    let entry = supply_chain_scanner::ecosystem::pypi::index::IndexEntry {
+        filename: "rename-fail-1.0.0.tar.gz".to_string(),
+        url: entry_url,
+        sha256: None,
+        requires_python: None,
+        metadata_hash: None,
+        yanked: None,
+    };
+
+    let dest_dir = tempfile::tempdir().expect("create dest dir");
+    // `dest` is itself a non-empty directory, so renaming the fully
+    // streamed temp file onto it fails on Linux (EISDIR/ENOTEMPTY). This
+    // deterministically exercises the rename-failure branch in
+    // `download`, distinct from the stream-failure branch exercised by
+    // the truncated-download test above.
+    let dest = dest_dir.path().join("rename-fail-1.0.0.tar.gz");
+    std::fs::create_dir(&dest).expect("create dest as a directory");
+    std::fs::write(dest.join("occupant"), b"occupying file").expect("populate dest directory");
+
+    let result = upstream.download(&entry, &dest).await;
+    assert!(
+        result.is_err(),
+        "a failed rename must surface as an error, not a silent success"
+    );
+
+    assert!(
+        dest.is_dir(),
+        "the pre-existing dest directory must be left untouched by the failed rename"
+    );
+
+    let leftovers: Vec<_> = std::fs::read_dir(dest_dir.path())
+        .expect("read dest dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path() != dest)
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no temp file must survive a failed rename: {leftovers:?}"
+    );
+}
+
+#[tokio::test]
 async fn download_of_truncated_body_errors_rather_than_leaving_partial_file() {
     let server = MockServer::start().await;
     // Declare a Content-Length larger than the actual body, which causes

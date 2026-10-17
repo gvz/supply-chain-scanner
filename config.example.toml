@@ -1,0 +1,67 @@
+# Example configuration for supply-chain-scanner.
+#
+# Copy this file, edit it for your org, and point the binary at it with
+# `--config`. Every field below is required unless noted otherwise.
+
+# Address the proxy listens on.
+bind = "127.0.0.1:8080"
+
+# Where the SQLite verdict/advisory/cache database lives.
+db_path = "data/scanner.db"
+
+# Where cached artifact files are stored on disk.
+cache_dir = "data/cache"
+
+# The real PyPI the proxy fetches from.
+upstream_url = "https://pypi.org"
+
+# The URL developers' tools see this proxy as (used to build absolute links,
+# e.g. in /why/<id> pages).
+public_url = "http://localhost:8080"
+
+# How long a first-time scan is allowed to run before the request returns a
+# retryable "scan in progress" response instead of hanging. Must stay at or
+# below 14s: pip's own default request timeout is 15s, so anything higher
+# always loses that race. Accepts humantime strings such as "12s".
+scan_budget = "12s"
+
+# How long a passing artifact is kept on disk before it must be refetched.
+# The TTL is sliding: every request resets it.
+cache_ttl = "24h"
+
+# How often the local OSV advisory mirror is refreshed.
+advisory_sync_interval = "1h"
+
+# Where the OSV advisory mirror is synced from. Optional — defaults to the
+# value shown here (the public OSV PyPI feed) if omitted.
+advisory_source_url = "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip"
+
+[cve]
+# Advisories scoring at or above this severity (CVSS-style, 0.0-10.0) block
+# the package.
+min_severity = 7.0
+
+# If true, only advisories that also list a fixed version block the
+# package; advisories with no known fix are allowed through.
+require_fix_available = false
+
+# How to treat advisories with missing or unparseable severity: "allow" lets
+# them through, "block" refuses the package. Optional — defaults to
+# "allow": treating unknown severity as blocking would refuse a large share
+# of ordinary packages on day one.
+unknown_severity = "allow"
+
+# Specific package+version entries the org has reviewed and decided to
+# permit regardless of stored verdict. A hash mismatch still refuses even
+# an allowlisted entry. Optional — defaults to empty.
+[[allowlist]]
+package = "example-package"
+version = "1.2.3"
+
+# Org-supplied check binaries, run in order against every unpacked,
+# unverdicted artifact. Exit code 0 means clean, non-zero means blocked.
+# Optional — defaults to empty.
+[[plugins]]
+name = "yara-malware"
+binary = "/opt/scanner/plugins/yara-malware"
+timeout = "5s"

@@ -1,0 +1,26 @@
+[package]
+name = "supply_chain_scanner"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "supply_chain_scanner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "supply-chain-scanner"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+arc-swap = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+humantime-serde = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = { version = "2", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"

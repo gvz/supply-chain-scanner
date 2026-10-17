@@ -171,10 +171,11 @@ pub async fn bootstrap(config: Config) -> anyhow::Result<Wired> {
         .upstream_url
         .join("simple/")
         .context("building the upstream simple-index base URL")?;
-    let scanner_upstream = Upstream::new(simple_base.clone(), index_cache.clone())
-        .context("constructing the scanner's upstream client")?;
+    let scanner_upstream =
+        Upstream::with_limits(simple_base.clone(), index_cache.clone(), &config.download)
+            .context("constructing the scanner's upstream client")?;
     let ecosystem_upstream = Arc::new(
-        Upstream::new(simple_base, index_cache)
+        Upstream::with_limits(simple_base, index_cache, &config.download)
             .context("constructing the ecosystem's upstream client")?,
     );
 
@@ -287,7 +288,8 @@ pub fn default_sandbox_factory() -> SandboxFactory {
 /// `db_path` into every open connection pool, `cache_dir` into the
 /// [`ArtifactCache`] root, `upstream_url` into both HTTP clients' base
 /// URLs, `advisory_source_url`/`advisory_sync_interval` into the sync
-/// ticker, and `cache_ttl` into the eviction ticker.
+/// ticker, `cache_ttl` into the eviction ticker, and `download` into the
+/// upstream clients' timeout configuration.
 ///
 /// A reload that changes any of them is **rejected in full**. That is a
 /// deliberate choice over the alternative of applying the rest: applying
@@ -302,6 +304,7 @@ const RESTART_ONLY_FIELDS: &[&str] = &[
     "advisory_source_url",
     "advisory_sync_interval",
     "cache_ttl",
+    "download",
 ];
 
 /// Configuration fields a reload genuinely applies, for the log line that
@@ -332,6 +335,9 @@ fn restart_only_changes(boot: &Config, candidate: &Config) -> Vec<&'static str> 
     }
     if boot.cache_ttl != candidate.cache_ttl {
         changed.push("cache_ttl");
+    }
+    if boot.download != candidate.download {
+        changed.push("download");
     }
     changed
 }

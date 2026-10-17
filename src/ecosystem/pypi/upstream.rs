@@ -7,9 +7,28 @@
 //! — never a silent empty result that would let an unexamined artifact
 //! through.
 //!
-//! Timeouts are deliberately tight (5s to connect, 10s total per request):
-//! the scanner's whole-scan budget is 12s, so a single upstream call must
-//! never be able to consume it alone.
+//! Timeouts come in two shapes, because the two jobs need different ones.
+//!
+//! **Index pages** keep a tight total deadline (5s to connect, 10s for the
+//! whole request): they fetch small documents and sit in front of the
+//! scanner's 12s whole-scan budget, so one of them must never be able to
+//! consume it alone.
+//!
+//! **Artifact downloads** have no total deadline at all. `reqwest`'s
+//! `ClientBuilder::timeout` runs from connect until the response body
+//! finishes, so on a download path it is a cap on artifact *size* wearing
+//! the costume of a cap on time: at 10 seconds total, a 300 MB wheel
+//! needed 30 MB/s sustained and a 900 MB `torch` wheel needed 90 MB/s, and
+//! every large ML/CUDA wheel was permanently unservable. Instead the
+//! download client detects *stalls* (`read_timeout`, which resets on every
+//! successful read) with a generous absolute cap behind it; both are
+//! configurable via [`crate::config::DownloadLimits`].
+//!
+//! A long legitimate download does outlive the 12s scan budget. That is
+//! the designed behavior, not a failure: the request returns the retryable
+//! scan-in-progress response while the *detached* scan keeps running and
+//! stores its verdict, so the developer's retry lands on a stored
+//! decision (see [`crate::scan`]).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -23,15 +42,20 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use url::Url;
 
+use crate::config::DownloadLimits;
 use crate::db::index_cache::IndexCache;
 use crate::ecosystem::pypi::index::{self, IndexEntry};
 
 /// Upper bound on establishing the TCP/TLS connection to upstream.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Upper bound on the entire request (connect + headers + body). The
-/// scanner's whole-scan budget is 12s; this must stay well under that so
-/// one slow upstream call cannot eat the whole budget by itself.
+/// Upper bound on an entire *index-page* request (connect + headers +
+/// body). The scanner's whole-scan budget is 12s; this must stay well
+/// under that so one slow index fetch cannot eat the whole budget by
+/// itself.
+///
+/// Deliberately not applied to the download path — see the module docs
+/// and [`DownloadLimits`].
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A value that may have come straight from upstream (`stale == false`) or
@@ -60,26 +84,61 @@ pub enum UpstreamError {
 }
 
 /// HTTP client for upstream PyPI, backed by a stale-tolerant index cache.
+///
+/// Two clients, deliberately, because the two jobs need opposite timeout
+/// shapes. `index_client` fetches small documents in front of the scan
+/// budget and keeps a total deadline. `download_client` streams artifact
+/// bodies of unbounded size and must *not* have one — see
+/// [`DownloadLimits`].
 pub struct Upstream {
-    client: reqwest::Client,
+    index_client: reqwest::Client,
+    download_client: reqwest::Client,
     base: Url,
     cache: IndexCache,
+    /// Absolute cap applied around a whole download; see
+    /// [`DownloadLimits::max_duration`].
+    download_max_duration: Duration,
 }
 
 impl Upstream {
+    /// Builds an `Upstream` with the default [`DownloadLimits`].
+    pub fn new(base: Url, cache: IndexCache) -> anyhow::Result<Self> {
+        Self::with_limits(base, cache, &DownloadLimits::default())
+    }
+
     /// Builds an `Upstream` pointed at `base` (the PEP 503 simple index
     /// root, e.g. `https://pypi.org/simple/`), using `cache` as the
-    /// fallback store for index pages.
-    pub fn new(base: Url, cache: IndexCache) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
+    /// fallback store for index pages and `limits` for the download path.
+    pub fn with_limits(
+        base: Url,
+        cache: IndexCache,
+        limits: &DownloadLimits,
+    ) -> anyhow::Result<Self> {
+        let index_client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .build()
-            .context("building upstream HTTP client")?;
+            .context("building the upstream index HTTP client")?;
+        // Deliberately no `.timeout(..)`: that is a *total* deadline
+        // (connect through end-of-body), which on this path is a cap on
+        // artifact size disguised as a cap on time. `read_timeout` is the
+        // right shape — it bounds how long the transfer may go without
+        // receiving a byte and resets on every successful read, so a
+        // dead connection still fails in seconds while a large honest
+        // download is not penalized for being large. The absolute cap
+        // lives in `download_max_duration`, applied around the whole
+        // call in `download`.
+        let download_client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(limits.stall_timeout)
+            .build()
+            .context("building the upstream download HTTP client")?;
         Ok(Self {
-            client,
+            index_client,
+            download_client,
             base,
             cache,
+            download_max_duration: limits.max_duration,
         })
     }
 
@@ -102,7 +161,7 @@ impl Upstream {
             .join(&format!("{normalized}/"))
             .with_context(|| format!("building simple index URL for {normalized:?}"))?;
 
-        match self.client.get(url.clone()).send().await {
+        match self.index_client.get(url.clone()).send().await {
             Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
                 Err(UpstreamError::NotFound)
             }
@@ -170,9 +229,40 @@ impl Upstream {
     /// error (network failure, truncated body, I/O error) the temporary
     /// file is removed and `dest` is left untouched, so a failed download
     /// never leaves a partial file where a caller might find it.
+    ///
+    /// Bounded by stall detection (see [`DownloadLimits::stall_timeout`],
+    /// configured on `download_client`) plus the absolute
+    /// [`DownloadLimits::max_duration`] cap applied here — never by a
+    /// total deadline short enough to make large artifacts unservable.
+    /// Exceeding `max_duration` is an error, and a partially written temp
+    /// file is removed on that path as on every other, so the fail-closed
+    /// guarantee holds: a download that ran out of time never produces
+    /// bytes a caller could mistake for a complete artifact.
     pub async fn download(&self, entry: &IndexEntry, dest: &Path) -> Result<String, UpstreamError> {
+        match tokio::time::timeout(self.download_max_duration, self.download_inner(entry, dest))
+            .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                // The inner future was dropped mid-stream, so its temp
+                // file (named `.<filename>.<random>.part` beside `dest`)
+                // was never removed by its own error path. Sweep it.
+                remove_part_files_beside(dest).await;
+                Err(UpstreamError::Unavailable(format!(
+                    "downloading {:?} exceeded the {:?} absolute download limit",
+                    entry.filename, self.download_max_duration
+                )))
+            }
+        }
+    }
+
+    async fn download_inner(
+        &self,
+        entry: &IndexEntry,
+        dest: &Path,
+    ) -> Result<String, UpstreamError> {
         let response = self
-            .client
+            .download_client
             .get(entry.url.clone())
             .send()
             .await
@@ -238,7 +328,7 @@ impl Upstream {
         let metadata_path = format!("{}.metadata", url.path());
         url.set_path(&metadata_path);
 
-        let response = self.client.get(url).send().await.map_err(|err| {
+        let response = self.index_client.get(url).send().await.map_err(|err| {
             UpstreamError::Unavailable(format!(
                 "request for metadata sidecar of {:?} failed: {err}",
                 entry.filename
@@ -290,6 +380,32 @@ async fn stream_to_file(response: reqwest::Response, path: &Path) -> anyhow::Res
         .with_context(|| format!("flushing temp file {}", path.display()))?;
 
     Ok(to_hex(&hasher.finalize()))
+}
+
+/// Removes any `.<name>.<random>.part` file this module may have left
+/// beside `dest`, used when the download future is cancelled (by the
+/// absolute cap) and so never reaches its own cleanup path.
+///
+/// Scoped to the exact naming scheme [`temp_path_beside`] produces, so it
+/// can never delete a caller's own files: `dest`'s directory is a
+/// per-download temp directory in every current caller, but this does not
+/// rely on that.
+async fn remove_part_files_beside(dest: &Path) {
+    let Some(parent) = dest.parent() else { return };
+    let Some(file_name) = dest.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let prefix = format!(".{file_name}.");
+
+    let Ok(mut entries) = tokio::fs::read_dir(parent).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&prefix) && name.ends_with(".part") {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
 }
 
 /// Picks a temp file path in the same directory as `dest`, so the final

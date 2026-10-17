@@ -392,3 +392,255 @@ async fn metadata_sidecar_fetches_the_dot_metadata_url() {
 
     assert_eq!(bytes.as_ref(), metadata_body.as_slice());
 }
+
+// ---------------------------------------------------------------------------
+// Download timeout semantics
+//
+// `reqwest`'s `ClientBuilder::timeout` is a *total* deadline: connect
+// through end-of-body. A 10s total deadline capped every servable artifact
+// at 10s x sustained throughput — a 300 MB wheel needed 30 MB/s held for
+// the whole transfer and a 900 MB `torch` wheel needed 90 MB/s, so every
+// large ML/CUDA wheel was permanently unservable as a 503 that pip retries
+// five times and then reports as an upstream problem. The download path
+// now uses stall detection (`read_timeout`) plus a generous absolute cap
+// instead; the index-page path keeps its total deadline, because it
+// fetches small documents and sits in front of the scan budget.
+// ---------------------------------------------------------------------------
+
+/// Serves exactly one HTTP/1.1 response on a fresh ephemeral port,
+/// trickling `body` out in `chunks` pieces with `gap` between them, so the
+/// transfer takes roughly `chunks * gap` without ever stalling for longer
+/// than `gap`. The returned task owns the listener and ends after the one
+/// response.
+async fn spawn_trickling_server(
+    body: Vec<u8>,
+    chunks: usize,
+    gap: std::time::Duration,
+) -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind trickling server");
+    let addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        // Drain the request headers; we serve the same body regardless.
+        let mut scratch = [0u8; 4096];
+        let _ = stream.read(&mut scratch).await;
+
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        if stream.write_all(header.as_bytes()).await.is_err() {
+            return;
+        }
+        let chunk_size = body.len().div_ceil(chunks);
+        for piece in body.chunks(chunk_size) {
+            tokio::time::sleep(gap).await;
+            if stream.write_all(piece).await.is_err() {
+                return;
+            }
+            if stream.flush().await.is_err() {
+                return;
+            }
+        }
+        let _ = stream.shutdown().await;
+    });
+
+    addr
+}
+
+/// Serves one HTTP/1.1 response that promises `promised` bytes, writes
+/// `prefix`, and then never writes another byte while holding the
+/// connection open — a genuinely stalled transfer, as distinct from a slow
+/// one.
+async fn spawn_stalling_server(prefix: Vec<u8>, promised: usize) -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalling server");
+    let addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut scratch = [0u8; 4096];
+        let _ = stream.read(&mut scratch).await;
+
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+             Content-Length: {promised}\r\n\r\n"
+        );
+        if stream.write_all(header.as_bytes()).await.is_err() {
+            return;
+        }
+        if stream.write_all(&prefix).await.is_err() {
+            return;
+        }
+        let _ = stream.flush().await;
+        // Hold the connection open, writing nothing, until the test ends.
+        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+    });
+
+    addr
+}
+
+fn entry_at(url: &str, filename: &str) -> supply_chain_scanner::ecosystem::pypi::index::IndexEntry {
+    supply_chain_scanner::ecosystem::pypi::index::IndexEntry {
+        filename: filename.to_string(),
+        url: Url::parse(url).expect("valid artifact url"),
+        sha256: None,
+        requires_python: None,
+        metadata_hash: None,
+        yanked: None,
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A body that trickles for longer than the old 10s *total* deadline but
+/// never stalls must now complete. Under the previous
+/// `ClientBuilder::timeout(10s)` this failed at the 10 second mark no
+/// matter how healthy the connection was, which is the whole of B2.
+///
+/// Deliberately a slow test (~12s): a shorter one cannot distinguish "the
+/// total deadline is gone" from "the total deadline was not reached".
+#[tokio::test]
+async fn a_body_trickling_past_the_old_total_deadline_now_completes() {
+    let body: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let expected = sha256_hex(&body);
+    // 24 chunks x 500ms = ~12s, comfortably past the retired 10s total
+    // deadline, with no single gap anywhere near the 30s default stall
+    // timeout.
+    let addr =
+        spawn_trickling_server(body.clone(), 24, std::time::Duration::from_millis(500)).await;
+
+    let (_dir, db) = open_db();
+    let cache = IndexCache::new(db);
+    let base = Url::parse("http://127.0.0.1/simple/").expect("valid base url");
+    // Default download limits on purpose: the fix has to hold for an
+    // operator who configures nothing.
+    let upstream = Upstream::new(base, cache).expect("construct upstream");
+
+    let entry = entry_at(
+        &format!("http://{addr}/packages/big-1.0.0-py3-none-any.whl"),
+        "big-1.0.0-py3-none-any.whl",
+    );
+    let dest_dir = tempfile::tempdir().expect("create dest dir");
+    let dest = dest_dir.path().join("big-1.0.0-py3-none-any.whl");
+
+    let started = std::time::Instant::now();
+    let digest = upstream
+        .download(&entry, &dest)
+        .await
+        .expect("a slow but healthy transfer must complete, not time out");
+    let elapsed = started.elapsed();
+
+    assert_eq!(digest, expected, "every byte must have been hashed");
+    assert_eq!(
+        std::fs::metadata(&dest).expect("stat dest").len() as usize,
+        body.len()
+    );
+    assert!(
+        elapsed > std::time::Duration::from_secs(10),
+        "the fixture must actually have run past the old 10s deadline to \
+         prove anything; it took {elapsed:?}"
+    );
+}
+
+/// A genuinely stalled body — no bytes at all for longer than the
+/// configured stall timeout — must still fail, and fail closed: no
+/// partial file left where a caller might find it.
+#[tokio::test]
+async fn a_stalled_body_still_fails_closed() {
+    let addr = spawn_stalling_server(b"the first few bytes".to_vec(), 1024 * 1024).await;
+
+    let (_dir, db) = open_db();
+    let cache = IndexCache::new(db);
+    let base = Url::parse("http://127.0.0.1/simple/").expect("valid base url");
+    let limits = supply_chain_scanner::config::DownloadLimits {
+        stall_timeout: std::time::Duration::from_millis(300),
+        max_duration: std::time::Duration::from_secs(60),
+    };
+    let upstream = Upstream::with_limits(base, cache, &limits).expect("construct upstream");
+
+    let entry = entry_at(
+        &format!("http://{addr}/packages/stalled-1.0.0.tar.gz"),
+        "stalled-1.0.0.tar.gz",
+    );
+    let dest_dir = tempfile::tempdir().expect("create dest dir");
+    let dest = dest_dir.path().join("stalled-1.0.0.tar.gz");
+
+    let started = std::time::Instant::now();
+    let result = upstream.download(&entry, &dest).await;
+    let elapsed = started.elapsed();
+    assert!(
+        result.is_err(),
+        "a stalled transfer must fail rather than hang or half-succeed"
+    );
+    // Well under both the retired 10s total deadline and the 60s absolute
+    // cap, so the only thing that could have caught this is the 300ms
+    // stall timeout — which is the point: stall detection, not duration.
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "the stall timeout must be what caught this, but it took {elapsed:?}"
+    );
+    assert!(
+        !dest.exists(),
+        "a failed download must leave nothing at dest"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(dest_dir.path())
+        .expect("read dest dir")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a failed download must not leave its temp file behind: {leftovers:?}"
+    );
+}
+
+/// The absolute cap is the backstop behind stall detection: a transfer
+/// that keeps dribbling bytes forever cannot run unbounded.
+#[tokio::test]
+async fn the_absolute_download_cap_still_bounds_an_endlessly_slow_transfer() {
+    let body: Vec<u8> = vec![7u8; 8 * 1024];
+    // 32 chunks x 200ms = ~6.4s of trickling, against a 1s cap.
+    let addr = spawn_trickling_server(body, 32, std::time::Duration::from_millis(200)).await;
+
+    let (_dir, db) = open_db();
+    let cache = IndexCache::new(db);
+    let base = Url::parse("http://127.0.0.1/simple/").expect("valid base url");
+    let limits = supply_chain_scanner::config::DownloadLimits {
+        // Never trips: each gap is 200ms.
+        stall_timeout: std::time::Duration::from_secs(30),
+        max_duration: std::time::Duration::from_secs(1),
+    };
+    let upstream = Upstream::with_limits(base, cache, &limits).expect("construct upstream");
+
+    let entry = entry_at(
+        &format!("http://{addr}/packages/endless-1.0.0.tar.gz"),
+        "endless-1.0.0.tar.gz",
+    );
+    let dest_dir = tempfile::tempdir().expect("create dest dir");
+    let dest = dest_dir.path().join("endless-1.0.0.tar.gz");
+
+    let result = upstream.download(&entry, &dest).await;
+    assert!(
+        result.is_err(),
+        "a transfer past the absolute cap must fail, not run forever"
+    );
+    assert!(!dest.exists(), "nothing may be left at dest");
+}

@@ -68,7 +68,7 @@ async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
     tracing::info!(
         reloadable = "cve, plugins, allowlist, public_url, scan_budget",
         restart_only = "bind, db_path, cache_dir, upstream_url, advisory_source_url, \
-                        advisory_sync_interval, cache_ttl",
+                        advisory_sync_interval, cache_ttl, download",
         "SIGHUP reloads the fields under `reloadable` (rebuilding the policy, the \
          fingerprint and the plugin sandbox); a SIGHUP whose file changes any field \
          under `restart_only` is rejected in full and names the field"

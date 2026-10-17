@@ -137,6 +137,7 @@ fn base_config(
             require_fix_available: false,
             unknown_severity: UnknownSeverity::Allow,
         },
+        download: Default::default(),
         allowlist: Vec::new(),
         plugins: Vec::new(),
     }

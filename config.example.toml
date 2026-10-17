@@ -65,3 +65,24 @@ version = "1.2.3"
 name = "yara-malware"
 binary = "/opt/scanner/plugins/yara-malware"
 timeout = "5s"
+
+# Timeouts for downloading an artifact's bytes. Optional — defaults shown.
+#
+# Deliberately NOT a total per-request deadline: a total deadline on a
+# download path is a cap on artifact size disguised as a cap on time (at
+# 10s total, a 900 MB `torch` wheel would need a sustained 90 MB/s, so
+# every large ML/CUDA wheel becomes permanently unservable). Instead:
+[download]
+# Abandon a transfer that goes this long without receiving a single byte.
+# Resets on every successful read, so an honest slow download of a large
+# artifact is never penalized for being large, while a dead connection
+# still fails in seconds.
+stall_timeout = "30s"
+
+# Absolute backstop against a connection that dribbles a byte at a time
+# forever, which stall detection alone cannot catch. Generous on purpose:
+# this allows PyPI's largest (~1 GB) artifacts at a sustained 600 KB/s.
+# A download that outlives `scan_budget` is normal — the request returns a
+# retryable "scan in progress" while the detached scan finishes and stores
+# its verdict.
+max_duration = "30m"

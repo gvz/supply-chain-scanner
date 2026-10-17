@@ -44,10 +44,71 @@ pub struct Config {
     #[serde(default = "default_advisory_source_url")]
     pub advisory_source_url: Url,
     pub cve: CveLine,
+    /// Timeouts for downloading an artifact's bytes. Optional — see
+    /// [`DownloadLimits::default`].
+    #[serde(default)]
+    pub download: DownloadLimits,
     #[serde(default)]
     pub allowlist: Vec<AllowEntry>,
     #[serde(default)]
     pub plugins: Vec<PluginConfig>,
+}
+
+/// How long an artifact download may take.
+///
+/// These exist because the obvious knob — one total request deadline — is
+/// the wrong shape for this job. `reqwest`'s `ClientBuilder::timeout`
+/// applies from connect until the response body finishes, so a 10 second
+/// total deadline silently capped every servable artifact at 10 seconds ×
+/// sustained throughput: a 300 MB wheel needed 30 MB/s held for the whole
+/// transfer, and a 900 MB `torch` wheel needed 90 MB/s. Every large
+/// ML/CUDA wheel was permanently unservable, surfacing to a developer as a
+/// 503 that pip retries five times and then reports as an upstream
+/// problem. A developer who cannot `pip install torch` through the proxy
+/// sets `--index-url https://pypi.org/simple` the same afternoon, which is
+/// the project's first anti-goal firing on ordinary input.
+///
+/// So the download path detects *stalls* instead of bounding *duration*,
+/// with a generous absolute cap behind it as a backstop. The index-page
+/// path is unaffected and keeps its total deadline: it fetches small
+/// documents and sits in front of the scan budget.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DownloadLimits {
+    /// How long a transfer may go without receiving a single byte before
+    /// it is abandoned. This is the real safety limit: it catches a dead
+    /// or black-holed connection in seconds regardless of artifact size,
+    /// and it resets on every successful read, so an honest slow transfer
+    /// is never penalized for being large.
+    ///
+    /// 30s is well above any pause a healthy CDN introduces mid-transfer
+    /// and well below the point at which an operator would think the
+    /// proxy had hung.
+    #[serde(with = "humantime_serde")]
+    pub stall_timeout: Duration,
+
+    /// Absolute cap on one download, as a backstop against a connection
+    /// that dribbles a byte at a time forever (which stall detection
+    /// alone would never catch).
+    ///
+    /// 30 minutes is deliberately generous: the largest artifacts on PyPI
+    /// are roughly 1 GB, which this allows at a sustained 600 KB/s — slow
+    /// enough to cover a bad day on a bad link, which is exactly the case
+    /// a tight cap gets wrong. A scan that outlives the much shorter
+    /// `scan_budget` is not a failure: the request returns a retryable
+    /// scan-in-progress while the detached scan keeps running and stores
+    /// its verdict, so the developer's retry lands on a stored decision.
+    #[serde(with = "humantime_serde")]
+    pub max_duration: Duration,
+}
+
+impl Default for DownloadLimits {
+    fn default() -> Self {
+        Self {
+            stall_timeout: Duration::from_secs(30),
+            max_duration: Duration::from_secs(30 * 60),
+        }
+    }
 }
 
 /// The org's line on CVE/advisory severity.

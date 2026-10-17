@@ -21,6 +21,10 @@ humantime-serde = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = { version = "2", features = ["serde"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+r2d2 = "0.8.10"
+r2d2_sqlite = "0.35.0"
+rand = "0.10.3"
 
 [dev-dependencies]
 tempfile = "3"

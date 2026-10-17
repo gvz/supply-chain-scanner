@@ -7,4 +7,5 @@
 //! tests can exercise the public API directly.
 
 pub mod config;
+pub mod db;
 pub mod model;

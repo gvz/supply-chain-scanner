@@ -1,0 +1,285 @@
+//! Integration tests for `supply_chain_scanner::db` (SQLite store, migrations,
+//! per-artifact verdict store).
+
+use supply_chain_scanner::db::verdict::VerdictStore;
+use supply_chain_scanner::db::Db;
+use supply_chain_scanner::model::{ArtifactKey, RefusalReason, Verdict};
+
+const FINGERPRINT_A: &str = "fingerprint-a";
+const FINGERPRINT_B: &str = "fingerprint-b";
+
+fn open_db() -> (tempfile::TempDir, Db) {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let db = Db::open(&dir.path().join("scanner.db")).expect("open db");
+    (dir, db)
+}
+
+fn key(filename: &str, sha256: &str) -> ArtifactKey {
+    ArtifactKey {
+        ecosystem: "pypi".to_string(),
+        package: "example-package".to_string(),
+        version: "1.2.3".to_string(),
+        filename: filename.to_string(),
+        sha256: sha256.to_string(),
+    }
+}
+
+#[test]
+fn put_then_get_roundtrips_clean_verdict() {
+    let (_dir, db) = open_db();
+    let store = VerdictStore::new(db);
+    let k = key(
+        "example_package-1.2.3-py3-none-any.whl",
+        "a".repeat(64).as_str(),
+    );
+
+    store
+        .put(&k, &Verdict::Clean, FINGERPRINT_A)
+        .expect("put clean verdict");
+
+    let stored = store
+        .get(&k, FINGERPRINT_A)
+        .expect("get should succeed")
+        .expect("verdict must be present");
+
+    assert_eq!(stored.verdict, Verdict::Clean);
+}
+
+#[test]
+fn put_then_get_roundtrips_blocked_verdict_with_reason() {
+    let (_dir, db) = open_db();
+    let store = VerdictStore::new(db);
+    let k = key("example_package-1.2.3.tar.gz", "b".repeat(64).as_str());
+    let reason = RefusalReason {
+        code: "cve:high".to_string(),
+        detail: "CVE-2024-0001 (CVSS 9.1), no fix available".to_string(),
+    };
+
+    store
+        .put(&k, &Verdict::Blocked(reason.clone()), FINGERPRINT_A)
+        .expect("put blocked verdict");
+
+    let stored = store
+        .get(&k, FINGERPRINT_A)
+        .expect("get should succeed")
+        .expect("verdict must be present");
+
+    match stored.verdict {
+        Verdict::Blocked(stored_reason) => {
+            assert_eq!(stored_reason.code, reason.code);
+            assert_eq!(stored_reason.detail, reason.detail);
+        }
+        Verdict::Clean => panic!("expected a blocked verdict"),
+    }
+}
+
+#[test]
+fn get_with_different_fingerprint_returns_none() {
+    let (_dir, db) = open_db();
+    let store = VerdictStore::new(db);
+    let k = key(
+        "example_package-1.2.3-py3-none-any.whl",
+        "c".repeat(64).as_str(),
+    );
+
+    store
+        .put(&k, &Verdict::Clean, FINGERPRINT_A)
+        .expect("put clean verdict");
+
+    let stored = store
+        .get(&k, FINGERPRINT_B)
+        .expect("get should succeed, just with no match");
+
+    assert!(
+        stored.is_none(),
+        "a stale fingerprint must not return a stored verdict"
+    );
+}
+
+#[test]
+fn put_twice_updates_in_place_and_keeps_one_row() {
+    let (_dir, db) = open_db();
+    let store = VerdictStore::new(db.clone());
+    let k = key(
+        "example_package-1.2.3-py3-none-any.whl",
+        "d".repeat(64).as_str(),
+    );
+
+    let why_id_1 = store
+        .put(&k, &Verdict::Clean, FINGERPRINT_A)
+        .expect("first put");
+
+    let reason = RefusalReason {
+        code: "plugin:yara".to_string(),
+        detail: "matched malware signature".to_string(),
+    };
+    let why_id_2 = store
+        .put(&k, &Verdict::Blocked(reason), FINGERPRINT_B)
+        .expect("second put (re-scan under a new policy)");
+
+    assert_eq!(
+        why_id_1, why_id_2,
+        "upserting the same artifact must reuse the existing why_id"
+    );
+
+    let stored = store
+        .get(&k, FINGERPRINT_B)
+        .expect("get should succeed")
+        .expect("verdict must be present after update");
+    assert!(matches!(stored.verdict, Verdict::Blocked(_)));
+
+    let conn = db.conn().expect("get pooled connection");
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM verdicts", [], |row| row.get(0))
+        .expect("count rows");
+    assert_eq!(count, 1, "there must be exactly one row for this artifact");
+}
+
+#[test]
+fn why_id_is_url_safe_and_resolves_to_the_verdict() {
+    let (_dir, db) = open_db();
+    let store = VerdictStore::new(db);
+    let k = key(
+        "example_package-1.2.3-py3-none-any.whl",
+        "e".repeat(64).as_str(),
+    );
+
+    let why_id = store
+        .put(&k, &Verdict::Clean, FINGERPRINT_A)
+        .expect("put clean verdict");
+
+    assert!(
+        why_id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+        "why_id must be URL-safe (lowercase alphanumeric only): {why_id:?}"
+    );
+    assert_eq!(why_id.len(), 16, "why_id must be 16 characters long");
+
+    let (resolved_key, stored) = store
+        .get_by_why_id(&why_id)
+        .expect("get_by_why_id should succeed")
+        .expect("why_id must resolve to a verdict");
+
+    assert_eq!(resolved_key, k);
+    assert_eq!(stored.verdict, Verdict::Clean);
+    assert_eq!(stored.why_id, why_id);
+}
+
+#[test]
+fn two_artifacts_of_same_version_are_stored_separately() {
+    let (_dir, db) = open_db();
+    let store = VerdictStore::new(db.clone());
+    let wheel = key(
+        "example_package-1.2.3-py3-none-any.whl",
+        "f".repeat(64).as_str(),
+    );
+    let sdist = key("example_package-1.2.3.tar.gz", "0".repeat(64).as_str());
+
+    store
+        .put(&sdist, &Verdict::Clean, FINGERPRINT_A)
+        .expect("put clean sdist verdict");
+
+    let reason = RefusalReason {
+        code: "cve:high".to_string(),
+        detail: "unscanned wheel must not ride on the sdist's clean verdict".to_string(),
+    };
+    store
+        .put(&wheel, &Verdict::Blocked(reason), FINGERPRINT_A)
+        .expect("put blocked wheel verdict");
+
+    let sdist_stored = store
+        .get(&sdist, FINGERPRINT_A)
+        .expect("get sdist")
+        .expect("sdist verdict must be present");
+    assert_eq!(sdist_stored.verdict, Verdict::Clean);
+
+    let wheel_stored = store
+        .get(&wheel, FINGERPRINT_A)
+        .expect("get wheel")
+        .expect("wheel verdict must be present");
+    assert!(matches!(wheel_stored.verdict, Verdict::Blocked(_)));
+
+    let conn = db.conn().expect("get pooled connection");
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM verdicts", [], |row| row.get(0))
+        .expect("count rows");
+    assert_eq!(
+        count, 2,
+        "the sdist and the wheel must be stored as separate rows"
+    );
+}
+
+#[test]
+fn blocked_filenames_lists_only_blocked_current_fingerprint_rows() {
+    let (_dir, db) = open_db();
+    let store = VerdictStore::new(db);
+
+    let clean_wheel = key(
+        "example_package-1.2.3-py3-none-any.whl",
+        "1".repeat(64).as_str(),
+    );
+    let blocked_sdist = key("example_package-1.2.3.tar.gz", "2".repeat(64).as_str());
+    let stale_blocked = key(
+        "example_package-1.2.3-cp311-cp311-linux_x86_64.whl",
+        "3".repeat(64).as_str(),
+    );
+
+    store
+        .put(&clean_wheel, &Verdict::Clean, FINGERPRINT_A)
+        .expect("put clean wheel");
+
+    let reason = RefusalReason {
+        code: "cve:high".to_string(),
+        detail: "blocked".to_string(),
+    };
+    store
+        .put(
+            &blocked_sdist,
+            &Verdict::Blocked(reason.clone()),
+            FINGERPRINT_A,
+        )
+        .expect("put blocked sdist");
+
+    // Blocked under the OLD fingerprint; policy has since changed, so it
+    // must not show up under the current fingerprint.
+    store
+        .put(&stale_blocked, &Verdict::Blocked(reason), FINGERPRINT_B)
+        .expect("put stale blocked artifact");
+
+    let blocked = store
+        .blocked_filenames("pypi", "example-package", FINGERPRINT_A)
+        .expect("blocked_filenames should succeed");
+
+    assert_eq!(blocked.len(), 1);
+    assert!(blocked.contains("example_package-1.2.3.tar.gz"));
+    assert!(!blocked.contains("example_package-1.2.3-py3-none-any.whl"));
+    assert!(!blocked.contains("example_package-1.2.3-cp311-cp311-linux_x86_64.whl"));
+}
+
+#[test]
+fn open_is_idempotent_and_migrations_rerun_cleanly() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let path = dir.path().join("scanner.db");
+
+    let db1 = Db::open(&path).expect("first open runs migrations");
+    let store1 = VerdictStore::new(db1);
+    let k = key(
+        "example_package-1.2.3-py3-none-any.whl",
+        "4".repeat(64).as_str(),
+    );
+    store1
+        .put(&k, &Verdict::Clean, FINGERPRINT_A)
+        .expect("put survives across opens");
+
+    // Re-opening the same database file must not fail and must not disturb
+    // existing data, even though migrations have already been applied.
+    let db2 = Db::open(&path).expect("second open is idempotent");
+    let store2 = VerdictStore::new(db2);
+
+    let stored = store2
+        .get(&k, FINGERPRINT_A)
+        .expect("get should succeed")
+        .expect("verdict written before reopening must survive");
+    assert_eq!(stored.verdict, Verdict::Clean);
+}

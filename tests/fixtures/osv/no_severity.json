@@ -1,0 +1,13 @@
+{
+  "id": "PYSEC-2024-3",
+  "summary": "Unscored-Package has an unspecified issue with no severity data",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "Unscored-Package"
+      },
+      "versions": ["0.1.0"]
+    }
+  ]
+}

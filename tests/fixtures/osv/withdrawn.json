@@ -1,0 +1,13 @@
+{
+  "id": "PYSEC-2024-5",
+  "summary": "Withdrawn-Package advisory present in the first sync but gone in the second",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "Withdrawn-Package"
+      },
+      "versions": ["0.9.0"]
+    }
+  ]
+}

@@ -6,6 +6,7 @@
 //! This crate is organized as a library plus a thin binary so integration
 //! tests can exercise the public API directly.
 
+pub mod advisory;
 pub mod config;
 pub mod db;
 pub mod ecosystem;

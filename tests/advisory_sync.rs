@@ -1,0 +1,299 @@
+//! Integration tests for `supply_chain_scanner::advisory` (OSV document
+//! parsing and CVSS scoring) and `supply_chain_scanner::db::advisory` (the
+//! local advisory mirror and its atomic sync), using `wiremock` as a
+//! stand-in for the upstream OSV feed.
+
+use std::io::Write as _;
+
+use supply_chain_scanner::advisory::osv::{parse_osv, severity_score, OsvSync};
+use supply_chain_scanner::db::advisory::AdvisoryStore;
+use supply_chain_scanner::db::Db;
+use url::Url;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+use zip::write::SimpleFileOptions;
+use zip::ZipWriter;
+
+fn open_db() -> (tempfile::TempDir, Db) {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let db = Db::open(&dir.path().join("scanner.db")).expect("open db");
+    (dir, db)
+}
+
+/// Reads a fixture JSON document from `tests/fixtures/osv/`.
+fn fixture(name: &str) -> String {
+    let path = format!("{}/tests/fixtures/osv/{name}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("reading fixture {path}: {err}"))
+}
+
+/// Builds an in-memory zip (uncompressed, so no compression feature is
+/// needed to write it) containing one entry per document in `docs`.
+fn zip_of(docs: &[&str]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let cursor = std::io::Cursor::new(&mut buf);
+        let mut writer = ZipWriter::new(cursor);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (index, doc) in docs.iter().enumerate() {
+            writer
+                .start_file(format!("advisory-{index}.json"), options)
+                .expect("start zip entry");
+            writer.write_all(doc.as_bytes()).expect("write zip entry");
+        }
+        writer.finish().expect("finish zip");
+    }
+    buf
+}
+
+// ---- parse_osv ----
+
+#[test]
+fn parse_osv_extracts_id_package_and_enumerated_versions() {
+    let advisories = parse_osv(&fixture("basic.json")).expect("parse basic fixture");
+    assert_eq!(advisories.len(), 1);
+    let adv = &advisories[0];
+    assert_eq!(adv.id, "PYSEC-2024-1");
+    assert_eq!(
+        adv.package, "example-package",
+        "package name must be PEP 503 normalized"
+    );
+    assert_eq!(adv.versions, vec!["1.0.0", "1.1.0", "1.2.0"]);
+}
+
+#[test]
+fn parse_osv_extracts_introduced_and_fixed_ranges() {
+    let advisories = parse_osv(&fixture("ranges.json")).expect("parse ranges fixture");
+    assert_eq!(advisories.len(), 1);
+    let adv = &advisories[0];
+    assert_eq!(adv.ranges.len(), 1);
+    assert_eq!(adv.ranges[0].introduced, Some("0".to_string()));
+    assert_eq!(adv.ranges[0].fixed, Some("2.0.0".to_string()));
+    assert_eq!(
+        adv.fixed_versions,
+        vec!["2.0.0".to_string()],
+        "fixed_versions must be derived from the ranges' fixed events"
+    );
+}
+
+#[test]
+fn parse_osv_entry_without_severity_yields_none() {
+    let advisories = parse_osv(&fixture("no_severity.json")).expect("parse no_severity fixture");
+    assert_eq!(advisories.len(), 1);
+    assert_eq!(
+        advisories[0].severity, None,
+        "a document with no severity[] entries must yield None, not a default score"
+    );
+}
+
+#[test]
+fn parse_osv_entry_with_multiple_affected_packages_yields_one_advisory_each() {
+    let advisories =
+        parse_osv(&fixture("multi_affected.json")).expect("parse multi_affected fixture");
+    assert_eq!(advisories.len(), 2);
+    assert_eq!(advisories[0].package, "package-one");
+    assert_eq!(advisories[1].package, "package-two");
+    assert_eq!(advisories[0].id, "PYSEC-2024-4");
+    assert_eq!(advisories[1].id, "PYSEC-2024-4");
+}
+
+// ---- severity_score ----
+
+#[test]
+fn severity_score_parses_cvss_v3_vector() {
+    let score = severity_score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+        .expect("a well-formed CVSS v3.1 vector must parse");
+    assert!((score - 9.8).abs() < 0.05, "expected ~9.8, got {score}");
+}
+
+#[test]
+fn severity_score_parses_bare_numeric_score() {
+    let score = severity_score("7.5").expect("a bare numeric score must parse");
+    assert!((score - 7.5).abs() < f32::EPSILON);
+}
+
+#[test]
+fn severity_score_rejects_garbage() {
+    assert_eq!(
+        severity_score("not a vector or a number"),
+        None,
+        "garbage input must yield None, not 0.0"
+    );
+    assert_eq!(severity_score(""), None, "empty input must yield None");
+    assert_eq!(
+        severity_score("nan"),
+        None,
+        "the literal \"nan\" must never surface as Some(NaN)"
+    );
+}
+
+// ---- AdvisoryStore ----
+
+#[test]
+fn for_package_normalizes_the_lookup_name() {
+    let (_dir, db) = open_db();
+    let store = AdvisoryStore::new(db);
+    let advisories = parse_osv(&fixture("basic.json")).expect("parse basic fixture");
+    store
+        .replace_all("pypi", &advisories)
+        .expect("replace_all should succeed");
+
+    // The fixture's package is "Example-Package"; stored (and looked up)
+    // under its PEP 503 normalized form, "example-package".
+    let found = store
+        .for_package("pypi", "Example_Package")
+        .expect("lookup should succeed");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, "PYSEC-2024-1");
+}
+
+/// Regression test: `multi_affected.json` parses into two `Advisory` rows
+/// that share one OSV id but name different packages with different
+/// version lists. The store must accept both (no primary-key collision
+/// on the shared id) and must never let one package's versions leak into
+/// the other's lookup.
+#[test]
+fn replace_all_keeps_shared_advisory_id_rows_isolated_per_package() {
+    let (_dir, db) = open_db();
+    let store = AdvisoryStore::new(db);
+    let advisories =
+        parse_osv(&fixture("multi_affected.json")).expect("parse multi_affected fixture");
+    store
+        .replace_all("pypi", &advisories)
+        .expect("replace_all must accept two rows sharing one advisory id");
+
+    let package_one = store
+        .for_package("pypi", "package-one")
+        .expect("lookup should succeed");
+    assert_eq!(package_one.len(), 1);
+    assert_eq!(package_one[0].id, "PYSEC-2024-4");
+    assert_eq!(package_one[0].versions, vec!["1.0.0".to_string()]);
+
+    let package_two = store
+        .for_package("pypi", "package-two")
+        .expect("lookup should succeed");
+    assert_eq!(package_two.len(), 1);
+    assert_eq!(package_two[0].id, "PYSEC-2024-4");
+    assert_eq!(
+        package_two[0].versions,
+        vec!["2.0.0".to_string()],
+        "package-two must not see package-one's versions despite sharing an advisory id"
+    );
+}
+
+// ---- OsvSync ----
+
+#[tokio::test]
+async fn sync_pypi_ingests_a_zip_of_osv_docs() {
+    let server = MockServer::start().await;
+    let zip_bytes = zip_of(&[&fixture("basic.json"), &fixture("ranges.json")]);
+    Mock::given(method("GET"))
+        .and(path("/all.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
+        .mount(&server)
+        .await;
+
+    let (_dir, db) = open_db();
+    let store = AdvisoryStore::new(db);
+    let url = Url::parse(&format!("{}/all.zip", server.uri())).expect("valid url");
+    let sync = OsvSync::new(store, reqwest::Client::new(), url);
+
+    let count = sync.sync_pypi().await.expect("sync should succeed");
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn sync_pypi_replaces_previous_rows_atomically() {
+    let server = MockServer::start().await;
+    let first_zip = zip_of(&[&fixture("basic.json"), &fixture("withdrawn.json")]);
+    let second_zip = zip_of(&[&fixture("basic.json")]);
+
+    Mock::given(method("GET"))
+        .and(path("/all.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(first_zip))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/all.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(second_zip))
+        .mount(&server)
+        .await;
+
+    let (_dir, db) = open_db();
+    let sync_store = AdvisoryStore::new(db.clone());
+    let url = Url::parse(&format!("{}/all.zip", server.uri())).expect("valid url");
+    let sync = OsvSync::new(sync_store, reqwest::Client::new(), url);
+
+    sync.sync_pypi().await.expect("first sync should succeed");
+
+    let query_store = AdvisoryStore::new(db);
+    let withdrawn_before = query_store
+        .for_package("pypi", "withdrawn-package")
+        .expect("lookup should succeed");
+    assert_eq!(
+        withdrawn_before.len(),
+        1,
+        "withdrawn-package must be present after the first sync"
+    );
+
+    sync.sync_pypi().await.expect("second sync should succeed");
+
+    let withdrawn_after = query_store
+        .for_package("pypi", "withdrawn-package")
+        .expect("lookup should succeed");
+    assert!(
+        withdrawn_after.is_empty(),
+        "withdrawn-package must disappear once the second sync's set no longer includes it"
+    );
+
+    let still_present = query_store
+        .for_package("pypi", "example-package")
+        .expect("lookup should succeed");
+    assert_eq!(
+        still_present.len(),
+        1,
+        "example-package must still be present after the second sync"
+    );
+}
+
+#[tokio::test]
+async fn sync_pypi_failure_leaves_existing_advisories_intact() {
+    let server = MockServer::start().await;
+    let good_zip = zip_of(&[&fixture("basic.json")]);
+
+    Mock::given(method("GET"))
+        .and(path("/all.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(good_zip))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/all.zip"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let (_dir, db) = open_db();
+    let sync_store = AdvisoryStore::new(db.clone());
+    let url = Url::parse(&format!("{}/all.zip", server.uri())).expect("valid url");
+    let sync = OsvSync::new(sync_store, reqwest::Client::new(), url);
+
+    sync.sync_pypi().await.expect("first sync should succeed");
+
+    let result = sync.sync_pypi().await;
+    assert!(
+        result.is_err(),
+        "a failed download must surface as an error, not an empty success"
+    );
+
+    let query_store = AdvisoryStore::new(db);
+    let advisories = query_store
+        .for_package("pypi", "example-package")
+        .expect("lookup should succeed");
+    assert_eq!(
+        advisories.len(),
+        1,
+        "a failed sync must leave the previous advisories intact"
+    );
+}

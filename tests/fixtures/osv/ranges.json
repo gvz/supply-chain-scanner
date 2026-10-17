@@ -1,0 +1,21 @@
+{
+  "id": "PYSEC-2024-2",
+  "summary": "Ranged-Package has a buffer overflow before the fixed release",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "Ranged-Package"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            { "introduced": "0" },
+            { "fixed": "2.0.0" }
+          ]
+        }
+      ]
+    }
+  ]
+}

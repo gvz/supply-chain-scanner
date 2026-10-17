@@ -3,6 +3,7 @@
 //! cache metadata — lives in one file, opened once at startup through
 //! [`Db::open`].
 
+pub mod advisory;
 pub mod index_cache;
 pub mod migrations;
 pub mod verdict;

@@ -45,6 +45,56 @@ pub const MIGRATIONS: &[&str] = &[
         fetched_at  INTEGER NOT NULL
     )
     "#,
+    // 2: advisories — the local OSV mirror (task 6's `AdvisoryStore`),
+    // keyed per ecosystem and PEP 503 normalized package name.
+    // `replace_all` deletes every row for one ecosystem and reinserts the
+    // freshly parsed set inside a single transaction; `ON DELETE CASCADE`
+    // on the child tables means that one delete takes `advisory_versions`
+    // and `advisory_ranges` with it, so a withdrawn advisory's enumerated
+    // versions and ranges never outlive the advisory itself.
+    //
+    // The primary key is `(ecosystem, id, package)`, not just
+    // `(ecosystem, id)`: one OSV advisory id can list several affected
+    // packages (e.g. sibling distributions sharing a vulnerability), which
+    // `parse_osv` turns into one `Advisory` row per package, all carrying
+    // the same `id`. The child tables key on that same triple so each
+    // package's own versions/ranges never mix with another package's rows
+    // under a shared advisory id.
+    r#"
+    CREATE TABLE advisories (
+        ecosystem       TEXT NOT NULL,
+        id              TEXT NOT NULL,
+        package         TEXT NOT NULL,
+        summary         TEXT NOT NULL,
+        severity        REAL,
+        fixed_versions  TEXT NOT NULL,
+        PRIMARY KEY (ecosystem, id, package)
+    );
+    CREATE INDEX idx_advisories_ecosystem_package ON advisories(ecosystem, package);
+
+    CREATE TABLE advisory_versions (
+        ecosystem    TEXT NOT NULL,
+        advisory_id  TEXT NOT NULL,
+        package      TEXT NOT NULL,
+        version      TEXT NOT NULL,
+        FOREIGN KEY (ecosystem, advisory_id, package)
+            REFERENCES advisories(ecosystem, id, package) ON DELETE CASCADE
+    );
+    CREATE INDEX idx_advisory_versions_advisory
+        ON advisory_versions(ecosystem, advisory_id, package);
+
+    CREATE TABLE advisory_ranges (
+        ecosystem    TEXT NOT NULL,
+        advisory_id  TEXT NOT NULL,
+        package      TEXT NOT NULL,
+        introduced   TEXT,
+        fixed        TEXT,
+        FOREIGN KEY (ecosystem, advisory_id, package)
+            REFERENCES advisories(ecosystem, id, package) ON DELETE CASCADE
+    );
+    CREATE INDEX idx_advisory_ranges_advisory
+        ON advisory_ranges(ecosystem, advisory_id, package);
+    "#,
 ];
 
 /// Applies every migration in [`MIGRATIONS`] that hasn't already run

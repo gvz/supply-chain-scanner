@@ -1,0 +1,20 @@
+{
+  "id": "PYSEC-2024-4",
+  "summary": "A shared vulnerability in a pair of sibling distributions",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "Package-One"
+      },
+      "versions": ["1.0.0"]
+    },
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "Package-Two"
+      },
+      "versions": ["2.0.0"]
+    }
+  ]
+}

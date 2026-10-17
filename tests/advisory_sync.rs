@@ -6,6 +6,7 @@
 use std::io::Write as _;
 
 use supply_chain_scanner::advisory::osv::{parse_osv, severity_score, OsvSync};
+use supply_chain_scanner::advisory::VersionRange;
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::db::Db;
 use url::Url;
@@ -97,6 +98,66 @@ fn parse_osv_entry_with_multiple_affected_packages_yields_one_advisory_each() {
     assert_eq!(advisories[1].id, "PYSEC-2024-4");
 }
 
+/// Regression test for the defect this task fixes: `repeated_package.json`
+/// is modeled on the real OSV document `GHSA-22jm-4hxw-35jf`, which lists
+/// `PyPI/nova` three times in `affected[]` with disjoint version sets and
+/// disjoint ranges. `parse_osv` must merge same-package entries within one
+/// document into a single `Advisory`, unioning `versions` and `ranges`,
+/// rather than emitting one row per `affected[]` entry (which collides on
+/// the `(ecosystem, id, package)` primary key once stored).
+#[test]
+fn parse_osv_merges_repeated_affected_entries_for_the_same_package() {
+    let advisories =
+        parse_osv(&fixture("repeated_package.json")).expect("parse repeated_package fixture");
+
+    assert_eq!(
+        advisories.len(),
+        1,
+        "three affected[] entries for the same package must merge into one Advisory"
+    );
+    let adv = &advisories[0];
+    assert_eq!(adv.id, "PYSEC-2024-5");
+    assert_eq!(adv.package, "repeated-package");
+
+    assert_eq!(
+        adv.versions,
+        vec![
+            "0.9.0".to_string(),
+            "1.5.0".to_string(),
+            "2.5.0".to_string()
+        ],
+        "versions must be the union of all three entries' enumerated versions"
+    );
+
+    assert_eq!(
+        adv.ranges.len(),
+        3,
+        "ranges must be the union of all three entries' ranges"
+    );
+    assert!(adv.ranges.contains(&VersionRange {
+        introduced: Some("0".to_string()),
+        fixed: Some("1.0.0".to_string()),
+    }));
+    assert!(adv.ranges.contains(&VersionRange {
+        introduced: Some("1.1.0".to_string()),
+        fixed: Some("1.6.0".to_string()),
+    }));
+    assert!(adv.ranges.contains(&VersionRange {
+        introduced: Some("2.0.0".to_string()),
+        fixed: Some("2.6.0".to_string()),
+    }));
+
+    assert_eq!(
+        adv.fixed_versions,
+        vec![
+            "1.0.0".to_string(),
+            "1.6.0".to_string(),
+            "2.6.0".to_string()
+        ],
+        "fixed_versions must be the union of all three entries' fixed events"
+    );
+}
+
 // ---- severity_score ----
 
 #[test]
@@ -179,6 +240,56 @@ fn replace_all_keeps_shared_advisory_id_rows_isolated_per_package() {
         vec!["2.0.0".to_string()],
         "package-two must not see package-one's versions despite sharing an advisory id"
     );
+}
+
+/// Regression test for the defect this task fixes: before the fix,
+/// `parse_osv` emitted one `Advisory` row per `affected[]` entry, so a
+/// document repeating the same package (like `repeated_package.json`,
+/// modeled on the real `GHSA-22jm-4hxw-35jf`) produced three rows that all
+/// shared the `(ecosystem, id, package)` primary key, and `replace_all`
+/// failed with a primary-key violation inside its transaction — which is
+/// exactly the failure the live OSV feed hit at startup (1156 of 26370
+/// real documents repeat a package). After the fix, `parse_osv` merges
+/// those entries into one row before `replace_all` ever sees them, so the
+/// insert succeeds and the merged row round-trips through `for_package`
+/// with the union of versions and ranges intact.
+#[test]
+fn replace_all_accepts_merged_rows_for_a_repeated_package() {
+    let (_dir, db) = open_db();
+    let store = AdvisoryStore::new(db);
+    let advisories =
+        parse_osv(&fixture("repeated_package.json")).expect("parse repeated_package fixture");
+
+    store
+        .replace_all("pypi", &advisories)
+        .expect("replace_all must accept the merged row without a primary-key violation");
+
+    let found = store
+        .for_package("pypi", "Repeated-Package")
+        .expect("lookup should succeed");
+    assert_eq!(
+        found.len(),
+        1,
+        "exactly one merged advisory must round-trip"
+    );
+    assert_eq!(found[0].id, "PYSEC-2024-5");
+    assert_eq!(
+        found[0].versions,
+        vec![
+            "0.9.0".to_string(),
+            "1.5.0".to_string(),
+            "2.5.0".to_string()
+        ]
+    );
+    assert_eq!(
+        found[0].ranges.len(),
+        3,
+        "all three merged ranges must round-trip"
+    );
+    assert!(found[0].ranges.contains(&VersionRange {
+        introduced: Some("2.0.0".to_string()),
+        fixed: Some("2.6.0".to_string()),
+    }));
 }
 
 // ---- OsvSync ----

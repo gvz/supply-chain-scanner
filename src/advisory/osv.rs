@@ -10,6 +10,7 @@
 //! never disturbs the advisories already on disk — parsing happens
 //! entirely in memory before anything is written.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
@@ -76,44 +77,129 @@ struct OsvEvent {
     fixed: Option<String>,
 }
 
-/// Parses one OSV JSON document into one [`Advisory`] per entry in its
-/// `affected` array (one advisory can name several affected packages,
-/// e.g. across a project's sibling distributions).
+/// Parses one OSV JSON document into one [`Advisory`] per distinct
+/// `(ecosystem, package)` named in its `affected` array.
+///
+/// One advisory can name several affected packages (e.g. across a
+/// project's sibling distributions), and — this is the case this function
+/// must not get wrong — it can also list the *same* package more than
+/// once, typically once per disjoint version range (observed in
+/// `GHSA-22jm-4hxw-35jf`, which lists `PyPI/nova` three times). The
+/// `advisories` table's primary key is `(ecosystem, id, package)`, so
+/// emitting one row per `affected[]` entry would collide on that key for
+/// any document shaped like that — about 4.4% of the real OSV PyPI feed —
+/// and fail [`crate::db::advisory::AdvisoryStore::replace_all`]'s whole
+/// transaction. Instead, entries that share a package within one document
+/// are merged here, in [`merge_affected`], before a single [`Advisory`] is
+/// built for that package: their `versions` and `ranges` (and the
+/// `fixed_versions` derived from those ranges) are unioned, deduplicating
+/// identical strings/ranges so the union doesn't grow needlessly. This is
+/// semantically exact, not an approximation: [`crate::advisory::matching`]
+/// already treats "affected" as "matches any enumerated version, or falls
+/// in any range" — a disjunction — so unioning ranges into one row changes
+/// nothing a matcher would observe versus keeping them as separate rows.
 ///
 /// Severity is computed once for the whole document — OSV's `severity`
-/// array is document-level, not per affected package — and shared by
-/// every advisory produced from it: the highest score among `severity[]`
-/// that [`severity_score`] can parse, or `None` if the array is empty or
-/// every entry is unparseable.
+/// array is document-level, not per affected package — as the highest
+/// score among `severity[]` that [`severity_score`] can parse, or `None`
+/// if the array is empty or every entry is unparseable. Every entry
+/// merged into one package's advisory therefore already carries the same
+/// value; merging takes the maximum of the two anyway (never
+/// `Some(f32::NAN)`), so the result stays correct even if a future OSV
+/// shape ever made severity vary per entry.
 pub fn parse_osv(json: &str) -> anyhow::Result<Vec<Advisory>> {
     let doc: OsvDoc = serde_json::from_str(json).context("parsing OSV JSON document")?;
     let severity = highest_severity(&doc.severity);
 
-    let advisories = doc
-        .affected
-        .iter()
-        .map(|affected| {
-            let ranges: Vec<VersionRange> = affected
-                .ranges
-                .iter()
-                .flat_map(|range| ranges_from_events(&range.events))
-                .collect();
-            let fixed_versions: Vec<String> =
-                ranges.iter().filter_map(|r| r.fixed.clone()).collect();
+    let mut advisories: Vec<Advisory> = Vec::new();
+    let mut index_by_package: HashMap<String, usize> = HashMap::new();
 
-            Advisory {
-                id: doc.id.clone(),
-                package: normalize_name(&affected.package.name),
-                summary: doc.summary.clone(),
-                severity,
-                versions: affected.versions.clone(),
-                ranges,
-                fixed_versions,
+    for affected in &doc.affected {
+        let package = normalize_name(&affected.package.name);
+        let ranges: Vec<VersionRange> = affected
+            .ranges
+            .iter()
+            .flat_map(|range| ranges_from_events(&range.events))
+            .collect();
+
+        match index_by_package.get(&package) {
+            Some(&index) => {
+                merge_affected(&mut advisories[index], &affected.versions, ranges, severity)
             }
-        })
-        .collect();
+            None => {
+                index_by_package.insert(package.clone(), advisories.len());
+                let mut adv = Advisory {
+                    id: doc.id.clone(),
+                    package,
+                    summary: doc.summary.clone(),
+                    severity: None,
+                    versions: Vec::new(),
+                    ranges: Vec::new(),
+                    fixed_versions: Vec::new(),
+                };
+                merge_affected(&mut adv, &affected.versions, ranges, severity);
+                advisories.push(adv);
+            }
+        }
+    }
 
     Ok(advisories)
+}
+
+/// Folds one `affected[]` entry's `versions`, `ranges`, and `severity` into
+/// `adv`, which may already hold a prior entry's data for the same
+/// package within the same document (see [`parse_osv`]).
+///
+/// `versions` and `ranges` are unioned: a value already present in `adv`
+/// (by equality) is not duplicated, so repeated calls for entries that
+/// happen to overlap don't grow the lists needlessly. Nothing already in
+/// `adv` is ever removed or replaced — a dropped range would be a package
+/// that stops being recognized as vulnerable — so every value from every
+/// merged entry is preserved exactly once. `fixed_versions` is then
+/// recomputed from the merged `ranges`, matching how a single, unmerged
+/// entry derives it. `severity` is folded with [`max_severity`], which
+/// never produces `Some(f32::NAN)`.
+fn merge_affected(
+    adv: &mut Advisory,
+    versions: &[String],
+    ranges: Vec<VersionRange>,
+    severity: Option<f32>,
+) {
+    for version in versions {
+        if !adv.versions.contains(version) {
+            adv.versions.push(version.clone());
+        }
+    }
+    for range in ranges {
+        if !adv.ranges.contains(&range) {
+            adv.ranges.push(range);
+        }
+    }
+    adv.fixed_versions =
+        adv.ranges
+            .iter()
+            .filter_map(|r| r.fixed.clone())
+            .fold(Vec::new(), |mut acc, fixed| {
+                if !acc.contains(&fixed) {
+                    acc.push(fixed);
+                }
+                acc
+            });
+    adv.severity = max_severity(adv.severity, severity);
+}
+
+/// The greater of two optional severities, or whichever one is `Some` if
+/// only one is, or `None` if both are. Both inputs are already guaranteed
+/// finite by [`severity_score`]/[`highest_severity`] — neither `NaN` nor
+/// any other non-finite value can reach this function — so a plain `>`
+/// comparison is safe and this can never produce `Some(f32::NAN)`.
+fn max_severity(a: Option<f32>, b: Option<f32>) -> Option<f32> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(if y > x { y } else { x }),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
+    }
 }
 
 /// The highest score among `entries` that [`severity_score`] can parse, or

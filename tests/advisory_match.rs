@@ -5,9 +5,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use supply_chain_scanner::advisory::matching::{affects, first_blocking};
+use supply_chain_scanner::advisory::osv::parse_osv;
 use supply_chain_scanner::advisory::{Advisory, VersionRange};
 use supply_chain_scanner::config::{Config, CveLine, UnknownSeverity};
 use supply_chain_scanner::policy::Policy;
+
+/// Reads a fixture JSON document from `tests/fixtures/osv/`, mirroring
+/// `tests/advisory_sync.rs`'s helper of the same name.
+fn fixture(name: &str) -> String {
+    let path = format!("{}/tests/fixtures/osv/{name}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("reading fixture {path}: {err}"))
+}
 
 /// A minimal, fully valid `Config` with no plugins and no allowlist
 /// entries. Individual tests clone and mutate the fields they care about.
@@ -286,6 +294,34 @@ fn refusal_detail_strips_control_chars_non_ascii_and_caps_length() {
         "sanitized summary must be capped at 200 characters, got {} chars: {:?}",
         summary_part.chars().count(),
         summary_part
+    );
+}
+
+/// Ties `parse_osv`'s affected-entry merge (fixed in this task) to
+/// `affects`: `repeated_package.json` has three `affected[]` entries for
+/// the same package, with disjoint ranges `[0, 1.0.0)`, `[1.1.0, 1.6.0)`,
+/// and `[2.0.0, 2.6.0)`. A version drawn from the *third* entry's range
+/// must still report as affected after the merge, proving the union did
+/// not lose a range (e.g. by only keeping the first or last entry seen).
+#[test]
+fn affects_recognizes_a_version_from_the_third_merged_range_entry() {
+    let advisories =
+        parse_osv(&fixture("repeated_package.json")).expect("parse repeated_package fixture");
+    assert_eq!(
+        advisories.len(),
+        1,
+        "the three entries must have merged into one Advisory"
+    );
+    let adv = &advisories[0];
+
+    assert!(
+        affects(adv, "2.3.0"),
+        "2.3.0 falls inside the third merged entry's range [2.0.0, 2.6.0) \
+         and must still be recognized as affected after the merge"
+    );
+    assert!(
+        !affects(adv, "1.8.0"),
+        "1.8.0 falls in the gap between the second and third ranges and must not affect"
     );
 }
 

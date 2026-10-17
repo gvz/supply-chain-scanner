@@ -147,10 +147,15 @@ const ELLIPSIS: &str = "...";
 /// whatever bytes are left over, ellipsized if it doesn't fit.
 ///
 /// If the URL alone (plus the fixed scaffold) does not fit in the
-/// budget — an absurdly long `public_url` — the code is dropped
-/// entirely rather than ellipsized to nothing: a developer with a link
-/// can always find the code on the page it points to, but a code with
-/// no link is a dead end.
+/// budget — an absurdly long `public_url` — the URL is dropped and the
+/// code kept, which is the opposite of the ordinary case and deliberately
+/// so. This branch used to emit `BLOCKED - why <url>` and rely on the URL
+/// being worth more than the code; but the phrase then goes through
+/// [`sanitize_phrase`], which caps at [`MAX_PHRASE_BYTES`] and cut that
+/// very URL mid-path. The result reached the wire as a link that looks
+/// clickable and is not — strictly worse than no link, and worse than the
+/// code it displaced. When the URL cannot survive intact there is nothing
+/// to reserve the budget for, so the code gets it.
 fn build_blocked_phrase(code: &str, why_url: Option<&str>) -> String {
     let Some(url) = why_url else {
         return format!("{BLOCKED_PREFIX}{code}");
@@ -158,7 +163,10 @@ fn build_blocked_phrase(code: &str, why_url: Option<&str>) -> String {
 
     let scaffold_and_url = BLOCKED_PREFIX.len() + WHY_SEPARATOR.len() + url.len();
     if scaffold_and_url > MAX_PHRASE_BYTES {
-        return format!("BLOCKED{WHY_SEPARATOR}{url}");
+        return format!(
+            "{BLOCKED_PREFIX}{}",
+            ellipsize(code, MAX_PHRASE_BYTES - BLOCKED_PREFIX.len())
+        );
     }
 
     let code_budget = MAX_PHRASE_BYTES - scaffold_and_url;
@@ -234,19 +242,67 @@ mod tests {
         assert!(response.status().is_client_error());
     }
 
+    /// This test used to assert that the full URL survived
+    /// `build_blocked_phrase` for an absurdly long `public_url`. It was
+    /// green and it was meaningless: `status_response` runs
+    /// `sanitize_phrase` afterwards, which caps at 120 bytes and cut that
+    /// very URL mid-path, so the only thing the old assertion proved was
+    /// that one intermediate function had not yet truncated it. It is now
+    /// asserted on the *post-sanitize* phrase — the bytes that actually
+    /// reach the wire — and on the behavior that was changed to make
+    /// those bytes useful: when the URL cannot fit intact it is dropped
+    /// in favor of the code, rather than being emitted as a link that
+    /// looks clickable and is not.
     #[test]
-    fn build_blocked_phrase_drops_the_code_when_even_the_bare_url_does_not_fit() {
-        // An absurdly long `public_url` leaves no room for the scaffold
-        // plus the URL, let alone any code. The code must be dropped
-        // (not ellipsized into nothing), and the full URL must still be
-        // present verbatim.
+    fn an_unfittable_why_url_is_dropped_for_the_code_in_the_phrase_on_the_wire() {
         let url = format!("http://localhost:8080/why/{}", "a".repeat(130));
-        let phrase = build_blocked_phrase("cve:high", Some(&url));
+        let raw = build_blocked_phrase("cve:high", Some(&url));
+        let on_the_wire = sanitize_phrase(&raw);
 
-        assert!(!phrase.contains("cve:high"));
         assert!(
-            phrase.contains(&url),
-            "the full URL must survive, got {phrase:?}"
+            on_the_wire.len() <= MAX_PHRASE_BYTES,
+            "the phrase on the wire is capped, got {} bytes",
+            on_the_wire.len()
+        );
+        assert!(
+            on_the_wire.contains("cve:high"),
+            "with no room for the URL, the code must be what survives, got \
+             {on_the_wire:?}"
+        );
+        assert!(
+            !on_the_wire.contains("/why/"),
+            "a URL that cannot fit must be dropped, not truncated into a \
+             link that looks clickable and is not, got {on_the_wire:?}"
+        );
+        // And the honest statement of the limitation: an operator with a
+        // `public_url` this long cannot get a usable link into the reason
+        // phrase at all. The `/why` page still exists and is still linked
+        // from nothing but the response body; only the HTTP/1.1 status
+        // line is too small for it.
+        assert!(
+            BLOCKED_PREFIX.len() + WHY_SEPARATOR.len() + url.len() > MAX_PHRASE_BYTES,
+            "this test only means something while the URL genuinely cannot fit"
+        );
+    }
+
+    /// The ordinary case, which the reservation policy exists for: when
+    /// the URL does fit, it survives intact on the wire and the code is
+    /// what gets shortened.
+    #[test]
+    fn a_fitting_why_url_survives_sanitization_intact() {
+        let url = format!("http://localhost:8080/why/{}", "c".repeat(40));
+        let raw = build_blocked_phrase(&"x".repeat(200), Some(&url));
+        let on_the_wire = sanitize_phrase(&raw);
+
+        assert!(on_the_wire.len() <= MAX_PHRASE_BYTES);
+        assert!(
+            on_the_wire.contains(&url),
+            "a URL that fits must reach the wire verbatim, got {on_the_wire:?}"
+        );
+        assert!(
+            on_the_wire.contains(ELLIPSIS),
+            "the code, not the URL, must be what was shortened, got \
+             {on_the_wire:?}"
         );
     }
 }

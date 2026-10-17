@@ -70,7 +70,41 @@ pub fn router(state: AppState, upstream: Arc<Upstream>) -> Router {
         )
         .route("/why/{id}", get(why::why_handler))
         .layer(Extension(upstream))
+        .layer(axum::middleware::from_fn(access_log))
         .with_state(state)
+}
+
+/// One line per request: method, path, status, and how long it took.
+///
+/// Without this there was no record that a request had happened at all, so
+/// an organization could not measure its own refusal rate — which is the
+/// only way anyone notices the false-positive anti-goal firing. A
+/// developer who gives up and switches back to `--index-url
+/// https://pypi.org/simple` produces no other signal.
+///
+/// Logged at `info!` so it is on by default, and paired with the
+/// per-decision `warn!`s in [`crate::scan`]: this line says a 403 happened
+/// on this URL, that one says which check produced it. `/healthz` is
+/// logged at `debug!` instead — it is a liveness probe, typically once a
+/// second, and would otherwise drown everything else.
+async fn access_log(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let started = std::time::Instant::now();
+
+    let response = next.run(request).await;
+
+    let status = response.status().as_u16();
+    let elapsed_ms = started.elapsed().as_millis();
+    if path == "/healthz" {
+        tracing::debug!(%method, %path, status, elapsed_ms, "request");
+    } else {
+        tracing::info!(%method, %path, status, elapsed_ms, "request");
+    }
+    response
 }
 
 async fn healthz() -> StatusCode {

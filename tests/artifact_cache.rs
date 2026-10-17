@@ -336,3 +336,207 @@ fn rejects_sha256_that_is_not_lowercase_hex() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Integrity: the cache must never hand back bytes it cannot vouch for
+// ---------------------------------------------------------------------------
+
+/// `evict_expired` read `sha256` straight out of the database and handed it
+/// to `path_for`, which slices `&sha256[0..2]`. `validated_sha256` guarded
+/// `get` and `insert` but not this path, so any short or non-hex value that
+/// ever reached the table — a schema change, a hand-edited row, a future
+/// caller that skipped the guard — panicked the eviction ticker instead of
+/// skipping the row.
+#[test]
+fn evict_expired_skips_a_malformed_sha256_row_instead_of_panicking() {
+    let (_db_dir, _cache_dir, db, cache) = open_cache();
+    let source_dir = tempfile::tempdir().expect("create source temp dir");
+
+    // One good, expired entry alongside the bad row, so the sweep has to
+    // survive the bad one *and* still do its job.
+    let good = "c".repeat(64);
+    let file = temp_source_file(&source_dir, "good.whl", b"good bytes");
+    cache.insert(&key(&good), &file).expect("insert good entry");
+    backdate_last_access(&db, &good, 10_000);
+
+    // A row `path_for` would panic on: shorter than the two characters it
+    // slices.
+    {
+        let conn = db.conn().expect("get connection");
+        conn.execute(
+            "INSERT INTO artifact_cache
+                 (sha256, ecosystem, package, version, filename, bytes, last_access)
+             VALUES ('x', 'pypi', 'p', '1', 'f.whl', 1, 0)",
+            [],
+        )
+        .expect("insert malformed row");
+    }
+
+    let removed = cache
+        .evict_expired(Duration::from_secs(60))
+        .expect("the sweep must not fail because of one bad row");
+    assert_eq!(
+        removed, 1,
+        "the good expired entry must still have been evicted"
+    );
+}
+
+/// `get` checked only `path.is_file()`, never the recorded length. A crash
+/// mid-write leaves a truncated file whose row says it is complete, and the
+/// scanner then serves those bytes as `Clean` forever — the artifact was
+/// hash-verified once, so nothing downstream re-checks it.
+#[test]
+fn get_treats_a_truncated_backing_file_as_a_miss_and_cleans_the_row() {
+    let (_db_dir, _cache_dir, db, cache) = open_cache();
+    let source_dir = tempfile::tempdir().expect("create source temp dir");
+
+    let sha = "d".repeat(64);
+    let file = temp_source_file(&source_dir, "full.whl", b"the complete artifact bytes");
+    let cached = cache.insert(&key(&sha), &file).expect("insert");
+    assert!(cache.get(&key(&sha)).expect("get").is_some());
+
+    // Simulate the crash: the file on disk is now shorter than its row.
+    std::fs::write(&cached, b"trunc").expect("truncate the cached file");
+
+    assert!(
+        cache.get(&key(&sha)).expect("get").is_none(),
+        "a file whose length disagrees with its row must be a miss, never \
+         served as verified bytes"
+    );
+    let conn = db.conn().expect("get connection");
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM artifact_cache WHERE sha256 = ?1",
+            [&sha],
+            |row| row.get(0),
+        )
+        .expect("count rows");
+    assert_eq!(rows, 0, "the stale row must be cleaned up");
+    assert!(
+        !cached.exists(),
+        "the untrustworthy file must be removed, not left for the next caller"
+    );
+}
+
+/// `insert` trusted any pre-existing file at the content-addressed path and
+/// deleted the incoming copy. After a crash left a truncated file there,
+/// the next request re-downloaded, verified, called `insert`, saw the file,
+/// deleted the *good* bytes, and wrote a row pointing at the truncated one.
+#[test]
+fn insert_replaces_a_pre_existing_file_whose_length_is_wrong() {
+    let (_db_dir, _cache_dir, _db, cache) = open_cache();
+    let source_dir = tempfile::tempdir().expect("create source temp dir");
+
+    let sha = "e".repeat(64);
+    let full = b"the complete artifact bytes".to_vec();
+
+    // Plant a truncated file at the content-addressed path with no row,
+    // exactly what a crash mid-copy leaves behind.
+    let file = temp_source_file(&source_dir, "probe.whl", &full);
+    let dest = cache
+        .insert(&key(&sha), &file)
+        .expect("insert to learn dest");
+    {
+        let conn = _db.conn().expect("get connection");
+        conn.execute("DELETE FROM artifact_cache", []).unwrap();
+    }
+    std::fs::write(&dest, b"trunc").expect("plant a truncated file");
+
+    // Now a fresh, hash-verified download arrives.
+    let good = temp_source_file(&source_dir, "good.whl", &full);
+    let path = cache.insert(&key(&sha), &good).expect("insert good bytes");
+
+    assert_eq!(
+        std::fs::read(&path).expect("read cached file"),
+        full,
+        "insert must not keep a pre-existing file whose length disagrees \
+         with the bytes it was handed"
+    );
+    assert!(
+        cache.get(&key(&sha)).expect("get").is_some(),
+        "the entry must now be a hit"
+    );
+}
+
+/// `insert` keeps a pre-existing file whose length *does* match, and
+/// removes the redundant incoming copy — the hit path, previously
+/// untested, which is where the bug above hid.
+#[test]
+fn insert_keeps_a_matching_pre_existing_file_and_drops_the_redundant_copy() {
+    let (_db_dir, _cache_dir, _db, cache) = open_cache();
+    let source_dir = tempfile::tempdir().expect("create source temp dir");
+
+    let sha = "f".repeat(64);
+    let content = b"identical bytes shipped twice".to_vec();
+
+    let first = temp_source_file(&source_dir, "first.whl", &content);
+    let dest = cache.insert(&key(&sha), &first).expect("first insert");
+
+    let second = temp_source_file(&source_dir, "second.whl", &content);
+    let again = cache.insert(&key(&sha), &second).expect("second insert");
+
+    assert_eq!(dest, again, "the same content must land at the same path");
+    assert!(
+        !second.exists(),
+        "the redundant incoming copy must be removed"
+    );
+    assert_eq!(std::fs::read(&dest).expect("read cached file"), content);
+}
+
+/// `move_into_place`'s `EXDEV` fallback used to `fs::copy` straight to the
+/// final path, so a crash mid-copy left a truncated file at a
+/// content-addressed path with no row behind it. It now copies to a temp
+/// name beside the destination and renames. Exercised here by pointing the
+/// cache root at a `tmpfs` mount when one is available — the real
+/// cross-device case — and otherwise by checking the same code path's
+/// observable contract on one filesystem.
+#[test]
+fn insert_across_a_device_boundary_lands_complete_bytes() {
+    let db_dir = tempfile::tempdir().expect("create db temp dir");
+    let db = Db::open(&db_dir.path().join("scanner.db")).expect("open db");
+
+    // `/dev/shm` is a tmpfs on Linux and therefore a different device
+    // from the usual `/tmp` backing store, which is what makes
+    // `fs::rename` return EXDEV.
+    let shm = std::path::Path::new("/dev/shm");
+    let (cache_root, _guard) = if shm.is_dir() {
+        let dir = tempfile::tempdir_in(shm).expect("create tmpfs temp dir");
+        (dir.path().join("artifacts"), Some(dir))
+    } else {
+        let dir = tempfile::tempdir().expect("create cache temp dir");
+        (dir.path().join("artifacts"), Some(dir))
+    };
+    let cache = ArtifactCache::new(db, cache_root).expect("create artifact cache");
+
+    // The source lives under the default temp dir, i.e. (usually) a
+    // different device from `/dev/shm`.
+    let source_dir = tempfile::tempdir().expect("create source temp dir");
+    let sha = "a".repeat(64);
+    let content: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let file = temp_source_file(&source_dir, "big.whl", &content);
+
+    let dest = cache.insert(&key(&sha), &file).expect("insert");
+    assert_eq!(
+        std::fs::read(&dest).expect("read cached file"),
+        content,
+        "every byte must survive the move, cross-device or not"
+    );
+    assert!(!file.exists(), "the source must have been consumed");
+    assert!(
+        cache.get(&key(&sha)).expect("get").is_some(),
+        "the entry must be a hit, i.e. the recorded length must match disk"
+    );
+
+    // No `.part` leftovers from the copy-then-rename fallback.
+    let shard = dest.parent().expect("shard dir");
+    let leftovers: Vec<_> = std::fs::read_dir(shard)
+        .expect("read shard dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path() != dest)
+        .map(|e| e.file_name())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the cross-device fallback must not leave temp files: {leftovers:?}"
+    );
+}

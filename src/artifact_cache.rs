@@ -60,15 +60,47 @@ impl ArtifactCache {
     /// returned, so the caller simply re-downloads and re-inserts rather
     /// than ever being handed a path to missing or partially-written
     /// bytes.
+    ///
+    /// The file's length is checked against the length recorded when it
+    /// was inserted, and a disagreement is treated exactly like a missing
+    /// file: a miss, with the row and the file both removed. `is_file()`
+    /// alone was not enough. A crash partway through writing into the
+    /// cache leaves a *truncated* file whose row says it is complete, and
+    /// nothing downstream re-verifies a cache hit — the artifact was
+    /// hash-verified once, on the way in — so those bytes would be served
+    /// as `Clean` for as long as the entry lived. Length is not a hash,
+    /// but it catches every truncation, which is the only corruption this
+    /// cache's own write path can produce.
     pub fn get(&self, key: &ArtifactKey) -> anyhow::Result<Option<PathBuf>> {
         let sha256 = validated_sha256(&key.sha256)?;
 
-        if self.store.get(sha256)?.is_none() {
+        let Some(entry) = self.store.get(sha256)? else {
             return Ok(None);
-        }
+        };
 
         let path = self.path_for(sha256);
-        if !path.is_file() {
+        let on_disk = match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => metadata.len(),
+            _ => {
+                self.store.remove(sha256)?;
+                return Ok(None);
+            }
+        };
+
+        let recorded = u64::try_from(entry.bytes).unwrap_or(u64::MAX);
+        if on_disk != recorded {
+            tracing::warn!(
+                sha256 = %sha256,
+                path = %path.display(),
+                recorded_bytes = recorded,
+                on_disk_bytes = on_disk,
+                "cached artifact file does not match its recorded length; \
+                 discarding it rather than serving bytes this cache cannot \
+                 vouch for. The artifact will be re-downloaded and re-verified."
+            );
+            // Remove the file too: leaving it would make the next
+            // `insert` for this hash take the already-cached branch.
+            let _ = std::fs::remove_file(&path);
             self.store.remove(sha256)?;
             return Ok(None);
         }
@@ -80,12 +112,22 @@ impl ArtifactCache {
     /// Moves `file` into the cache under `key`'s content hash and records
     /// its metadata, returning the path it now lives at.
     ///
-    /// `file` is expected to be a freshly downloaded temp file: on
-    /// success it no longer exists at its original path, having been
-    /// moved (or, if a same-filesystem rename isn't possible, copied and
-    /// then removed) into the cache. If the content is already cached
-    /// under this hash, the incoming file is redundant bytes and is
-    /// simply removed rather than kept around.
+    /// `file` is expected to be a freshly downloaded, already
+    /// hash-verified temp file: on success it no longer exists at its
+    /// original path, having been moved (or, if a same-filesystem rename
+    /// isn't possible, copied and then removed) into the cache.
+    ///
+    /// A file already present at the content-addressed path is kept, and
+    /// the incoming copy removed as redundant, **only if the two lengths
+    /// agree**. Trusting any pre-existing file unconditionally was a hole
+    /// with a complete failure sequence behind it: a crash mid-write
+    /// leaves a truncated file at the content-addressed path with no row;
+    /// the next request re-downloads, verifies the bytes, calls `insert`,
+    /// sees a file there, deletes the *good* bytes, and writes a row
+    /// pointing at the truncated ones. The incoming file has just been
+    /// verified against the index-declared hash, so when the lengths
+    /// disagree it is the pre-existing file that is wrong, and it is
+    /// replaced.
     pub fn insert(&self, key: &ArtifactKey, file: &Path) -> anyhow::Result<PathBuf> {
         let sha256 = validated_sha256(&key.sha256)?;
         let dest = self.path_for(sha256);
@@ -95,16 +137,38 @@ impl ArtifactCache {
                 .with_context(|| format!("creating cache shard directory {}", parent.display()))?;
         }
 
-        if dest.is_file() {
-            std::fs::remove_file(file).with_context(|| {
-                format!(
-                    "removing redundant source file {} (content already cached at {})",
-                    file.display(),
-                    dest.display()
-                )
-            })?;
-        } else {
-            move_into_place(file, &dest)?;
+        let incoming_bytes = std::fs::metadata(file)
+            .with_context(|| format!("statting incoming artifact file {}", file.display()))?
+            .len();
+
+        let existing_bytes = match std::fs::metadata(&dest) {
+            Ok(metadata) if metadata.is_file() => Some(metadata.len()),
+            _ => None,
+        };
+
+        match existing_bytes {
+            Some(bytes) if bytes == incoming_bytes => {
+                std::fs::remove_file(file).with_context(|| {
+                    format!(
+                        "removing redundant source file {} (content already cached at {})",
+                        file.display(),
+                        dest.display()
+                    )
+                })?;
+            }
+            Some(bytes) => {
+                tracing::warn!(
+                    sha256 = %sha256,
+                    path = %dest.display(),
+                    existing_bytes = bytes,
+                    incoming_bytes,
+                    "a file already at this content-addressed path has the wrong \
+                     length (most likely a truncated write left by an earlier \
+                     crash); replacing it with the freshly verified bytes"
+                );
+                move_into_place(file, &dest)?;
+            }
+            None => move_into_place(file, &dest)?,
         }
 
         let bytes = std::fs::metadata(&dest)
@@ -129,6 +193,20 @@ impl ArtifactCache {
 
         let mut removed = 0;
         for sha256 in expired {
+            // `path_for` slices `&sha256[0..2]`, and this value came
+            // straight out of the database rather than through
+            // `validated_sha256` the way `get` and `insert` do. One short
+            // or non-hex row — a hand-edited database, a future caller
+            // that skipped the guard — used to panic the eviction ticker
+            // instead of skipping the row.
+            let Ok(sha256) = validated_sha256(&sha256).map(str::to_owned) else {
+                tracing::warn!(
+                    sha256 = %sha256,
+                    "artifact cache row has a malformed sha256; skipping it \
+                     rather than deriving a path from it"
+                );
+                continue;
+            };
             let path = self.path_for(&sha256);
             match std::fs::remove_file(&path) {
                 Ok(()) => {
@@ -174,23 +252,45 @@ fn validated_sha256(sha256: &str) -> anyhow::Result<&str> {
     Ok(sha256)
 }
 
-/// Moves `src` to `dest`, falling back to copy-then-remove when the
+/// Moves `src` to `dest`, falling back to copy-then-rename when the
 /// rename fails because they're on different filesystems. The fallback
 /// matters because `src` is normally a freshly downloaded temp file and
 /// temp directories are sometimes a different mount than the cache root;
 /// losing a successfully scanned artifact to a plain rename error would
 /// be worse than paying for a copy.
+///
+/// The fallback copies to a temp name *beside* `dest` and then renames,
+/// never straight to `dest`. A `fs::copy` directly onto the
+/// content-addressed path is non-atomic: a crash partway through leaves a
+/// truncated file at exactly the path a cache hit is looked up by, with no
+/// row to contradict it. Copy-then-rename means `dest` only ever appears
+/// complete. The temp file is removed if the copy or the rename fails, so
+/// a failure leaves nothing behind either.
 fn move_into_place(src: &Path, dest: &Path) -> anyhow::Result<()> {
     match std::fs::rename(src, dest) {
         Ok(()) => Ok(()),
         Err(err) if err.raw_os_error() == Some(libc::EXDEV) => {
-            std::fs::copy(src, dest).with_context(|| {
-                format!(
-                    "copying {} to {} (cross-device move)",
-                    src.display(),
-                    dest.display()
-                )
-            })?;
+            let staged = staging_path_beside(dest)?;
+            if let Err(err) = std::fs::copy(src, &staged) {
+                let _ = std::fs::remove_file(&staged);
+                return Err(err).with_context(|| {
+                    format!(
+                        "copying {} to {} (cross-device move)",
+                        src.display(),
+                        staged.display()
+                    )
+                });
+            }
+            if let Err(err) = std::fs::rename(&staged, dest) {
+                let _ = std::fs::remove_file(&staged);
+                return Err(err).with_context(|| {
+                    format!(
+                        "renaming {} into place at {} after a cross-device copy",
+                        staged.display(),
+                        dest.display()
+                    )
+                });
+            }
             std::fs::remove_file(src).with_context(|| {
                 format!(
                     "removing source file {} after cross-device copy",
@@ -202,6 +302,24 @@ fn move_into_place(src: &Path, dest: &Path) -> anyhow::Result<()> {
         Err(err) => Err(err)
             .with_context(|| format!("moving {} into cache at {}", src.display(), dest.display())),
     }
+}
+
+/// A staging path in `dest`'s own directory, so the final rename is
+/// same-filesystem and therefore atomic. The name is randomized so two
+/// concurrent inserts of the same content cannot stage over each other.
+fn staging_path_beside(dest: &Path) -> anyhow::Result<PathBuf> {
+    let parent = dest
+        .parent()
+        .context("cache destination path has no parent directory")?;
+    let file_name = dest
+        .file_name()
+        .context("cache destination path has no file name")?
+        .to_string_lossy()
+        .into_owned();
+
+    let mut suffix = [0u8; 8];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut suffix);
+    Ok(parent.join(format!(".{file_name}.{}.part", hex::encode(suffix))))
 }
 
 fn now_unix() -> i64 {

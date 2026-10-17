@@ -1,0 +1,7 @@
+[book]
+title = "Supply Chain Scanner"
+authors = ["supply-chain-scanner contributors"]
+language = "en"
+src = "src"
+
+[output.html]

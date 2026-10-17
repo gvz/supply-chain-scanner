@@ -25,7 +25,7 @@
 //! gave up on still finishes and still gets stored.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
 
@@ -74,6 +74,11 @@ impl ScanCoordinator {
     /// after this call starts a fresh scan rather than joining a finished
     /// one — which is safe, because by construction the owner only calls
     /// this after any verdict it produced is already durably stored.
+    ///
+    /// Prefer [`FinishGuard`] over calling this directly from the owner's
+    /// task body: a bare call here is skipped if the scan body panics,
+    /// leaking the entry for the rest of the process's life (see
+    /// [`FinishGuard`]'s docs).
     pub fn finish(&self, sha256: &str) {
         self.inflight
             .lock()
@@ -85,6 +90,47 @@ impl ScanCoordinator {
 impl Default for ScanCoordinator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Guarantees [`ScanCoordinator::finish`] runs for the owner's sha256 no
+/// matter how its scan task exits — a normal return, an early `return`,
+/// or a panic unwinding through it.
+///
+/// Without this, a panic inside the owner's scan body (a bug in a future
+/// check, an unexpected `unwrap`, anything) unwinds straight past a bare
+/// `coordinator.finish(...)` call placed after the scan. The in-flight
+/// map entry is never removed. Every later request for that same sha256
+/// then calls [`ScanCoordinator::start_or_join`], finds the stale entry,
+/// and joins a receiver whose sender was already dropped during the
+/// panic — which [`wait_for_verdict`] correctly resolves to `None` (fail
+/// closed, never a false `Serve`), but *every* request for that artifact
+/// gets stuck there forever, for the life of the process: a permanent
+/// denial of service for one artifact, which is exactly the failure mode
+/// this project exists to avoid on the other side of the ledger.
+///
+/// Constructing a `FinishGuard` as the very first statement in the
+/// owner's task body — before the scan itself runs — means its `Drop`
+/// fires last among that task's locals, after the scan has produced its
+/// outcome and that outcome has been sent, on every exit path including
+/// one added later by a future change to that body.
+pub struct FinishGuard {
+    coordinator: Arc<ScanCoordinator>,
+    sha256: String,
+}
+
+impl FinishGuard {
+    pub fn new(coordinator: Arc<ScanCoordinator>, sha256: String) -> Self {
+        Self {
+            coordinator,
+            sha256,
+        }
+    }
+}
+
+impl Drop for FinishGuard {
+    fn drop(&mut self) {
+        self.coordinator.finish(&self.sha256);
     }
 }
 

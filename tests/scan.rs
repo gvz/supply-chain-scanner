@@ -900,3 +900,61 @@ async fn served_bytes_come_from_cache_on_the_second_request() {
     // already cached, so it must never touch upstream again.
     server.verify().await;
 }
+
+#[tokio::test]
+async fn allowlisted_package_behind_a_slow_upstream_returns_in_progress_within_budget() {
+    let server = MockServer::start().await;
+    let filename = "demo_package-1.0.0-py3-none-any.whl";
+    let body = build_wheel_bytes();
+    let sha256 = sha256_hex(&body);
+
+    // The delay is well past the budget below, so the allowlist path's
+    // fetch cannot finish before `decide()`'s own timeout elapses.
+    Mock::given(method("GET"))
+        .and(path(format!("/packages/{filename}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(body.clone())
+                .set_delay(Duration::from_millis(150)),
+        )
+        .mount(&server)
+        .await;
+
+    let mut cfg = base_config(Duration::from_millis(20));
+    cfg.allowlist = vec![AllowEntry {
+        package: "demo-package".to_string(),
+        version: "1.0.0".to_string(),
+    }];
+    let harness = build_harness(cfg, &server, FakeSandbox::empty());
+    let key = key_for(&sha256, filename);
+    let entry = entry_for(&server, filename, Some(&sha256));
+
+    let started = std::time::Instant::now();
+    let decision = harness.scanner.decide(&key, &entry).await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        decision,
+        Decision::InProgress,
+        "a slow upstream must not block an allowlisted request past its budget"
+    );
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "decide() took {elapsed:?}, which is not within the configured budget"
+    );
+
+    // The budget timeout must not have cancelled the fetch: give it time
+    // to finish in the background, then confirm a retried request finds
+    // the artifact already warm in the cache rather than paying for the
+    // download all over again.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let retried = harness.scanner.decide(&key, &entry).await;
+    match retried {
+        Decision::Serve(served_path) => {
+            assert_eq!(std::fs::read(&served_path).expect("read served file"), body);
+        }
+        other => panic!(
+            "a retried request must find the warm cache from the undetached fetch, got {other:?}"
+        ),
+    }
+}

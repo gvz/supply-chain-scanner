@@ -58,7 +58,7 @@ use crate::model::{ArtifactKey, RefusalReason, Verdict};
 use crate::plugin::{unpack, PluginRunner};
 use crate::policy::Policy;
 
-use coordinator::ScanCoordinator;
+use coordinator::{FinishGuard, ScanCoordinator};
 
 /// The cap, in characters, on a sanitized internal-error or upstream-error
 /// detail. These details can embed attacker-influenced or merely verbose
@@ -195,15 +195,40 @@ impl Scanner {
     pub async fn blocked_filenames(&self, ecosystem: &str, package: &str) -> HashSet<String> {
         let fingerprint = self.policy.fingerprint().to_string();
         let store = Arc::clone(&self.verdict_store);
-        let ecosystem = ecosystem.to_string();
-        let package = package.to_string();
+        let ecosystem_owned = ecosystem.to_string();
+        let package_owned = package.to_string();
 
-        tokio::task::spawn_blocking(move || {
-            store.blocked_filenames(&ecosystem, &package, &fingerprint)
+        let result = tokio::task::spawn_blocking(move || {
+            store.blocked_filenames(&ecosystem_owned, &package_owned, &fingerprint)
         })
-        .await
-        .unwrap_or_else(|_| Ok(HashSet::new()))
-        .unwrap_or_else(|_| HashSet::new())
+        .await;
+
+        match result {
+            Ok(Ok(filenames)) => filenames,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    ecosystem,
+                    package,
+                    error = %err,
+                    "blocked_filenames lookup failed; the index listing for this \
+                     package will not be filtered until this is resolved, though \
+                     decide() independently refuses any blocked artifact regardless"
+                );
+                HashSet::new()
+            }
+            Err(join_error) => {
+                tracing::warn!(
+                    ecosystem,
+                    package,
+                    error = %join_error,
+                    "blocked_filenames lookup task panicked; the index listing for \
+                     this package will not be filtered until this is resolved, \
+                     though decide() independently refuses any blocked artifact \
+                     regardless"
+                );
+                HashSet::new()
+            }
+        }
     }
 
     // -----------------------------------------------------------------
@@ -268,10 +293,17 @@ impl Scanner {
                 // budget timeout below, nor by any later joiner's. It
                 // runs to completion, stores whatever it finds, and
                 // reports the outcome to anyone still listening.
+                //
+                // `_finish_guard` is constructed first so its `Drop` runs
+                // last — after the scan and the send below on a normal
+                // exit, and in place of them if `run_full_scan` panics —
+                // so the coordinator's map entry for this sha256 is
+                // removed no matter how this task ends, never leaking it
+                // for the rest of the process's life.
                 let handle = tokio::spawn(async move {
+                    let _finish_guard = FinishGuard::new(coordinator, sha256_for_cleanup);
                     let decision = scanner.run_full_scan(&key, &entry, &fingerprint).await;
                     let _ = tx.send(verdict_for_dedup(&decision));
-                    coordinator.finish(&sha256_for_cleanup);
                     decision
                 });
 
@@ -509,13 +541,31 @@ impl Scanner {
     /// neither of those paths runs plugins again, so neither goes through
     /// [`Scanner::run_full_scan`].
     async fn fetch_decision(&self, key: &ArtifactKey, entry: &IndexEntry) -> Decision {
-        match self.fetch_verified_and_cache(key, entry).await {
-            Ok(path) => Decision::Serve(path),
-            Err(FetchError::Unverifiable(reason)) => Decision::Unverifiable(reason),
-            Err(FetchError::Mismatch(reason)) => Decision::Refuse {
+        let budget = self.config.current().scan_budget;
+        let scanner = self.clone();
+        let key = key.clone();
+        let entry = entry.clone();
+
+        // Detached, exactly like the full-scan owner in `scan_with_budget`:
+        // a slow-but-reachable upstream must not make this call block past
+        // the budget, but the download it's not cancelled on elapse — it
+        // keeps running, so a retried request shortly after can find the
+        // artifact already sitting in the warm cache instead of paying for
+        // the download all over again.
+        let handle =
+            tokio::spawn(async move { scanner.fetch_verified_and_cache(&key, &entry).await });
+
+        match tokio::time::timeout(budget, handle).await {
+            Ok(Ok(Ok(path))) => Decision::Serve(path),
+            Ok(Ok(Err(FetchError::Unverifiable(reason)))) => Decision::Unverifiable(reason),
+            Ok(Ok(Err(FetchError::Mismatch(reason)))) => Decision::Refuse {
                 reason,
                 why_id: None,
             },
+            Ok(Err(_join_error)) => {
+                Decision::Unverifiable(internal_error_reason_simple("fetch task panicked"))
+            }
+            Err(_elapsed) => Decision::InProgress,
         }
     }
 
@@ -737,4 +787,202 @@ fn sanitize_text(text: &str, max_chars: usize) -> String {
         .filter(|c| c.is_ascii() && !c.is_ascii_control())
         .take(max_chars)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    //! A whitebox test for `FinishGuard`, placed here rather than in
+    //! `tests/scan.rs` because it needs to reach `Scanner`'s private
+    //! `coordinator` field directly.
+    //!
+    //! Code review on this task found that no dependency currently
+    //! available to `Scanner` can actually make `run_full_scan` panic:
+    //! every blocking call (`VerdictStore`, `AdvisoryStore`,
+    //! `ArtifactCache`, `unpack`) goes through `spawn_blocking` with
+    //! explicit `JoinError` handling, and `PluginRunner::run_one` applies
+    //! the same pattern around `SandboxRunner::run` — confirmed
+    //! empirically: a `SandboxRunner` that panics resolves to a normal
+    //! `RefusalReason`, never a propagated panic, because
+    //! `tokio::task::spawn_blocking` itself catches it. So this test
+    //! builds the exact shape `scan_with_budget`'s owner constructs around
+    //! a real scan — `start_or_join`, then a task whose first statement is
+    //! a `FinishGuard` — and panics in place of the scan body, which is
+    //! the one thing a future change to this module's own code could
+    //! still do. It then drives the *real* `Scanner::decide` for the
+    //! second assertion, so the proof that a later request re-scans
+    //! rather than being stuck forever goes through the actual public
+    //! API, not a second manual coordinator probe.
+
+    use super::*;
+
+    use sha2::{Digest, Sha256};
+    use url::Url;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::config::{Config, CveLine, UnknownSeverity};
+    use crate::db::index_cache::IndexCache;
+    use crate::plugin::{SandboxOutcome, SandboxRunner, SandboxSpec};
+
+    /// No plugins are configured in this test, so this must never run.
+    struct NeverCalledSandbox;
+    impl SandboxRunner for NeverCalledSandbox {
+        fn run(&self, _spec: &SandboxSpec) -> anyhow::Result<SandboxOutcome> {
+            panic!("no plugins are configured in this test; the sandbox must never run");
+        }
+    }
+
+    fn base_config(scan_budget: std::time::Duration) -> Config {
+        Config {
+            bind: "127.0.0.1:8080".parse().unwrap(),
+            db_path: PathBuf::from("data/scanner.db"),
+            cache_dir: PathBuf::from("data/cache"),
+            upstream_url: "https://pypi.org".parse().unwrap(),
+            public_url: "http://localhost:8080".parse().unwrap(),
+            scan_budget,
+            cache_ttl: std::time::Duration::from_secs(24 * 60 * 60),
+            advisory_sync_interval: std::time::Duration::from_secs(60 * 60),
+            advisory_source_url: "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip"
+                .parse()
+                .unwrap(),
+            cve: CveLine {
+                min_severity: 7.0,
+                require_fix_available: false,
+                unknown_severity: UnknownSeverity::Allow,
+            },
+            allowlist: Vec::new(),
+            plugins: Vec::new(),
+        }
+    }
+
+    fn build_wheel_bytes() -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut zip = zip::ZipWriter::new(cursor);
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file("demo/__init__.py", options)
+                .expect("start zip entry");
+            std::io::Write::write_all(&mut zip, b"VERSION = '1.0.0'\n")
+                .expect("write zip entry contents");
+            zip.finish().expect("finish zip fixture");
+        }
+        buf
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_panicked_owner_does_not_leak_the_coordinator_entry_forever() {
+        let server = MockServer::start().await;
+        let filename = "demo_package-1.0.0-py3-none-any.whl";
+        let body = build_wheel_bytes();
+        let sha256 = sha256_hex(&body);
+
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{filename}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+
+        let db_dir = tempfile::tempdir().expect("create db temp dir");
+        let db = crate::db::Db::open(&db_dir.path().join("scanner.db")).expect("open db");
+        let cache_dir = tempfile::tempdir().expect("create cache temp dir");
+        let artifact_cache = ArtifactCache::new(db.clone(), cache_dir.path().join("artifacts"))
+            .expect("create artifact cache");
+        let index_cache = IndexCache::new(db.clone());
+        let base = Url::parse(&format!("{}/simple/", server.uri())).expect("valid base url");
+        let upstream = Upstream::new(base, index_cache).expect("construct upstream");
+        let verdict_store = VerdictStore::new(db.clone());
+        let advisory_store = AdvisoryStore::new(db.clone());
+        let plugin_runner = PluginRunner::new(Arc::new(NeverCalledSandbox));
+        let cfg = base_config(std::time::Duration::from_secs(12));
+        let policy = Policy::build(Arc::new(cfg.clone())).expect("build policy");
+        let config_handle = Arc::new(ConfigHandle::new(cfg));
+
+        let scanner = Scanner::new(
+            verdict_store,
+            upstream,
+            policy,
+            advisory_store,
+            plugin_runner,
+            artifact_cache,
+            config_handle,
+        );
+
+        let key = ArtifactKey {
+            ecosystem: "pypi".to_string(),
+            package: "demo-package".to_string(),
+            version: "1.0.0".to_string(),
+            filename: filename.to_string(),
+            sha256: sha256.clone(),
+        };
+        let entry = IndexEntry {
+            filename: filename.to_string(),
+            url: Url::parse(&format!("{}/packages/{filename}", server.uri())).unwrap(),
+            sha256: Some(sha256.clone()),
+            requires_python: None,
+            metadata_hash: None,
+            yanked: None,
+        };
+
+        // Claim ownership exactly as `scan_with_budget` would, and start a
+        // joiner that is already waiting when the owner fails.
+        let tx = scanner
+            .coordinator
+            .start_or_join(&sha256)
+            .expect("the coordinator must be empty for a brand-new sha256");
+        let joined_rx = match scanner.coordinator.start_or_join(&sha256) {
+            Err(rx) => rx,
+            Ok(_) => panic!("a second start_or_join for the same sha256 must join, not own"),
+        };
+
+        // The owner's task: a `FinishGuard` constructed first, exactly as
+        // in `scan_with_budget`, then a panic standing in for a bug in a
+        // future `run_full_scan` change.
+        let coordinator_for_owner = Arc::clone(&scanner.coordinator);
+        let sha256_for_owner = sha256.clone();
+        let owner = tokio::spawn(async move {
+            let _finish_guard = FinishGuard::new(coordinator_for_owner, sha256_for_owner);
+            let _tx = tx;
+            panic!("simulated panic inside the scan body");
+        });
+        let owner_result = owner.await;
+        assert!(
+            owner_result.is_err(),
+            "the simulated owner task must have panicked"
+        );
+
+        // First assertion: a caller that was already waiting resolves to
+        // a refusal, not a hang, once the owner panics.
+        let joined_verdict = coordinator::wait_for_verdict(joined_rx).await;
+        assert!(
+            joined_verdict.is_none(),
+            "a panicked owner must close the channel without ever sending a verdict"
+        );
+
+        // Second assertion — the finding itself. Without the
+        // `FinishGuard` fix, the coordinator's map entry for this sha256
+        // would still be present (the bare `coordinator.finish(...)` call
+        // it replaced never runs on a panic), so this `decide()` would
+        // join the dead receiver above and resolve to
+        // `Decision::Unverifiable` immediately, forever, without ever
+        // touching upstream again.
+        let decision = scanner.decide(&key, &entry).await;
+        match decision {
+            Decision::Serve(_) => {}
+            other => panic!(
+                "a panicked owner must not permanently block rescans of the \
+                 same artifact, got {other:?}"
+            ),
+        }
+    }
 }

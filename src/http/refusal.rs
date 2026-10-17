@@ -128,11 +128,60 @@ fn fail_closed_response(status: StatusCode, fallback_phrase: &'static [u8]) -> R
 /// persisted) so a developer reading pip's error line learns both which
 /// check refused them and where to read the detail.
 pub fn refusal_response(reason: &RefusalReason, why_url: Option<&str>) -> Response {
-    let phrase_text = match why_url {
-        Some(url) => format!("BLOCKED {} - why {}", reason.code, url),
-        None => format!("BLOCKED {}", reason.code),
-    };
+    let phrase_text = build_blocked_phrase(&reason.code, why_url);
     status_response(StatusCode::FORBIDDEN, &phrase_text, b"Blocked")
+}
+
+/// Fixed scaffold text around the variable-length `code` and `url`.
+const BLOCKED_PREFIX: &str = "BLOCKED ";
+const WHY_SEPARATOR: &str = " - why ";
+const ELLIPSIS: &str = "...";
+
+/// Builds the `BLOCKED <code> - why <url>` phrase so that when the
+/// combined length would exceed [`MAX_PHRASE_BYTES`], it is the
+/// variable-length `code` that gets shortened, never the `why` URL — a
+/// phrase is still useful to a developer with a code they have to look
+/// up themselves, but a URL truncated mid-path looks clickable and
+/// isn't, leaving them with no path to the detail page at all. The URL
+/// is why this channel exists, so it is reserved first; the code gets
+/// whatever bytes are left over, ellipsized if it doesn't fit.
+///
+/// If the URL alone (plus the fixed scaffold) does not fit in the
+/// budget — an absurdly long `public_url` — the code is dropped
+/// entirely rather than ellipsized to nothing: a developer with a link
+/// can always find the code on the page it points to, but a code with
+/// no link is a dead end.
+fn build_blocked_phrase(code: &str, why_url: Option<&str>) -> String {
+    let Some(url) = why_url else {
+        return format!("{BLOCKED_PREFIX}{code}");
+    };
+
+    let scaffold_and_url = BLOCKED_PREFIX.len() + WHY_SEPARATOR.len() + url.len();
+    if scaffold_and_url > MAX_PHRASE_BYTES {
+        return format!("BLOCKED{WHY_SEPARATOR}{url}");
+    }
+
+    let code_budget = MAX_PHRASE_BYTES - scaffold_and_url;
+    let shortened_code = ellipsize(code, code_budget);
+    format!("{BLOCKED_PREFIX}{shortened_code}{WHY_SEPARATOR}{url}")
+}
+
+/// Shortens `s` to at most `max_bytes` bytes, replacing any truncated
+/// tail with an ellipsis so a shortened code reads as visibly
+/// incomplete rather than silently cut (and, unlike a cut URL, a
+/// shortened code was never going to be the whole story anyway — the
+/// full text is always in `RefusalReason.detail` on the `/why` page).
+/// Cuts on a char boundary; if `max_bytes` is too small to fit even the
+/// ellipsis, returns an empty string rather than panicking.
+fn ellipsize(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    if ELLIPSIS.len() >= max_bytes {
+        return cap_bytes(ELLIPSIS, max_bytes);
+    }
+    let truncated = cap_bytes(s, max_bytes - ELLIPSIS.len());
+    format!("{truncated}{ELLIPSIS}")
 }
 
 /// 429: the scan for this artifact is still running. Deliberately not
@@ -183,5 +232,21 @@ mod tests {
     fn fail_closed_response_is_never_2xx() {
         let response = fail_closed_response(StatusCode::FORBIDDEN, b"Blocked");
         assert!(response.status().is_client_error());
+    }
+
+    #[test]
+    fn build_blocked_phrase_drops_the_code_when_even_the_bare_url_does_not_fit() {
+        // An absurdly long `public_url` leaves no room for the scaffold
+        // plus the URL, let alone any code. The code must be dropped
+        // (not ellipsized into nothing), and the full URL must still be
+        // present verbatim.
+        let url = format!("http://localhost:8080/why/{}", "a".repeat(130));
+        let phrase = build_blocked_phrase("cve:high", Some(&url));
+
+        assert!(!phrase.contains("cve:high"));
+        assert!(
+            phrase.contains(&url),
+            "the full URL must survive, got {phrase:?}"
+        );
     }
 }

@@ -237,6 +237,62 @@ fn refusal_response_phrase_survives_a_hostile_plugin_detail() {
 }
 
 #[test]
+fn refusal_response_keeps_the_full_why_url_and_shortens_an_overlong_code() {
+    // A long package name folded into the check code, plus a long
+    // advisory identifier, plus a deep `public_url` path: a plausible
+    // real-world combination where `code` + `why_url` together exceed
+    // the 120-byte budget even though the URL alone fits comfortably.
+    let long_package = "a".repeat(40);
+    let long_advisory_id = format!("GHSA-{}", "x".repeat(80));
+    let code = format!("cve:{long_package}:{long_advisory_id}");
+    let why_url = format!("http://localhost:8080/why/{}", "c".repeat(60));
+
+    const PREFIX_LEN: usize = "BLOCKED ".len();
+    const SEP_LEN: usize = " - why ".len();
+
+    // Sanity on the fixture itself: the URL alone must fit inside the
+    // budget (otherwise this test would exercise the "drop the code
+    // entirely" fallback, not the ellipsize-the-code path), but the URL
+    // together with the unshortened code must not fit (otherwise this
+    // test would not exercise truncation at all).
+    assert!(
+        PREFIX_LEN + SEP_LEN + why_url.len() <= 120,
+        "fixture bug: the why_url must fit in the budget on its own"
+    );
+    assert!(
+        PREFIX_LEN + SEP_LEN + why_url.len() + code.len() > 120,
+        "fixture bug: code + why_url must exceed the budget to exercise truncation"
+    );
+
+    let reason = RefusalReason {
+        code: code.clone(),
+        detail: "irrelevant".to_string(),
+    };
+    let response = refusal_response(&reason, Some(&why_url));
+
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    let phrase = reason_phrase_of(&response);
+
+    assert!(
+        phrase.len() <= 120,
+        "phrase must stay within the 120-byte budget, got {} bytes: {phrase:?}",
+        phrase.len()
+    );
+    assert!(
+        phrase.contains(&why_url),
+        "the full, unmangled why URL must survive truncation, got {phrase:?}"
+    );
+    assert!(
+        !phrase.contains(&code),
+        "the overlong code must have been shortened, not fully retained: {phrase:?}"
+    );
+    assert!(
+        phrase.contains("..."),
+        "a shortened code should read as visibly incomplete, got {phrase:?}"
+    );
+}
+
+#[test]
 fn in_progress_response_is_429_so_pip_does_not_silently_retry() {
     let response = in_progress_response();
 

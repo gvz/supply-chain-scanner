@@ -24,20 +24,30 @@
 //! user namespace); and the plugin's lifetime (`--die-with-parent` plus a
 //! `SIGKILL` to the whole process group at the timeout).
 //!
+//! The bind set also includes the standard read-only OS paths (`/usr`,
+//! `/lib`, `/lib64`, `/bin`, `/sbin`, the dynamic loader's cache and config,
+//! and — this host being NixOS — `/nix/store`) so that an ordinary
+//! dynamically linked binary can `exec` at all. See
+//! [`RUNTIME_RO_BIND_PATHS`] for what that gives up and what it does not.
+//!
 //! Not contained:
 //!
-//! - **Resource consumption.** There is no cgroup, no rlimit and no CPU
-//!   quota. `/` and `/tmp` inside the sandbox are writable tmpfs, which is
-//!   RAM, so a plugin can exhaust memory, and it can spin a core for the
-//!   whole of its timeout. The timeout is the only bound on a plugin's
-//!   appetite.
+//! - **Resource consumption beyond a hard tmpfs cap.** There is no cgroup,
+//!   no rlimit and no CPU quota. The writable tmpfs mounted at `/` and
+//!   `/tmp` is capped at [`TMPFS_SIZE_BYTES`] (RAM-backed storage is bounded
+//!   so a plugin cannot fill host memory through either mount), but nothing
+//!   bounds CPU use or the number of processes a plugin forks within its
+//!   timeout — the timeout remains the only bound on those.
 //! - **Kernel attack surface.** No seccomp filter is installed, so the
 //!   plugin reaches the full syscall table from inside the namespace.
-//! - **Dynamically linked plugins.** Only the binary itself is bound — no
-//!   loader, no `/lib`, no `/usr`. A plugin that is not statically linked
-//!   cannot `exec` in here, and gets a refusal rather than a clean result.
-//!   Supporting one means widening the bind set, which widens the
-//!   boundary; that is a deliberate decision not taken here.
+//! - **Read access to the host's installed software.** A plugin can read
+//!   anything under the paths in [`RUNTIME_RO_BIND_PATHS`] — which, on this
+//!   host, includes the entire Nix store. This is not new exposure: the
+//!   plugin is a binary the organization installed and runs as this same
+//!   user, so it could already read all of that before being sandboxed.
+//!   What stays denied is unchanged: the network, writing anywhere on the
+//!   host, the rest of the filesystem (no `/etc` secrets, no `/home`, no
+//!   other package's cache), and modifying the package under scan.
 
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
@@ -68,6 +78,50 @@ const BWRAP_ERROR_PREFIX: &str = "bwrap: ";
 /// giving up and reporting a sandbox error. A hard bound: the scan must
 /// never hang past its budget waiting on a wedged plugin.
 const KILL_GRACE: Duration = Duration::from_secs(2);
+
+/// Read-only host paths an ordinary dynamically linked ELF binary needs in
+/// order to `exec` at all: the shared library directories, the dynamic
+/// loader's cache and config, and — this host being NixOS, where `bwrap`
+/// itself and any plugin built here live — `/nix/store`.
+///
+/// Each is bound only if [`Path::exists`] says so, so a deployment missing
+/// `/lib64` or `/nix/store` (i.e. not NixOS) still boots; the brief is
+/// explicit that an absent path must never fail sandbox startup.
+///
+/// What this gives up: a plugin can now *read* host files under these
+/// paths. That is not new exposure — the plugin is a binary the
+/// organization installed and already runs as this same user, so it could
+/// read all of this before it was ever sandboxed. What stays denied is
+/// unchanged: the network (`--unshare-all`), writing anywhere on the host
+/// (every entry here is `--ro-bind`), the rest of the filesystem (no
+/// `/etc` secrets, no `/home`, no other package's cache — only the paths
+/// listed here, `/proc`, `/dev`, and the package directory are visible),
+/// and modifying the package under scan (`/pkg` stays read-only).
+const RUNTIME_RO_BIND_PATHS: &[&str] = &[
+    "/usr",
+    "/lib",
+    "/lib64",
+    "/bin",
+    "/sbin",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/nix/store",
+];
+
+/// Hard cap, in bytes, on each writable tmpfs mounted inside the sandbox
+/// (the implicit root and the explicit `/tmp`).
+///
+/// This does not close the resource-limit gap described in this module's
+/// doc comment — there is still no cgroup, no rlimit, no CPU quota, and a
+/// plugin can still spin a core for the whole of its timeout. It removes
+/// only the cheapest host-memory-exhaustion path available through a
+/// single flag: without a `--size`, both tmpfs mounts are backed by RAM
+/// and unbounded, so a plugin could fill host memory just by writing to
+/// its own scratch space. 64 MiB is generous for a plugin's working files
+/// and small enough that even several plugins' worth of it does not
+/// threaten the host.
+const TMPFS_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// One plugin invocation.
 #[derive(Debug, Clone)]
@@ -150,14 +204,37 @@ impl BubblewrapSandbox {
     /// cannot outlive the proxy. The package directory is bound read-only,
     /// so a plugin cannot alter the artifact between being scanned and
     /// being served.
+    ///
+    /// The explicit, size-capped `--tmpfs /` comes first and only first:
+    /// bwrap's default root is already an unbounded tmpfs, and mounting a
+    /// capped one in its place must happen before anything else is bound
+    /// under `/`, or the later mount would hide those binds rather than
+    /// contain them. Everything that follows — the binary, the runtime
+    /// paths in [`RUNTIME_RO_BIND_PATHS`], and the package directory —
+    /// nests inside that capped root.
     fn command(&self, binary: &Path, package_dir: &Path, args: &[String]) -> Command {
         let mut command = Command::new(&self.bwrap);
         command
             .arg("--unshare-all")
             .arg("--die-with-parent")
+            .arg("--size")
+            .arg(TMPFS_SIZE_BYTES.to_string())
+            .arg("--tmpfs")
+            .arg("/")
             .arg("--ro-bind")
             .arg(binary)
-            .arg(binary)
+            .arg(binary);
+
+        for path in RUNTIME_RO_BIND_PATHS {
+            let path = Path::new(path);
+            // Skip anything absent rather than failing: a deployment
+            // without, say, `/lib64` or `/nix/store` must still boot.
+            if path.exists() {
+                command.arg("--ro-bind").arg(path).arg(path);
+            }
+        }
+
+        command
             .arg("--ro-bind")
             .arg(package_dir)
             .arg(SANDBOX_PACKAGE_DIR)
@@ -165,6 +242,8 @@ impl BubblewrapSandbox {
             .arg("/proc")
             .arg("--dev")
             .arg("/dev")
+            .arg("--size")
+            .arg(TMPFS_SIZE_BYTES.to_string())
             .arg("--tmpfs")
             .arg("/tmp")
             .arg("--chdir")
@@ -325,5 +404,92 @@ fn kill_process_group(process_group: i32) {
     // about to confirm the group is dead by waiting for it.
     unsafe {
         libc::killpg(process_group, libc::SIGKILL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Extracts the argument vector `command()` builds, as plain strings,
+    /// without invoking `bwrap` at all. This is the fast, deterministic
+    /// counterpart to the `#[ignore]`d real-sandbox tests: it proves the
+    /// *shape* of the command line (what gets bound, in what order, with
+    /// what size cap) on every `cargo test`, not only where `bwrap` and
+    /// usable namespaces happen to be available.
+    fn built_args() -> Vec<String> {
+        let sandbox = BubblewrapSandbox {
+            bwrap: PathBuf::from("bwrap"),
+        };
+        let command = sandbox.command(
+            Path::new("/plugins/demo"),
+            Path::new("/pkgs/demo-1.0"),
+            &["--flag".to_string()],
+        );
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn runtime_paths_are_bound_only_when_present_on_the_host() {
+        let args = built_args();
+        for path in RUNTIME_RO_BIND_PATHS {
+            let bound = args
+                .windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[1] == *path && w[2] == *path);
+            assert_eq!(
+                bound,
+                Path::new(path).exists(),
+                "{path} bind presence did not match whether it exists on this host"
+            );
+        }
+    }
+
+    #[test]
+    fn root_and_tmp_tmpfs_are_both_size_capped() {
+        let args = built_args();
+        let size_arg = TMPFS_SIZE_BYTES.to_string();
+
+        let root_capped = args
+            .windows(4)
+            .any(|w| w[0] == "--size" && w[1] == size_arg && w[2] == "--tmpfs" && w[3] == "/");
+        assert!(root_capped, "root tmpfs was not size-capped: {args:?}");
+
+        let tmp_capped = args
+            .windows(4)
+            .any(|w| w[0] == "--size" && w[1] == size_arg && w[2] == "--tmpfs" && w[3] == "/tmp");
+        assert!(tmp_capped, "/tmp tmpfs was not size-capped: {args:?}");
+    }
+
+    #[test]
+    fn root_tmpfs_is_mounted_before_any_other_bind() {
+        // The capped root must be the very first mount, or later binds
+        // under `/` would be hidden rather than contained (verified
+        // against real bwrap during implementation).
+        let args = built_args();
+        assert_eq!(args[0], "--unshare-all");
+        assert_eq!(args[1], "--die-with-parent");
+        assert_eq!(args[2], "--size");
+        assert_eq!(args[4], "--tmpfs");
+        assert_eq!(args[5], "/");
+    }
+
+    #[test]
+    fn package_dir_binary_and_chdir_are_still_present() {
+        let args = built_args();
+        assert!(args
+            .windows(3)
+            .any(|w| w[0] == "--ro-bind" && w[1] == "/plugins/demo" && w[2] == "/plugins/demo"));
+        assert!(args.windows(3).any(|w| w[0] == "--ro-bind"
+            && w[1] == "/pkgs/demo-1.0"
+            && w[2] == SANDBOX_PACKAGE_DIR));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--chdir" && w[1] == SANDBOX_PACKAGE_DIR));
+        // The trailing `-- <binary> <args...>`.
+        let tail = &args[args.len() - 3..];
+        assert_eq!(tail, ["--", "/plugins/demo", "--flag"]);
     }
 }

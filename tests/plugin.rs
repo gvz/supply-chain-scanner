@@ -666,46 +666,27 @@ async fn plugins_run_in_configured_order_and_stop_at_first_block() {
 // The real sandbox
 // ---------------------------------------------------------------------------
 
-/// Locates a statically linked `busybox` to stand in for a plugin binary.
+/// An ordinary, dynamically linked shell to stand in for a plugin binary.
 ///
-/// The sandbox binds only the plugin binary — no `/lib`, no dynamic
-/// loader — so a dynamically linked plugin cannot `exec` inside it. Set
-/// `SCS_TEST_STATIC_SH` to point at one explicitly.
-fn static_shell() -> PathBuf {
-    if let Some(path) = std::env::var_os("SCS_TEST_STATIC_SH") {
+/// The bind set mounts the standard read-only OS paths (`/usr`, `/lib`,
+/// `/lib64`, `/bin`, the loader's cache/config, and `/nix/store`) precisely
+/// so that a binary like this — linked against libc and the dynamic
+/// loader, exactly what a real plugin looks like — can `exec` inside the
+/// sandbox. Using a statically linked stand-in here would prove nothing
+/// about that bind set; it would pass even with the defect this task
+/// fixes (binding only the plugin binary, no loader). Set `SCS_TEST_SH` to
+/// point at a different shell explicitly.
+fn dynamic_shell() -> PathBuf {
+    if let Some(path) = std::env::var_os("SCS_TEST_SH") {
         return PathBuf::from(path);
     }
-    for candidate in ["/bin/busybox", "/usr/bin/busybox"] {
-        let path = Path::new(candidate);
-        if path.is_file() {
-            return path.to_path_buf();
-        }
-    }
-    if let Some(path) = nix_store_static_busybox() {
-        return path;
-    }
-    panic!("no statically linked shell found; set SCS_TEST_STATIC_SH to one");
-}
-
-fn nix_store_static_busybox() -> Option<PathBuf> {
-    for entry in fs::read_dir("/nix/store").ok()?.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.contains("busybox-static") || name.ends_with(".drv") {
-            continue;
-        }
-        let candidate = entry.path().join("bin/busybox");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    PathBuf::from("/bin/sh")
 }
 
 #[test]
-#[ignore = "requires bwrap, usable namespaces, and a statically linked test plugin"]
+#[ignore = "requires bwrap and usable namespaces"]
 fn bubblewrap_runs_a_real_binary_read_only() {
-    let shell = static_shell();
+    let shell = dynamic_shell();
     let pkg = TempDir::new().unwrap();
     fs::write(pkg.path().join("payload.txt"), "contents\n").unwrap();
 
@@ -717,13 +698,17 @@ fn bubblewrap_runs_a_real_binary_read_only() {
         .run(&SandboxSpec {
             binary: shell,
             package_dir: pkg.path().to_path_buf(),
-            args: vec!["sh".to_string(), "-c".to_string(), script.to_string()],
+            args: vec!["-c".to_string(), script.to_string()],
             timeout: Duration::from_secs(10),
             max_output_bytes: 200,
         })
         .expect("bwrap should run the plugin");
 
     assert!(!outcome.timed_out);
+    // The exit code and output only come back if `/bin/sh` — dynamically
+    // linked, not a statically linked stand-in — actually `exec`'d inside
+    // the sandbox. A bind set missing the loader would surface as a
+    // sandbox `Err`, not as this `Ok` outcome with a real exit code.
     assert_eq!(
         outcome.exit_code,
         Some(0),
@@ -738,9 +723,9 @@ fn bubblewrap_runs_a_real_binary_read_only() {
 }
 
 #[test]
-#[ignore = "requires bwrap, usable namespaces, and a statically linked test plugin"]
+#[ignore = "requires bwrap and usable namespaces"]
 fn bubblewrap_timeout_kills_a_plugin_that_ignores_sigterm() {
-    let shell = static_shell();
+    let shell = dynamic_shell();
     let pkg = TempDir::new().unwrap();
 
     let sandbox = BubblewrapSandbox::detect().expect("bwrap must be on PATH");
@@ -750,10 +735,8 @@ fn bubblewrap_timeout_kills_a_plugin_that_ignores_sigterm() {
             binary: shell,
             package_dir: pkg.path().to_path_buf(),
             // Ignores SIGTERM and then spins forever, using only shell
-            // builtins because the sandbox binds no other executable.
-            // Nothing short of a real kill ends this.
+            // builtins so nothing short of a real kill ends this.
             args: vec![
-                "sh".to_string(),
                 "-c".to_string(),
                 "trap '' TERM; while :; do :; done".to_string(),
             ],

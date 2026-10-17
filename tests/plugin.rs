@@ -186,6 +186,66 @@ fn unpack_extracts_sdist_tar_gz_contents() {
     );
 }
 
+/// GNU `tar` routinely writes a `./` entry for the archive root, and many
+/// real PyPI sdists carry one. It resolves to an empty relative path, which
+/// `resolve_entry_path` used to reject before the `is_dir` branch could see
+/// it — taking the whole archive down and (because `run_full_scan` stored
+/// that as `Verdict::Blocked`) permanently blocking a perfectly legitimate
+/// sdist with a refusal that reads to a developer as "we found malware".
+#[test]
+fn unpack_accepts_the_archive_root_directory_entry_gnu_tar_emits() {
+    let tmp = TempDir::new().unwrap();
+    let sdist = tmp.path().join("pkg-1.0.tar.gz");
+    write_tar_gz(&sdist, |tar| {
+        // The `./` archive-root entry, exactly as GNU tar writes it, and
+        // first — so an unpacker that refuses it never reaches the real
+        // contents at all.
+        let mut root = Header::new_gnu();
+        root.set_entry_type(EntryType::Directory);
+        root.set_size(0);
+        root.set_mode(0o755);
+        root.set_path("./").unwrap();
+        root.set_cksum();
+        tar.append(&root, io::empty()).unwrap();
+
+        let setup = b"from setuptools import setup\n";
+        let mut header = Header::new_gnu();
+        header.set_entry_type(EntryType::Regular);
+        header.set_size(setup.len() as u64);
+        header.set_mode(0o644);
+        header.set_path("./pkg-1.0/setup.py").unwrap();
+        header.set_cksum();
+        tar.append(&header, &setup[..]).unwrap();
+    });
+
+    let dest = tmp.path().join("unpacked");
+    unpack(&sdist, &dest).expect("a `./` archive-root entry must not refuse the archive");
+    assert_eq!(
+        fs::read_to_string(dest.join("pkg-1.0/setup.py")).unwrap(),
+        "from setuptools import setup\n"
+    );
+}
+
+/// The `./` allowance is for *directory* entries only. A zero-length path
+/// on a file entry names nothing to write and is still refused.
+#[test]
+fn unpack_still_rejects_an_empty_path_on_a_file_entry() {
+    let tmp = TempDir::new().unwrap();
+    let sdist = tmp.path().join("evil-1.0.tar.gz");
+    write_tar_gz(&sdist, |tar| {
+        let body = b"payload";
+        let mut header = forged_header("./", EntryType::Regular, body.len() as u64);
+        header.set_cksum();
+        tar.append(&header, &body[..]).unwrap();
+    });
+
+    let dest = tmp.path().join("unpacked");
+    assert!(
+        unpack(&sdist, &dest).is_err(),
+        "a file entry naming no path must still refuse the archive"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // unpack: hostile archives
 // ---------------------------------------------------------------------------

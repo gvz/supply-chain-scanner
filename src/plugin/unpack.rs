@@ -22,6 +22,14 @@
 //! wiped on the way out: a partial extraction is a package the plugin would
 //! then scan incompletely and pass.
 //!
+//! The one entry that looks bad and is not: the `./` archive-root
+//! directory GNU `tar` writes, carried by many real PyPI sdists. It
+//! reduces to an empty relative path, which is refused on a *file* entry
+//! (it names nothing to write) and skipped on a *directory* entry (the
+//! archive root already exists as the destination). Refusing it outright
+//! took legitimate sdists down, and the caller stored that as a durable
+//! block — see [`relative_entry_path`].
+//!
 //! Archive-recorded permissions are deliberately ignored. Files land with
 //! the process's default mode, which cannot carry setuid, setgid, or the
 //! sticky bit no matter what the package asked for.
@@ -162,14 +170,22 @@ impl Budget {
     }
 }
 
-/// Validates one archive-supplied entry name and maps it to a path inside
-/// `dest`.
+/// Validates one archive-supplied entry name and reduces it to a safe
+/// relative path, **which may be empty**.
 ///
 /// Every component must be a plain name: a `..` component, a root, or a
 /// Windows path prefix is an attempt to write outside `dest` and takes the
 /// archive down. `.` components are dropped — `tar` writes them routinely
-/// for the archive root and they are not an escape.
-fn resolve_entry_path(dest: &Path, raw: &Path) -> anyhow::Result<PathBuf> {
+/// and they are not an escape.
+///
+/// An entry made entirely of `.` components (i.e. `./`, the archive-root
+/// entry GNU `tar` emits and that many real PyPI sdists carry) reduces to
+/// the empty path. That is deliberately *not* an error here: whether it is
+/// acceptable depends on the entry type, which only the caller knows. A
+/// directory entry naming the archive root is a no-op to skip; a file
+/// entry naming no path is still refused. Conflating the two is what used
+/// to turn a legitimate sdist into a permanent `BLOCKED`.
+fn relative_entry_path(raw: &Path) -> anyhow::Result<PathBuf> {
     let shown = raw.display();
 
     if raw.is_absolute() {
@@ -188,17 +204,44 @@ fn resolve_entry_path(dest: &Path, raw: &Path) -> anyhow::Result<PathBuf> {
         }
     }
 
-    if relative.as_os_str().is_empty() {
-        bail!("archive entry {shown} names no file");
-    }
+    Ok(relative)
+}
 
-    let resolved = dest.join(&relative);
-    // Belt and braces. The component walk above already makes an escape
-    // impossible; this catches any future change to it.
+/// Maps an already-validated, non-empty `relative` path into `dest`.
+fn resolve_within(dest: &Path, relative: &Path, raw: &Path) -> anyhow::Result<PathBuf> {
+    let resolved = dest.join(relative);
+    // Belt and braces. The component walk in `relative_entry_path`
+    // already makes an escape impossible; this catches any future change
+    // to it.
     if !resolved.starts_with(dest) {
-        bail!("archive entry {shown} resolves outside the destination directory");
+        bail!(
+            "archive entry {} resolves outside the destination directory",
+            raw.display()
+        );
     }
     Ok(resolved)
+}
+
+/// What one archive entry's path resolves to inside `dest`.
+enum EntryTarget {
+    /// A real path to create or write.
+    Path(PathBuf),
+    /// The archive root itself (`./`), which already exists as `dest`.
+    /// Valid only for a directory entry.
+    ArchiveRoot,
+}
+
+/// Resolves `raw` for an entry that is or is not a directory, allowing the
+/// archive-root entry through only in the directory case.
+fn resolve_entry_target(dest: &Path, raw: &Path, is_dir: bool) -> anyhow::Result<EntryTarget> {
+    let relative = relative_entry_path(raw)?;
+    if relative.as_os_str().is_empty() {
+        if is_dir {
+            return Ok(EntryTarget::ArchiveRoot);
+        }
+        bail!("archive entry {} names no file", raw.display());
+    }
+    Ok(EntryTarget::Path(resolve_within(dest, &relative, raw)?))
 }
 
 /// Writes one file entry, reading at most its declared size.
@@ -285,12 +328,12 @@ fn unpack_zip(archive: &Path, dest: &Path, budget: &mut Budget) -> anyhow::Resul
 
         let is_dir = entry.is_dir();
         let declared = entry.size();
-        let path = resolve_entry_path(dest, Path::new(&name))?;
 
-        if is_dir {
-            create_dir_entry(&path)?;
-        } else {
-            write_file_entry(&path, &mut entry, declared, budget)?;
+        match resolve_entry_target(dest, Path::new(&name), is_dir)? {
+            // The archive root already exists as `dest`; nothing to do.
+            EntryTarget::ArchiveRoot => continue,
+            EntryTarget::Path(path) if is_dir => create_dir_entry(&path)?,
+            EntryTarget::Path(path) => write_file_entry(&path, &mut entry, declared, budget)?,
         }
     }
 
@@ -327,19 +370,22 @@ fn unpack_tar_gz(archive: &Path, dest: &Path, budget: &mut Budget) -> anyhow::Re
             .path()
             .context("decoding a tar entry path")?
             .to_path_buf();
-        let path = resolve_entry_path(dest, &raw)?;
 
-        if entry_type.is_dir() {
-            create_dir_entry(&path)?;
-        } else if entry_type.is_file() {
-            write_file_entry(&path, &mut entry, declared, budget)?;
-        } else {
+        if !entry_type.is_dir() && !entry_type.is_file() {
             bail!(
                 "archive entry {} is neither a regular file nor a directory \
                  (tar type {:?})",
                 raw.display(),
                 entry_type
             );
+        }
+
+        match resolve_entry_target(dest, &raw, entry_type.is_dir())? {
+            // The `./` archive-root entry GNU tar emits: `dest` already
+            // exists, so there is nothing to create.
+            EntryTarget::ArchiveRoot => continue,
+            EntryTarget::Path(path) if entry_type.is_dir() => create_dir_entry(&path)?,
+            EntryTarget::Path(path) => write_file_entry(&path, &mut entry, declared, budget)?,
         }
     }
 

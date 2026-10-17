@@ -959,3 +959,159 @@ async fn allowlisted_package_behind_a_slow_upstream_returns_in_progress_within_b
         ),
     }
 }
+
+// ---------------------------------------------------------------------------
+// "We could not check" must never look like "we checked and it is bad"
+// ---------------------------------------------------------------------------
+
+/// An archive this unpacker cannot read is a gap in *our* coverage — an
+/// unsupported format, a tar quirk, a truncated transfer. Storing that as
+/// `Verdict::Blocked` made a format gap permanently indistinguishable from
+/// a malware finding, and the refusal read to a developer as "we found
+/// malware in your package".
+#[tokio::test]
+async fn an_unreadable_archive_is_unverifiable_and_stores_no_verdict() {
+    let server = MockServer::start().await;
+    let filename = "demo_package-1.0.0-py3-none-any.whl";
+    // Well-formed HTTP, correct hash, but not a zip at all.
+    let body = b"this is not a zip archive".to_vec();
+    let sha256 = sha256_hex(&body);
+
+    Mock::given(method("GET"))
+        .and(path(format!("/packages/{filename}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&server)
+        .await;
+
+    let harness = build_harness(
+        base_config(Duration::from_secs(12)),
+        &server,
+        FakeSandbox::empty(),
+    );
+    let key = key_for(&sha256, filename);
+    let entry = entry_for(&server, filename, Some(&sha256));
+
+    match harness.scanner.decide(&key, &entry).await {
+        Decision::Unverifiable(reason) => assert_eq!(reason.code, "unverifiable:unpack-failed"),
+        other => panic!(
+            "an archive we cannot read must be Unverifiable, never a stored \
+             Blocked verdict, got {other:?}"
+        ),
+    }
+
+    assert!(
+        harness
+            .verdict_store
+            .get(&key, &harness.fingerprint)
+            .expect("query verdict")
+            .is_none(),
+        "an unpack failure must not be persisted as a verdict"
+    );
+}
+
+/// A plugin that could not be run has not examined the artifact, so there
+/// is no verdict to store. Storing one would outlive the broken plugin and
+/// leave a developer reading "we found malware" about an artifact nothing
+/// ever looked at.
+#[tokio::test]
+async fn a_plugin_that_cannot_run_is_unverifiable_and_stores_no_verdict() {
+    let server = MockServer::start().await;
+    let filename = "demo_package-1.0.0-py3-none-any.whl";
+    let body = build_wheel_bytes();
+    let sha256 = sha256_hex(&body);
+
+    Mock::given(method("GET"))
+        .and(path(format!("/packages/{filename}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&server)
+        .await;
+
+    let plugin_dir = tempfile::tempdir().expect("create plugin temp dir");
+    let plugin_path = plugin_dir.path().join("broken-plugin");
+    std::fs::write(&plugin_path, b"pretend plugin binary").expect("write plugin binary");
+
+    let mut cfg = base_config(Duration::from_secs(12));
+    cfg.plugins = vec![PluginConfig {
+        name: "broken".to_string(),
+        binary: plugin_path.clone(),
+        timeout: Duration::from_secs(5),
+    }];
+    // The sandbox itself fails: the check never ran.
+    let sandbox = FakeSandbox::new([(
+        plugin_path,
+        Err("bubblewrap could not run the plugin".to_string()),
+    )]);
+
+    let harness = build_harness(cfg, &server, sandbox);
+    let key = key_for(&sha256, filename);
+    let entry = entry_for(&server, filename, Some(&sha256));
+
+    match harness.scanner.decide(&key, &entry).await {
+        Decision::Unverifiable(reason) => assert_eq!(reason.code, "plugin:broken:error"),
+        other => panic!(
+            "a plugin that could not run must be Unverifiable, never a stored \
+             Blocked verdict, got {other:?}"
+        ),
+    }
+
+    assert!(
+        harness
+            .verdict_store
+            .get(&key, &harness.fingerprint)
+            .expect("query verdict")
+            .is_none(),
+        "a check that never ran must not be persisted as a verdict"
+    );
+}
+
+/// A plugin killed at its timeout also never reached a verdict.
+#[tokio::test]
+async fn a_plugin_that_timed_out_is_unverifiable_and_stores_no_verdict() {
+    let server = MockServer::start().await;
+    let filename = "demo_package-1.0.0-py3-none-any.whl";
+    let body = build_wheel_bytes();
+    let sha256 = sha256_hex(&body);
+
+    Mock::given(method("GET"))
+        .and(path(format!("/packages/{filename}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&server)
+        .await;
+
+    let plugin_dir = tempfile::tempdir().expect("create plugin temp dir");
+    let plugin_path = plugin_dir.path().join("slow-plugin");
+    std::fs::write(&plugin_path, b"pretend plugin binary").expect("write plugin binary");
+
+    let mut cfg = base_config(Duration::from_secs(12));
+    cfg.plugins = vec![PluginConfig {
+        name: "slow".to_string(),
+        binary: plugin_path.clone(),
+        timeout: Duration::from_millis(50),
+    }];
+    let sandbox = FakeSandbox::new([(
+        plugin_path,
+        Ok(SandboxOutcome {
+            exit_code: None,
+            output: String::new(),
+            timed_out: true,
+        }),
+    )]);
+
+    let harness = build_harness(cfg, &server, sandbox);
+    let key = key_for(&sha256, filename);
+    let entry = entry_for(&server, filename, Some(&sha256));
+
+    match harness.scanner.decide(&key, &entry).await {
+        Decision::Unverifiable(reason) => assert_eq!(reason.code, "plugin:slow:timeout"),
+        other => panic!("a timed-out plugin must be Unverifiable, got {other:?}"),
+    }
+
+    assert!(
+        harness
+            .verdict_store
+            .get(&key, &harness.fingerprint)
+            .expect("query verdict")
+            .is_none(),
+        "a check that never finished must not be persisted as a verdict"
+    );
+}

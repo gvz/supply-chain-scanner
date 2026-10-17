@@ -354,6 +354,80 @@ fn unpack_rejects_symlink_entry() {
     }
 }
 
+/// Re-review finding: `EntryType::is_file()` is `true` only for the plain
+/// `Regular` type, not for `Continuous` (tar type `'7'`, which the `tar`
+/// crate's own docs describe as "Implementation-defined 'high-performance'
+/// type, treated as regular file") or `GNUSparse` (`'S'`, GNU tar's
+/// sparse-file extension for an ordinary file with holes). Before this
+/// fix both fell through the "neither a regular file nor a directory"
+/// check into `escape(..)`, turning a rare-but-legitimate sdist into a
+/// sticky, durable `Blocked` verdict — the false-positive anti-goal,
+/// reintroduced at a different seam by the fix that was supposed to close
+/// it. These two tests build real `Continuous`/`GNUSparse` entries with
+/// the `tar` crate's own `Header`/`EntryType` API, so they exercise the
+/// actual entry-type and (for the sparse case) sparse-reconstruction path
+/// a hand-rolled header would not reach.
+#[test]
+fn unpack_accepts_a_continuous_type_entry_as_a_regular_file() {
+    let tmp = TempDir::new().unwrap();
+    let body = b"implementation-defined high-performance content\n";
+    let sdist = tmp.path().join("pkg-1.0.tar.gz");
+    write_tar_gz(&sdist, |tar| {
+        let mut header = Header::new_gnu();
+        header.set_path("pkg-1.0/data.bin").unwrap();
+        header.set_entry_type(EntryType::Continuous);
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append(&header, &body[..]).unwrap();
+    });
+
+    let dest = tmp.path().join("unpacked");
+    unpack(&sdist, &dest).expect(
+        "a Continuous-type entry is an ordinary file by the tar format's \
+         own definition and must extract, not be treated as an escape attempt",
+    );
+    assert_eq!(fs::read(dest.join("pkg-1.0/data.bin")).unwrap(), body);
+}
+
+#[test]
+fn unpack_accepts_a_gnu_sparse_entry_as_a_regular_file() {
+    let tmp = TempDir::new().unwrap();
+    let body = b"an ordinary file stored with the GNU sparse extension\n";
+    let sdist = tmp.path().join("pkg-1.0.tar.gz");
+    write_tar_gz(&sdist, |tar| {
+        let mut header = Header::new_gnu();
+        header.set_path("pkg-1.0/data.bin").unwrap();
+        {
+            let gnu = header
+                .as_gnu_mut()
+                .expect("Header::new_gnu builds a GNU header");
+            // One sparse block covering the whole file at offset 0 — a
+            // sparse-format entry with no actual hole in it, exactly the
+            // shape a real archiver can produce for a file that is no
+            // longer sparse on an incremental re-pack. The rest of
+            // `gnu.sparse` stays zeroed, which the reader treats as "no
+            // more blocks" (`GnuSparseHeader::is_empty`).
+            gnu.sparse[0].set_offset(0);
+            gnu.sparse[0].set_length(body.len() as u64);
+            gnu.set_is_extended(false);
+            gnu.set_real_size(body.len() as u64);
+        }
+        header.set_entry_type(EntryType::GNUSparse);
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append(&header, &body[..]).unwrap();
+    });
+
+    let dest = tmp.path().join("unpacked");
+    unpack(&sdist, &dest).expect(
+        "a GNUSparse entry is an ordinary file the tar crate reconstructs \
+         transparently and must extract, not be treated as an escape attempt",
+    );
+    assert_eq!(fs::read(dest.join("pkg-1.0/data.bin")).unwrap(), body);
+}
+
 #[test]
 fn unpack_rejects_archive_exceeding_size_limit() {
     let tmp = TempDir::new().unwrap();

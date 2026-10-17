@@ -436,7 +436,22 @@ fn unpack_tar_gz(archive: &Path, dest: &Path, budget: &mut Budget) -> anyhow::Re
             .context("decoding a tar entry path")?
             .to_path_buf();
 
-        if !entry_type.is_dir() && !entry_type.is_file() {
+        // `is_file()` alone is too narrow: it is true only for the plain
+        // `Regular` type, not for `Continuous` (tar type `'7'`, which the
+        // `tar` crate's own docs describe as "treated as regular file")
+        // or `GNUSparse` (`'S'`, GNU tar's sparse-file extension — an
+        // ordinary file stored with holes, transparently reassembled by
+        // this crate's own reader, with `Header::size()` already
+        // returning the real reconstructed size rather than the on-disk
+        // fragment total). Neither is a deliberate escape; both read and
+        // extract exactly like a regular file. Treating them as "neither
+        // regular nor directory" and routing them into `escape(..)` would
+        // turn an ordinary, if rare, sdist into a sticky `Blocked`
+        // verdict — the same false-positive anti-goal this module's
+        // escape/benign-gap split exists to avoid.
+        let is_regular_file =
+            entry_type.is_file() || entry_type.is_contiguous() || entry_type.is_gnu_sparse();
+        if !entry_type.is_dir() && !is_regular_file {
             return Err(escape(format!(
                 "archive entry {} is neither a regular file nor a directory \
                  (tar type {:?})",

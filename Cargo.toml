@@ -41,6 +41,7 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 cvss = "3"
 serde_json = "1"
 tempfile = "3"
+pep440_rs = "0.7"
 
 [dev-dependencies]
 wiremock = "0.6"

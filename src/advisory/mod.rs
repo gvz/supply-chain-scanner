@@ -8,6 +8,7 @@
 //! so this module stays about the advisory *data* rather than how it is
 //! persisted.
 
+pub mod matching;
 pub mod osv;
 
 /// One advisory as it applies to a single affected package: everything

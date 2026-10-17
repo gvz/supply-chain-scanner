@@ -95,6 +95,30 @@ pub const MIGRATIONS: &[&str] = &[
     CREATE INDEX idx_advisory_ranges_advisory
         ON advisory_ranges(ecosystem, advisory_id, package);
     "#,
+    // 3: artifact_cache — on-disk cache of scanned artifact bytes (task 9's
+    // `ArtifactCache`), keyed by `sha256` alone rather than by
+    // (ecosystem, package, version, filename): the cache is content
+    // addressed, so identical bytes shipped under different names are
+    // stored once. The descriptive columns are kept anyway so an operator
+    // inspecting the database can see what a cached blob is.
+    //
+    // `last_access` is the sliding TTL clock: every cache hit stamps it
+    // with the current time, so a package in constant use is never
+    // evicted while one-off downloads age out. This table is purely a
+    // performance cache in front of the durable `verdicts` table above —
+    // emptying it never changes what the proxy decides to serve, only how
+    // long that takes.
+    r#"
+    CREATE TABLE artifact_cache (
+        sha256       TEXT PRIMARY KEY,
+        ecosystem    TEXT NOT NULL,
+        package      TEXT NOT NULL,
+        version      TEXT NOT NULL,
+        filename     TEXT NOT NULL,
+        bytes        INTEGER NOT NULL,
+        last_access  INTEGER NOT NULL
+    )
+    "#,
 ];
 
 /// Applies every migration in [`MIGRATIONS`] that hasn't already run

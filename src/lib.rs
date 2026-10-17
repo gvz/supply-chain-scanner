@@ -7,6 +7,7 @@
 //! tests can exercise the public API directly.
 
 pub mod advisory;
+pub mod artifact_cache;
 pub mod config;
 pub mod db;
 pub mod ecosystem;

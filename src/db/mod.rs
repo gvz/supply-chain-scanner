@@ -4,6 +4,7 @@
 //! [`Db::open`].
 
 pub mod advisory;
+pub mod cache;
 pub mod index_cache;
 pub mod migrations;
 pub mod verdict;

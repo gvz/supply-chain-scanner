@@ -156,6 +156,57 @@ fn evict_removes_untouched_entries_past_ttl() {
 }
 
 #[test]
+fn evict_retries_an_entry_whose_file_cannot_be_deleted() {
+    let (src_dir, _cache_dir, db, cache) = open_cache();
+    let sha256 = "9".repeat(64);
+    let k = key(&sha256);
+    let source = temp_source_file(&src_dir, "artifact.whl", b"payload");
+    let stored_path = cache.insert(&k, &source).expect("insert should succeed");
+
+    // Simulate the backing file becoming undeletable without needing any
+    // privilege games: replace it with a directory at the same path. On
+    // Linux, `remove_file` on a directory fails with `EISDIR`, not
+    // `NotFound` — a different failure from the "pruned by hand" case
+    // `get_returns_none_when_the_file_vanished_from_disk` covers.
+    std::fs::remove_file(&stored_path).expect("remove the real file first");
+    std::fs::create_dir(&stored_path).expect("replace it with a directory");
+
+    backdate_last_access(&db, &sha256, 3600);
+
+    let removed = cache
+        .evict_expired(Duration::from_secs(60))
+        .expect("evict_expired must not error just because one file failed to delete");
+
+    assert_eq!(
+        removed, 0,
+        "an entry whose file could not be deleted must not be counted as removed"
+    );
+    assert!(
+        row_exists(&db, &sha256),
+        "its row must be kept, not dropped, so the bytes are never silently orphaned"
+    );
+
+    // Clear the obstruction and sweep again. The row must still be a
+    // candidate for eviction rather than permanently stuck because an
+    // earlier attempt failed: this time deletion can succeed, and it
+    // must actually happen.
+    std::fs::remove_dir(&stored_path).expect("clear the obstruction");
+
+    let removed_on_retry = cache
+        .evict_expired(Duration::from_secs(60))
+        .expect("evict_expired should succeed once the obstruction is gone");
+
+    assert_eq!(
+        removed_on_retry, 1,
+        "a later sweep must retry the entry, not leave it stuck forever"
+    );
+    assert!(
+        !row_exists(&db, &sha256),
+        "once the obstruction is gone, the retried sweep must finish the job"
+    );
+}
+
+#[test]
 fn evict_keeps_entries_touched_within_ttl() {
     let (src_dir, _cache_dir, db, cache) = open_cache();
     let sha256 = "d".repeat(64);

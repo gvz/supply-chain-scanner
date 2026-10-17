@@ -11,6 +11,7 @@ pub mod artifact_cache;
 pub mod config;
 pub mod db;
 pub mod ecosystem;
+pub mod http;
 pub mod model;
 pub mod plugin;
 pub mod policy;

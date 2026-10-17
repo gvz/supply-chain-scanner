@@ -45,8 +45,11 @@ cvss = "3"
 serde_json = "1"
 tempfile = "3"
 pep440_rs = "0.7"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "tower-log"] }
+hyper = { version = "1", features = ["http1"] }
 
 [dev-dependencies]
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 wiremock = "0.6"
 
 # The zip-bomb test in `tests/plugin.rs` has to push more than the

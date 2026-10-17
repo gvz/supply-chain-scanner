@@ -23,6 +23,7 @@ use supply_chain_scanner::db::index_cache::IndexCache;
 use supply_chain_scanner::db::verdict::VerdictStore;
 use supply_chain_scanner::db::Db;
 use supply_chain_scanner::ecosystem::pypi::upstream::Upstream;
+use supply_chain_scanner::ecosystem::pypi::PyPi;
 use supply_chain_scanner::http::refusal::{
     in_progress_response, refusal_response, sanitize_phrase, unverifiable_response,
 };
@@ -80,9 +81,14 @@ fn app_state() -> (tempfile::TempDir, tempfile::TempDir, AppState) {
     let index_cache = IndexCache::new(db.clone());
     let upstream = Upstream::new(
         "https://example.invalid/simple/".parse().unwrap(),
-        index_cache,
+        index_cache.clone(),
     )
     .expect("construct upstream");
+    let ecosystem_upstream = Upstream::new(
+        "https://example.invalid/simple/".parse().unwrap(),
+        index_cache,
+    )
+    .expect("construct ecosystem upstream");
     let verdict_store = VerdictStore::new(db.clone());
     let advisory_store = AdvisoryStore::new(db.clone());
     let plugin_runner = PluginRunner::new(Arc::new(NeverCalledSandbox));
@@ -104,6 +110,7 @@ fn app_state() -> (tempfile::TempDir, tempfile::TempDir, AppState) {
         scanner: Arc::new(scanner),
         verdicts: Arc::new(verdict_store),
         config: config_handle,
+        ecosystem: Arc::new(PyPi::new(Arc::new(ecosystem_upstream))),
     };
 
     (db_dir, cache_dir, state)

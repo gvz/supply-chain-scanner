@@ -49,10 +49,10 @@ use anyhow::Context;
 use crate::advisory::matching::first_blocking;
 use crate::advisory::Advisory;
 use crate::artifact_cache::ArtifactCache;
-use crate::config::ConfigHandle;
+use crate::config::{Config, ConfigHandle};
 use crate::db::advisory::AdvisoryStore;
 use crate::db::verdict::{StoredVerdict, VerdictStore};
-use crate::ecosystem::pypi::index::IndexEntry;
+use crate::ecosystem::pypi::index::{normalize_name, IndexEntry};
 use crate::ecosystem::pypi::upstream::{Upstream, UpstreamError};
 use crate::model::{ArtifactKey, RefusalReason, Verdict};
 use crate::plugin::{unpack, PluginRunner};
@@ -158,7 +158,7 @@ impl Scanner {
             return Decision::Unverifiable(no_hash_reason());
         }
 
-        if self.policy.allows(&key.package, &key.version) {
+        if is_allowlisted(&self.config.current(), &key.package, &key.version) {
             // The allowlist overrides any stored verdict, but never the
             // integrity check: the bytes still have to match the hash
             // the index declared.
@@ -725,6 +725,32 @@ fn cleanup_fresh_download(path: &std::path::Path, freshly_downloaded: bool) {
             let _ = std::fs::remove_dir(parent);
         }
     }
+}
+
+/// Whether `package`@`version` is explicitly allowlisted by the org,
+/// overriding any stored verdict (but never the hash check).
+///
+/// Deliberately reads `config` — the live snapshot behind
+/// [`crate::config::ConfigHandle`] — rather than going through
+/// [`Policy::allows`], even though the two compare identically today.
+/// [`Policy`] is built once at startup and never rebuilt (its own module
+/// docs are explicit that it must stay immutable so an in-flight scan
+/// finishes under the policy it started with), while those same docs
+/// also say the allowlist "is an override applied at request time, not
+/// an input that changes what a scan examines" — i.e. it is meant to
+/// take effect immediately on a config reload (task 12's `SIGHUP`
+/// handler), unlike the fingerprinted parts of policy. Reading it here,
+/// straight from `ConfigHandle::current()`, is what makes that true;
+/// going through the frozen `Policy` snapshot instead would silently
+/// make a reloaded allowlist entry inert for the lifetime of the
+/// process. Matches [`Policy::allows`]'s own comparison rules exactly
+/// (package names normalized per PEP 503, versions compared verbatim).
+fn is_allowlisted(config: &Config, package: &str, version: &str) -> bool {
+    let normalized = normalize_name(package);
+    config
+        .allowlist
+        .iter()
+        .any(|entry| normalize_name(&entry.package) == normalized && entry.version == version)
 }
 
 fn no_hash_reason() -> RefusalReason {

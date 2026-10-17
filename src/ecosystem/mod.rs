@@ -1,6 +1,7 @@
 //! Ecosystem-specific protocol logic. PyPI is implemented first; npm and
-//! cargo are expected to follow. The trait that abstracts over ecosystems
-//! arrives in a later task once there is more than one implementation to
-//! generalize from.
+//! cargo are expected to follow behind the same [`Ecosystem`] trait.
 
 pub mod pypi;
+pub mod traits;
+
+pub use traits::Ecosystem;

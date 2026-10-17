@@ -36,7 +36,8 @@ hex = "0.4"
 thiserror = "1"
 bytes = "1"
 futures-util = "0.3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "net", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 tar = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
@@ -47,6 +48,7 @@ tempfile = "3"
 pep440_rs = "0.7"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "tower-log"] }
 hyper = { version = "1", features = ["http1"] }
+async-trait = "0.1"
 
 [dev-dependencies]
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }

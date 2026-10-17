@@ -25,6 +25,11 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 r2d2 = "0.8.10"
 r2d2_sqlite = "0.35.0"
 rand = "0.10.3"
+# Transitive dependency of r2d2_sqlite. Pinned because uuid 1.28 requires
+# rustc 1.89, but this repo pins rustc 1.88.0 via rust-toolchain.toml; an
+# unconstrained `cargo update` would otherwise silently re-bump uuid and
+# break the build. Remove this pin once the toolchain is bumped past 1.89.
+uuid = "=1.11.0"
 
 [dev-dependencies]
 tempfile = "3"

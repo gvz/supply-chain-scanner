@@ -301,6 +301,7 @@ fn exited(code: i32, output: &str) -> SandboxOutcome {
         exit_code: Some(code),
         output: output.to_string(),
         timed_out: false,
+        signal: None,
     }
 }
 

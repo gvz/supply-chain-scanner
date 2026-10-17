@@ -87,6 +87,23 @@ stall_timeout = "30s"
 # its verdict.
 max_duration = "30m"
 
+# Hard cap, in bytes, on one artifact's downloaded size. Optional — defaults
+# to 2147483648 (2 GiB). Checked against `Content-Length` up front when
+# upstream supplies one, and against the running total of bytes actually
+# received either way (so a response with no declared length, or one that
+# understates it, is still caught). 2 GiB clears every real artifact this
+# proxy has been tested against with room to spare — including a 906 MB
+# `torch` wheel — while still bounding a single download to a survivable
+# write, which matters because the download path writes into a temp
+# directory that is typically tmpfs-backed (RAM) on Linux.
+max_artifact_bytes = 2147483648
+
+# Everything in [download] above, including max_artifact_bytes, is
+# restart-only: these values are baked into the upstream HTTP clients at
+# startup and cannot be changed by a SIGHUP reload. A reload that changes
+# any of them is rejected in full, naming the field, and the previously
+# running configuration keeps running.
+
 # How many full scans (download + unpack + plugins) may run at once.
 # Optional — omit it (or leave it unset) to size it automatically from the
 # host's available parallelism, at 2 per CPU, clamped to 2..=16, which is

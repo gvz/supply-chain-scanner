@@ -51,9 +51,13 @@
 //!
 //! - **Resource consumption beyond those per-process rlimits.** There is
 //!   still no cgroup, so the limits are per *process*, not per sandbox: a
-//!   plugin may hold [`PLUGIN_MAX_PROCESSES`] processes each with its own
-//!   [`PLUGIN_MAX_ADDRESS_SPACE_BYTES`] of address space and its own CPU
-//!   allowance. That bounds the blast radius rather than making it small.
+//!   plugin may hold many processes (bounded by `RLIMIT_NPROC`, see
+//!   [`apply_rlimits`]) each with its own
+//!   [`PLUGIN_MAX_ADDRESS_SPACE_BYTES`] of address space. That bounds the
+//!   blast radius rather than making it small. There is deliberately no
+//!   CPU-time rlimit at all — see the comment on why `RLIMIT_CPU` is
+//!   absent, near `PLUGIN_MAX_FILE_BYTES` — so CPU consumption is bounded
+//!   only by the wall-clock timeout, not by a separate allowance.
 //!   `RLIMIT_AS` also bounds *virtual* address space, not resident memory,
 //!   which is the only portable handle Linux offers (`RLIMIT_RSS` is a
 //!   no-op) — a plugin can still touch a lot of real memory under a
@@ -71,7 +75,7 @@
 
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -176,11 +180,16 @@ const PLUGIN_MAX_ADDRESS_SPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// artifact* on any busy host: the false-positive anti-goal, triggered by
 /// nothing more than the machine being in use.
 ///
-/// So the limit is measured-plus-headroom instead. Inside the sandbox's
-/// fresh user namespace the count starts from zero, so this headroom is
-/// the real bound on a fork bomb: 512 tasks, against the ~125,000 the
-/// kernel's own default ceiling would otherwise allow. They also live in
-/// a PID namespace torn down with the sandbox, so none outlive the run.
+/// So the limit is measured-plus-headroom instead. The *value* set is
+/// inherited from outside the sandbox, but the *count* charged against
+/// it restarts near zero once `bwrap` clones into its fresh user
+/// namespace — so the real ceiling a fork bomb hits inside the sandbox
+/// is approximately host-threads-at-launch-time + 512 (on the machine
+/// this comment was written against, which carried roughly 1,066 threads
+/// for this uid, that is about 1,578), not 512 tasks outright. That is
+/// still a large improvement over the ~125,000 the kernel's own default
+/// ceiling would otherwise allow. They also live in a PID namespace torn
+/// down with the sandbox, so none outlive the run.
 const PLUGIN_PROCESS_HEADROOM: u64 = 512;
 
 /// `RLIMIT_FSIZE`: largest single file the plugin may create.
@@ -191,17 +200,29 @@ const PLUGIN_PROCESS_HEADROOM: u64 = 512;
 /// using the scratch space it was given.
 const PLUGIN_MAX_FILE_BYTES: u64 = TMPFS_SIZE_BYTES;
 
-/// Seconds of slack added to the plugin's wall-clock timeout to derive
-/// `RLIMIT_CPU`.
-///
-/// `RLIMIT_CPU` is CPU-seconds, not wall-clock, so for a single-threaded
-/// plugin it is a slightly looser bound than the timeout already is. Its
-/// value is against a plugin that *multiplies*: with the timeout alone, N
-/// forked workers could burn N × timeout core-seconds inside one timeout.
-/// The slack keeps an honest plugin that genuinely uses its whole budget
-/// from being killed by `SIGXCPU` a moment before the runner's own
-/// timeout would have reported it as a clean timeout instead.
-const PLUGIN_CPU_SLACK_SECONDS: u64 = 1;
+// `RLIMIT_CPU` is deliberately **not** one of the limits this sandbox
+// applies.
+//
+// Linux enforces `RLIMIT_CPU` against the thread-*group's* total CPU
+// time, not wall-clock time: an N-threaded plugin burns the allowance
+// in roughly `limit / N` wall seconds, not `limit`. A single-threaded
+// plugin would only ever hit this a moment before the wall-clock
+// timeout fires anyway, so the limit buys that case nothing; a
+// multithreaded one — threaded YARA, anything using `rayon`, `clamscan`
+// — gets killed by `SIGXCPU` at a small fraction of its real timeout,
+// well before doing any work. That is the false-positive anti-goal
+// firing on an entirely legitimate plugin: the runner has no way to
+// tell "killed by `SIGXCPU` partway through" apart from "actually
+// malicious," so it refuses the artifact and stores nothing, forever,
+// on every retry.
+//
+// The wall-clock timeout in `SandboxSpec::timeout` is what actually
+// bounds how long any plugin — single- or multi-threaded — may run, and
+// it does so correctly regardless of thread count. `RLIMIT_NPROC` below
+// separately bounds how many threads/processes a plugin may create at
+// all, which is the real defense against a CPU-burning fork bomb.
+// Between the two, a CPU-only limit measured in the wrong clock adds no
+// coverage and only costs correctness, so it is left out.
 
 /// One plugin invocation.
 #[derive(Debug, Clone)]
@@ -232,6 +253,12 @@ pub struct SandboxOutcome {
     /// Captured stdout, truncated to `max_output_bytes`. Unsanitized.
     pub output: String,
     pub timed_out: bool,
+    /// The signal that killed the process, if `exit_code` is `None` and
+    /// it was *not* this sandbox's own timeout kill (that case already
+    /// has `timed_out: true` to explain it, and carries no signal here).
+    /// E.g. `SIGXCPU`, `SIGSEGV`, or an OOM killer's `SIGKILL` — distinct
+    /// from a plain "no exit code" for the operator reading `/why`.
+    pub signal: Option<i32>,
 }
 
 /// Runs a plugin binary under confinement.
@@ -373,22 +400,17 @@ impl SandboxRunner for BubblewrapSandbox {
         // every process it spawned, not just `bwrap` itself.
         command.process_group(0);
 
-        // `RLIMIT_CPU` is derived per run from this plugin's own timeout;
-        // the rest are constants. Set in the forked child just before
-        // `exec`, so they apply to `bwrap` and are inherited by
+        // The rlimits are constants (see `apply_rlimits`; `RLIMIT_CPU` is
+        // deliberately not among them). Set in the forked child just
+        // before `exec`, so they apply to `bwrap` and are inherited by
         // everything it starts inside the namespace.
-        let cpu_seconds = spec
-            .timeout
-            .as_secs()
-            .saturating_add(PLUGIN_CPU_SLACK_SECONDS)
-            .max(1);
         let nproc = nproc_limit_for_this_host();
         if nproc.is_none() {
             tracing::warn!(
                 "could not read this host's thread count from /proc, so the \
                  sandbox's RLIMIT_NPROC is left at whatever this process \
                  inherited: a plugin's fork count is unbounded for this run. \
-                 Every other limit (address space, file size, CPU) still applies."
+                 Every other limit (address space, file size) still applies."
             );
         }
         // SAFETY: `pre_exec` runs in the forked child between `fork` and
@@ -400,7 +422,7 @@ impl SandboxRunner for BubblewrapSandbox {
         // `/proc` walk that produced `nproc` happened above, in the
         // parent, precisely so it is not done here.
         unsafe {
-            command.pre_exec(move || apply_rlimits(cpu_seconds, nproc));
+            command.pre_exec(move || apply_rlimits(nproc));
         }
 
         let mut child = command
@@ -423,8 +445,13 @@ impl SandboxRunner for BubblewrapSandbox {
             let _ = status_tx.send(child.wait());
         });
 
-        let (exit_code, timed_out) = match status_rx.recv_timeout(spec.timeout) {
-            Ok(Ok(status)) => (status.code(), false),
+        let (exit_code, timed_out, signal) = match status_rx.recv_timeout(spec.timeout) {
+            // `signal()` (from `ExitStatusExt`) is `Some` exactly when
+            // `code()` is `None` — the process died from a signal this
+            // sandbox did not send, e.g. `SIGXCPU`, `SIGSEGV`, an `OOM`
+            // kill's `SIGKILL`. Surfacing it is what lets an operator
+            // tell that apart from a plain "no exit code".
+            Ok(Ok(status)) => (status.code(), false, status.signal()),
             // `wait` failed, so the plugin's fate is unknown. Make it
             // certain rather than leaving something running behind a scan
             // that has already given up on it.
@@ -440,7 +467,9 @@ impl SandboxRunner for BubblewrapSandbox {
                 // whole group goes so that children die with it.
                 kill_process_group(process_group);
                 match status_rx.recv_timeout(KILL_GRACE) {
-                    Ok(_) => (None, true),
+                    // `timed_out` already says why this one ended; no
+                    // separate signal is reported for it.
+                    Ok(_) => (None, true, None),
                     // A refusal rather than a hang. The reader threads are
                     // left behind with it; they end when the wedged process
                     // finally releases the pipes.
@@ -489,6 +518,7 @@ impl SandboxRunner for BubblewrapSandbox {
             exit_code,
             output,
             timed_out,
+            signal,
         })
     }
 }
@@ -537,10 +567,11 @@ fn join_reader(
 /// spawn and therefore refuses the artifact: a plugin running with fewer
 /// limits than this module promises is not something to proceed with
 /// quietly.
-fn apply_rlimits(cpu_seconds: u64, nproc: Option<u64>) -> std::io::Result<()> {
+fn apply_rlimits(nproc: Option<u64>) -> std::io::Result<()> {
     set_limit(libc::RLIMIT_AS, PLUGIN_MAX_ADDRESS_SPACE_BYTES)?;
     set_limit(libc::RLIMIT_FSIZE, PLUGIN_MAX_FILE_BYTES)?;
-    set_limit(libc::RLIMIT_CPU, cpu_seconds)?;
+    // `RLIMIT_CPU` is intentionally not set here; see the "deliberately
+    // not one of the limits" comment above, near `PLUGIN_MAX_FILE_BYTES`.
     // `None` means the host's thread count could not be read, so any
     // value chosen here could be *below* it and would make `bwrap` fail
     // to clone at all — refusing every artifact. Leaving the inherited

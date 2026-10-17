@@ -40,6 +40,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context};
 use flate2::read::MultiGzDecoder;
+use thiserror::Error;
 
 /// Hard cap on the total uncompressed bytes one archive may extract to.
 ///
@@ -65,6 +66,47 @@ const S_IFREG: u32 = 0o100000;
 /// `S_IFDIR`: a directory.
 const S_IFDIR: u32 = 0o040000;
 
+/// Why [`unpack`] refused an archive.
+///
+/// The distinction a caller needs: [`UnpackError::Escape`] is a
+/// **deliberate** attempt to write outside the destination — an absolute
+/// path, a `..` component, a symlink, a hard link, or a device/FIFO entry
+/// — which is an unambiguous attack, not a gap in this unpacker's coverage.
+/// A caller should store it as a durable `Blocked` verdict, with the
+/// detail naming what was caught.
+///
+/// [`UnpackError::Other`] is everything else: an unsupported format, a
+/// truncated or malformed archive, a decompression-budget failure, an I/O
+/// error. These are gaps in *our* coverage, not findings, and a caller must
+/// treat them as `Unverifiable` and store nothing — conflating the two
+/// used to turn "this unpacker cannot read `.tar.bz2`" into a permanent,
+/// durable "we found malware in your package."
+#[derive(Debug, Error)]
+pub enum UnpackError {
+    #[error("{0}")]
+    Escape(String),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+/// Marks an [`anyhow::Error`] as a deliberate escape attempt (see
+/// [`UnpackError::Escape`]), without threading a new return type through
+/// every helper function below. [`unpack`] looks for this in the error
+/// chain once extraction has already failed, via
+/// [`anyhow::Error::chain`] + [`std::error::Error::is`], so it survives
+/// any `.context(..)` wrapping added on top.
+#[derive(Debug, Error)]
+#[error("{0}")]
+struct EscapeAttempt(String);
+
+/// Builds an [`anyhow::Error`] tagged as a deliberate escape attempt — the
+/// `bail!`-equivalent for every call site in this module that detects an
+/// absolute path, a `..` component, a symlink, a hard link, or a
+/// device/FIFO entry.
+fn escape(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(EscapeAttempt(message.into()))
+}
+
 /// Extracts `archive` into `dest`, creating `dest` if it does not exist.
 ///
 /// The archive format is chosen from `archive`'s file name: `.whl`, `.zip`
@@ -76,11 +118,12 @@ const S_IFDIR: u32 = 0o040000;
 /// hand a plugin a half-extracted package. `dest` must therefore be a
 /// directory this archive owns — a fresh one per artifact — and not a
 /// shared location holding anything the caller wants to keep.
-pub fn unpack(archive: &Path, dest: &Path) -> anyhow::Result<()> {
-    let kind = ArchiveKind::of(archive)?;
+pub fn unpack(archive: &Path, dest: &Path) -> Result<(), UnpackError> {
+    let kind = ArchiveKind::of(archive).map_err(UnpackError::Other)?;
 
     fs::create_dir_all(dest)
-        .with_context(|| format!("creating unpack destination {}", dest.display()))?;
+        .with_context(|| format!("creating unpack destination {}", dest.display()))
+        .map_err(UnpackError::Other)?;
 
     let mut budget = Budget::new();
     let result = match kind {
@@ -88,18 +131,30 @@ pub fn unpack(archive: &Path, dest: &Path) -> anyhow::Result<()> {
         ArchiveKind::TarGz => unpack_tar_gz(archive, dest, &mut budget),
     };
 
-    if result.is_err() {
-        // Reject the whole archive, not just the offending entry.
-        if let Err(cleanup_error) = clear_dir(dest) {
-            tracing::warn!(
-                dest = %dest.display(),
-                error = %cleanup_error,
-                "could not remove a partial extraction after a refused archive"
-            );
-        }
+    let Err(err) = result else {
+        return Ok(());
+    };
+
+    // Reject the whole archive, not just the offending entry.
+    if let Err(cleanup_error) = clear_dir(dest) {
+        tracing::warn!(
+            dest = %dest.display(),
+            error = %cleanup_error,
+            "could not remove a partial extraction after a refused archive"
+        );
     }
 
-    result.with_context(|| format!("unpacking {}", archive.display()))
+    // Checked on the *original* error, before `.context(..)` below adds a
+    // frame on top — `chain()` still walks through that frame fine, but
+    // checking first keeps this independent of where in the chain the
+    // added context ends up.
+    let is_escape = err.chain().any(|cause| cause.is::<EscapeAttempt>());
+    let err = err.context(format!("unpacking {}", archive.display()));
+    if is_escape {
+        Err(UnpackError::Escape(format!("{err:#}")))
+    } else {
+        Err(UnpackError::Other(err))
+    }
 }
 
 enum ArchiveKind {
@@ -189,7 +244,9 @@ fn relative_entry_path(raw: &Path) -> anyhow::Result<PathBuf> {
     let shown = raw.display();
 
     if raw.is_absolute() {
-        bail!("archive entry {shown} has an absolute path");
+        return Err(escape(format!(
+            "archive entry {shown} has an absolute path"
+        )));
     }
 
     let mut relative = PathBuf::new();
@@ -197,9 +254,15 @@ fn relative_entry_path(raw: &Path) -> anyhow::Result<PathBuf> {
         match component {
             Component::Normal(part) => relative.push(part),
             Component::CurDir => {}
-            Component::ParentDir => bail!("archive entry {shown} contains a `..` component"),
+            Component::ParentDir => {
+                return Err(escape(format!(
+                    "archive entry {shown} contains a `..` component"
+                )))
+            }
             Component::RootDir | Component::Prefix(_) => {
-                bail!("archive entry {shown} is not a relative path")
+                return Err(escape(format!(
+                    "archive entry {shown} is not a relative path"
+                )))
             }
         }
     }
@@ -214,10 +277,10 @@ fn resolve_within(dest: &Path, relative: &Path, raw: &Path) -> anyhow::Result<Pa
     // already makes an escape impossible; this catches any future change
     // to it.
     if !resolved.starts_with(dest) {
-        bail!(
+        return Err(escape(format!(
             "archive entry {} resolves outside the destination directory",
             raw.display()
-        );
+        )));
     }
     Ok(resolved)
 }
@@ -315,14 +378,16 @@ fn unpack_zip(archive: &Path, dest: &Path, budget: &mut Budget) -> anyhow::Resul
             .into_owned();
 
         if entry.is_symlink() {
-            bail!("archive entry {name} is a symlink");
+            return Err(escape(format!("archive entry {name} is a symlink")));
         }
         if let Some(mode) = entry.unix_mode() {
             let file_type = mode & S_IFMT;
             // A zip entry may legitimately record no file-type bits at all,
             // in which case it is a plain file.
             if file_type != 0 && file_type != S_IFREG && file_type != S_IFDIR {
-                bail!("archive entry {name} is neither a regular file nor a directory");
+                return Err(escape(format!(
+                    "archive entry {name} is neither a regular file nor a directory"
+                )));
             }
         }
 
@@ -372,12 +437,12 @@ fn unpack_tar_gz(archive: &Path, dest: &Path, budget: &mut Budget) -> anyhow::Re
             .to_path_buf();
 
         if !entry_type.is_dir() && !entry_type.is_file() {
-            bail!(
+            return Err(escape(format!(
                 "archive entry {} is neither a regular file nor a directory \
                  (tar type {:?})",
                 raw.display(),
                 entry_type
-            );
+            )));
         }
 
         match resolve_entry_target(dest, &raw, entry_type.is_dir())? {

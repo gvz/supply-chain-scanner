@@ -348,7 +348,7 @@ fn rejects_sha256_that_is_not_lowercase_hex() {
 /// caller that skipped the guard — panicked the eviction ticker instead of
 /// skipping the row.
 #[test]
-fn evict_expired_skips_a_malformed_sha256_row_instead_of_panicking() {
+fn evict_expired_deletes_a_malformed_sha256_row_instead_of_leaving_it_forever() {
     let (_db_dir, _cache_dir, db, cache) = open_cache();
     let source_dir = tempfile::tempdir().expect("create source temp dir");
 
@@ -372,12 +372,40 @@ fn evict_expired_skips_a_malformed_sha256_row_instead_of_panicking() {
         .expect("insert malformed row");
     }
 
+    // N5: a malformed row must not merely be skipped-and-kept — that
+    // logs the same warning and reclaims nothing on every future sweep,
+    // forever. It must be deleted, same as a row whose file has already
+    // gone missing.
     let removed = cache
         .evict_expired(Duration::from_secs(60))
         .expect("the sweep must not fail because of one bad row");
     assert_eq!(
-        removed, 1,
-        "the good expired entry must still have been evicted"
+        removed, 2,
+        "both the good expired entry and the malformed row must be removed"
+    );
+
+    let remaining: i64 = db
+        .conn()
+        .expect("get connection")
+        .query_row(
+            "SELECT COUNT(*) FROM artifact_cache WHERE sha256 = 'x'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query malformed row");
+    assert_eq!(
+        remaining, 0,
+        "the malformed row must actually be deleted, not merely skipped"
+    );
+
+    // A second sweep must find nothing left to do (and, crucially, must
+    // not panic or re-log the same malformed row again).
+    let removed_again = cache
+        .evict_expired(Duration::from_secs(60))
+        .expect("a second sweep over an already-clean table must not fail");
+    assert_eq!(
+        removed_again, 0,
+        "the malformed row must not still be there to be \"removed\" again"
     );
 }
 

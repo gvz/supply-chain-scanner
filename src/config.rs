@@ -117,6 +117,36 @@ pub struct DownloadLimits {
     /// its verdict, so the developer's retry lands on a stored decision.
     #[serde(with = "humantime_serde")]
     pub max_duration: Duration,
+
+    /// Hard cap, in bytes, on one artifact's downloaded size.
+    ///
+    /// Removing the old total-duration deadline (see `max_duration`'s own
+    /// doc comment) left the download path with no byte budget at all:
+    /// only stall detection and this struct's absolute-duration backstop
+    /// stood between a tampered or MITM'd upstream — a threat this
+    /// project explicitly models, since a hash mismatch against exactly
+    /// such an upstream is logged as one — and up to `max_duration` of
+    /// writing into `$TMPDIR`, which on a default Linux host is tmpfs
+    /// backed by RAM. This closes that gap the same way
+    /// [`crate::plugin::unpack`]'s own 512 MiB extraction cap closes the
+    /// analogous one on the unpack side.
+    ///
+    /// 2 GiB clears every real artifact this proxy has been tested
+    /// against with room to spare — including a 906 MB `torch` wheel —
+    /// while still bounding a single download to a survivable write on
+    /// any host that can run the proxy at all. Checked twice: against
+    /// `Content-Length` up front when upstream supplies one (so an
+    /// obviously oversized artifact is refused before a single byte
+    /// arrives), and against the running total of bytes actually
+    /// received (so a response lacking that header, or one that lies in
+    /// it, is still caught while streaming).
+    pub max_artifact_bytes: u64,
+}
+
+/// Default for [`DownloadLimits::max_artifact_bytes`]: 2 GiB. See that
+/// field's own doc comment for why.
+fn default_max_artifact_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
 }
 
 impl Default for DownloadLimits {
@@ -124,6 +154,7 @@ impl Default for DownloadLimits {
         Self {
             stall_timeout: Duration::from_secs(30),
             max_duration: Duration::from_secs(30 * 60),
+            max_artifact_bytes: default_max_artifact_bytes(),
         }
     }
 }

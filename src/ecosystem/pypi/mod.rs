@@ -62,6 +62,6 @@ impl Ecosystem for PyPi {
     }
 
     fn unpack(&self, archive: &Path, dest: &Path) -> anyhow::Result<()> {
-        crate::plugin::unpack(archive, dest)
+        crate::plugin::unpack(archive, dest).map_err(anyhow::Error::from)
     }
 }

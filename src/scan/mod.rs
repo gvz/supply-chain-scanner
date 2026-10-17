@@ -57,7 +57,7 @@ use crate::db::verdict::{StoredVerdict, VerdictStore};
 use crate::ecosystem::pypi::index::{normalize_name, IndexEntry};
 use crate::ecosystem::pypi::upstream::{Upstream, UpstreamError};
 use crate::model::{ArtifactKey, RefusalReason, Verdict};
-use crate::plugin::{unpack, PluginRunner};
+use crate::plugin::{unpack, PluginRunner, UnpackError};
 use crate::policy::Policy;
 
 use coordinator::{FinishGuard, ScanCoordinator};
@@ -621,7 +621,27 @@ impl Scanner {
         };
         match unpack_result {
             Ok(Ok(())) => {}
-            Ok(Err(err)) => {
+            Ok(Err(UnpackError::Escape(detail))) => {
+                cleanup_fresh_download(&artifact_path, freshly_downloaded);
+                // Unlike the `Other` arm below, this is not a gap in our
+                // coverage: an absolute path, a `..` component, a
+                // symlink, a hard link, or a device/FIFO entry is a
+                // deliberate attempt to write outside the unpack
+                // destination — an unambiguous attack, not a format we
+                // merely failed to read. "We checked and it is bad," so
+                // it is stored as a durable `Blocked` verdict (a 403 with
+                // a `/why` page), unlike every other `unpack` failure.
+                let reason = RefusalReason {
+                    code: "unpack:escape".to_string(),
+                    detail: sanitize_text(&detail, DETAIL_MAX_CHARS),
+                };
+                let why_id = self
+                    .store_verdict(key, &Verdict::Blocked(reason.clone()), fingerprint)
+                    .await
+                    .ok();
+                return Decision::Refuse { reason, why_id };
+            }
+            Ok(Err(UnpackError::Other(err))) => {
                 cleanup_fresh_download(&artifact_path, freshly_downloaded);
                 // Deliberately `Unverifiable`, not `Blocked`: an archive
                 // this unpacker cannot read is a gap in *our* coverage —

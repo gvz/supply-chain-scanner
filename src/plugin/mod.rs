@@ -31,7 +31,7 @@ use std::sync::Arc;
 pub use sandbox::{
     BubblewrapSandbox, SandboxOutcome, SandboxRunner, SandboxSpec, SANDBOX_PACKAGE_DIR,
 };
-pub use unpack::unpack;
+pub use unpack::{unpack, UnpackError};
 
 use crate::config::PluginConfig;
 use crate::model::{ArtifactKey, RefusalReason};
@@ -165,9 +165,20 @@ impl PluginRunner {
             }),
             // Killed by a signal without timing out: the plugin crashed
             // before reaching a verdict, so there is no verdict to trust.
+            // Naming the signal (when the sandbox could determine one)
+            // is what lets an operator tell a `SIGXCPU`/`SIGSEGV`/OOM
+            // `SIGKILL` death apart from an uninformative "no exit code" —
+            // the first is often a plugin bug or a resource limit, the
+            // second two usually are not.
             None => Some(error_refusal(
                 &plugin.name,
-                "plugin terminated without an exit code",
+                &match outcome.signal {
+                    Some(signal) => format!(
+                        "plugin terminated by signal {signal} ({})",
+                        signal_name(signal)
+                    ),
+                    None => "plugin terminated without an exit code".to_string(),
+                },
             )),
         }
     }
@@ -178,6 +189,25 @@ fn error_refusal(name: &str, cause: &str) -> RefusalReason {
     RefusalReason {
         code: format!("plugin:{}{CODE_SUFFIX_ERROR}", sanitize_detail(name)),
         detail: sanitize_detail(&format!("plugin {name} could not run: {cause}")),
+    }
+}
+
+/// A human-readable name for a Linux signal number, for the handful an
+/// operator is actually likely to see from a killed plugin. Falls back to
+/// just the number for anything else rather than guessing.
+fn signal_name(signal: i32) -> &'static str {
+    match signal {
+        libc::SIGXCPU => "SIGXCPU, CPU time limit exceeded",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGSEGV => "SIGSEGV, segmentation fault",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGILL => "SIGILL, illegal instruction",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGSYS => "SIGSYS, bad system call",
+        _ => "unknown signal",
     }
 }
 

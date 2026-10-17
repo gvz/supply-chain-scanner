@@ -200,11 +200,27 @@ impl ArtifactCache {
             // that skipped the guard — used to panic the eviction ticker
             // instead of skipping the row.
             let Ok(sha256) = validated_sha256(&sha256).map(str::to_owned) else {
+                // Merely skipping used to mean this row (and whatever
+                // bytes its file holds) was never reclaimed: the next
+                // sweep found the same row still "expired," logged the
+                // same warning, and skipped it again, forever. Delete
+                // the row outright instead, and best-effort delete its
+                // file too when a path can be derived safely — `get`,
+                // not indexing, because a malformed value may not even
+                // be 2 bytes long or may not land on a UTF-8 boundary at
+                // that offset, and this must never panic the eviction
+                // ticker either way.
                 tracing::warn!(
                     sha256 = %sha256,
-                    "artifact cache row has a malformed sha256; skipping it \
-                     rather than deriving a path from it"
+                    "artifact cache row has a malformed sha256; deleting the \
+                     row (and its file, if a path can be derived) instead \
+                     of leaving it to be re-skipped on every future sweep"
                 );
+                if let Some(prefix) = sha256.get(0..2) {
+                    let _ = std::fs::remove_file(self.root.join(prefix).join(&sha256));
+                }
+                self.store.remove(&sha256)?;
+                removed += 1;
                 continue;
             };
             let path = self.path_for(&sha256);

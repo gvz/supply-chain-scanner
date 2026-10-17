@@ -91,6 +91,23 @@ fn build_wheel_bytes() -> Vec<u8> {
     buf
 }
 
+/// A wheel carrying one entry that escapes `dest` via a `..` component —
+/// the kind of deliberate attack N3's regression test needs, as opposed to
+/// [`build_wheel_bytes`]'s ordinary well-formed contents.
+fn build_wheel_bytes_with_traversal_entry() -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let cursor = std::io::Cursor::new(&mut buf);
+        let mut zip = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("../escape.txt", options)
+            .expect("start zip entry");
+        zip.write_all(b"pwned\n").expect("write zip entry contents");
+        zip.finish().expect("finish zip fixture");
+    }
+    buf
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -204,6 +221,7 @@ fn exited(code: i32, output: &str) -> SandboxOutcome {
         exit_code: Some(code),
         output: output.to_string(),
         timed_out: false,
+        signal: None,
     }
 }
 
@@ -1139,6 +1157,58 @@ async fn an_unreadable_archive_is_unverifiable_and_stores_no_verdict() {
     );
 }
 
+/// N3 regression test: an archive attempting a deliberate path-escape — a
+/// `..` component here, but the same rule covers absolute paths, symlinks,
+/// hard links, and device/FIFO entries — is an unambiguous attack, not a
+/// format gap, and must be `Blocked` with a stored, `/why`-visible verdict.
+/// Before the fix, every `unpack` failure (benign or hostile alike) mapped
+/// to `unverifiable:unpack-failed`, storing nothing — so an attack like
+/// this read to a developer as "we could not check this artifact" and pip
+/// retried the download up to five times.
+#[tokio::test]
+async fn an_archive_with_a_path_escape_is_blocked_and_stores_the_verdict() {
+    let server = MockServer::start().await;
+    let filename = "demo_package-1.0.0-py3-none-any.whl";
+    let body = build_wheel_bytes_with_traversal_entry();
+    let sha256 = sha256_hex(&body);
+
+    Mock::given(method("GET"))
+        .and(path(format!("/packages/{filename}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&server)
+        .await;
+
+    let harness = build_harness(
+        base_config(Duration::from_secs(12)),
+        &server,
+        FakeSandbox::empty(),
+    );
+    let key = key_for(&sha256, filename);
+    let entry = entry_for(&server, filename, Some(&sha256));
+
+    match harness.scanner.decide(&key, &entry).await {
+        Decision::Refuse { reason, why_id } => {
+            assert_eq!(reason.code, "unpack:escape");
+            assert!(
+                why_id.is_some(),
+                "a deliberate escape attempt must produce a /why-visible verdict"
+            );
+        }
+        other => panic!(
+            "a deliberate path-escape attempt must be Blocked, not {other:?} \
+             (an unreadable/unsupported archive is the only case that stays \
+             Unverifiable)"
+        ),
+    }
+
+    let stored = harness
+        .verdict_store
+        .get(&key, &harness.fingerprint)
+        .expect("query verdict")
+        .expect("a path-escape attempt must store a durable verdict");
+    assert!(matches!(stored.verdict, Verdict::Blocked(_)));
+}
+
 /// A plugin that could not be run has not examined the artifact, so there
 /// is no verdict to store. Storing one would outlive the broken plugin and
 /// leave a developer reading "we found malware" about an artifact nothing
@@ -1224,6 +1294,7 @@ async fn a_plugin_that_timed_out_is_unverifiable_and_stores_no_verdict() {
             exit_code: None,
             output: String::new(),
             timed_out: true,
+            signal: None,
         }),
     )]);
 

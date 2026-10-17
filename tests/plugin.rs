@@ -29,6 +29,7 @@ use supply_chain_scanner::config::PluginConfig;
 use supply_chain_scanner::model::ArtifactKey;
 use supply_chain_scanner::plugin::{
     unpack, BubblewrapSandbox, PluginRunner, SandboxOutcome, SandboxRunner, SandboxSpec,
+    UnpackError,
 };
 
 // ---------------------------------------------------------------------------
@@ -84,7 +85,11 @@ fn forged_header(name: &str, entry_type: EntryType, size: u64) -> Header {
 /// file (or symlink) at any path in `must_not_exist`, and an empty
 /// destination directory, because a partial extraction is a package a
 /// plugin would then scan incompletely.
-fn assert_refused_and_clean(result: anyhow::Result<()>, dest: &Path, must_not_exist: &[&Path]) {
+fn assert_refused_and_clean(
+    result: Result<(), UnpackError>,
+    dest: &Path,
+    must_not_exist: &[&Path],
+) {
     let err = result.expect_err("unpack must refuse this archive");
 
     for path in must_not_exist {
@@ -490,6 +495,7 @@ fn clean() -> SandboxOutcome {
         exit_code: Some(0),
         output: String::new(),
         timed_out: false,
+        signal: None,
     }
 }
 
@@ -498,6 +504,7 @@ fn exited(code: i32, output: &str) -> SandboxOutcome {
         exit_code: Some(code),
         output: output.to_string(),
         timed_out: false,
+        signal: None,
     }
 }
 
@@ -632,6 +639,7 @@ async fn timeout_blocks_with_plugin_timeout_code() {
         exit_code: None,
         output: String::new(),
         timed_out: true,
+        signal: None,
     };
     let fake = FakeSandbox::new([("/plugins/slowpoke", Ok(timed_out))]);
     let runner = PluginRunner::new(fake.clone());
@@ -672,11 +680,13 @@ async fn sandbox_error_blocks_rather_than_passing() {
     );
 
     // The plugin ran but died on a signal, so it never reported a verdict.
-    // That is also not a clean result.
+    // That is also not a clean result, and the refusal detail must name
+    // the signal rather than just saying "no exit code" (N1).
     let killed = SandboxOutcome {
         exit_code: None,
         output: String::new(),
         timed_out: false,
+        signal: Some(libc::SIGSEGV),
     };
     let fake = FakeSandbox::new([("/plugins/crasher", Ok(killed))]);
     let runner = PluginRunner::new(fake.clone());
@@ -687,6 +697,34 @@ async fn sandbox_error_blocks_rather_than_passing() {
         .await
         .expect("a plugin that died without an exit code must block");
     assert_eq!(reason.code, "plugin:crasher:error");
+    assert!(
+        reason.detail.contains("SIGSEGV"),
+        "refusal detail did not name the terminating signal: {:?}",
+        reason.detail
+    );
+
+    // No signal determined at all (e.g. the sandbox could not read it):
+    // still a refusal, with the old uninformative-but-safe fallback text.
+    let killed_unknown = SandboxOutcome {
+        exit_code: None,
+        output: String::new(),
+        timed_out: false,
+        signal: None,
+    };
+    let fake = FakeSandbox::new([("/plugins/crasher2", Ok(killed_unknown))]);
+    let runner = PluginRunner::new(fake.clone());
+    let plugins = [plugin("crasher2", "/plugins/crasher2")];
+
+    let reason = runner
+        .run_all(&plugins, &key(), Path::new("/unpacked"))
+        .await
+        .expect("a plugin that died without an exit code must block");
+    assert_eq!(reason.code, "plugin:crasher2:error");
+    assert!(
+        reason.detail.contains("without an exit code"),
+        "refusal detail changed for the no-signal-known case: {:?}",
+        reason.detail
+    );
 }
 
 #[tokio::test]
@@ -810,6 +848,134 @@ fn bubblewrap_timeout_kills_a_plugin_that_ignores_sigterm() {
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "the timeout did not kill promptly: {:?}",
+        started.elapsed()
+    );
+}
+
+/// Builds, into a fresh temp directory, a small but genuinely
+/// multithreaded CPU-burning binary: `threads` threads, each spinning on
+/// its own core for roughly `burn_seconds` wall-clock seconds before the
+/// process exits 0 and prints `ok`.
+///
+/// This is the fixture N1's regression test needs: an N-threaded burner
+/// is exactly the shape of plugin `RLIMIT_CPU` used to kill early, because
+/// Linux enforces `RLIMIT_CPU` against the thread-*group's* total CPU
+/// time, not wall-clock time, so it burns a CPU-seconds allowance in
+/// roughly `allowance / N` wall seconds. Needs a C compiler (`cc`) on
+/// `PATH`, which — like `bwrap` for the sandbox tests around it — is a
+/// requirement of this `#[ignore]`d test only, never of `cargo test`.
+fn build_multithreaded_cpu_burner(threads: u32, burn_seconds: u32) -> (TempDir, PathBuf) {
+    // Built under the crate's own `target/`, not the system temp
+    // directory: the sandbox mounts a *second*, fresh tmpfs over `/tmp`
+    // after binding the plugin binary into place (see `command()`'s doc
+    // comment on mount ordering), so a binary whose host path happens to
+    // live under `/tmp` would be hidden by that later mount and fail to
+    // `exec` — a sandbox quirk unrelated to what this test is checking.
+    let target_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+    let dir = tempfile::Builder::new()
+        .prefix("n1-burner-")
+        .tempdir_in(&target_dir)
+        .expect("create burner fixture tempdir under target/");
+    let source = dir.path().join("burn.c");
+    let binary = dir.path().join("burn");
+    fs::write(
+        &source,
+        format!(
+            r#"
+#include <pthread.h>
+#include <time.h>
+#include <stdio.h>
+
+static void *burn(void *arg) {{
+    (void) arg;
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    volatile unsigned long x = 0;
+    for (;;) {{
+        for (long i = 0; i < 10000000; i++) {{
+            x += (unsigned long) i;
+        }}
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (double) (now.tv_sec - start.tv_sec)
+            + (double) (now.tv_nsec - start.tv_nsec) / 1e9;
+        if (elapsed > {burn_seconds}) {{
+            break;
+        }}
+    }}
+    return NULL;
+}}
+
+int main(void) {{
+    pthread_t threads[{threads}];
+    for (int i = 0; i < {threads}; i++) {{
+        pthread_create(&threads[i], NULL, burn, NULL);
+    }}
+    for (int i = 0; i < {threads}; i++) {{
+        pthread_join(threads[i], NULL);
+    }}
+    printf("ok\n");
+    return 0;
+}}
+"#
+        ),
+    )
+    .expect("write burner fixture source");
+
+    let status = std::process::Command::new("cc")
+        .args(["-O2", "-pthread", "-o"])
+        .arg(&binary)
+        .arg(&source)
+        .status()
+        .expect("invoke cc to build the multithreaded burner fixture");
+    assert!(status.success(), "cc failed to build the burner fixture");
+
+    (dir, binary)
+}
+
+/// N1 regression test: a `RLIMIT_CPU` sized as `timeout + 1` CPU-seconds
+/// kills a multithreaded plugin at a small fraction of its wall-clock
+/// timeout, because Linux charges `RLIMIT_CPU` against the thread-group's
+/// combined CPU time rather than wall-clock time. Reproduced empirically
+/// against this sandbox's exact `bwrap` flag set before the fix: a
+/// 4-thread burner with a 10-second timeout (`RLIMIT_CPU` = 11) died with
+/// `SIGXCPU` (exit 152) after about 2.88 wall seconds.
+///
+/// This burner needs only 3 wall seconds across 4 threads to finish, well
+/// inside a 10-second wall-clock timeout, and must now be allowed to run
+/// to completion rather than being killed partway through.
+#[test]
+#[ignore = "requires bwrap, usable namespaces, and a C compiler (cc) on PATH"]
+fn bubblewrap_allows_a_multithreaded_plugin_to_finish_within_its_wall_clock_timeout() {
+    let (_source_dir, binary) = build_multithreaded_cpu_burner(4, 3);
+    let pkg = TempDir::new().unwrap();
+
+    let sandbox = BubblewrapSandbox::detect().expect("bwrap must be on PATH");
+    let started = std::time::Instant::now();
+    let outcome = sandbox
+        .run(&SandboxSpec {
+            binary,
+            package_dir: pkg.path().to_path_buf(),
+            args: vec![],
+            timeout: Duration::from_secs(10),
+            max_output_bytes: 200,
+        })
+        .expect("the sandbox must report an outcome, not fail to run");
+
+    assert!(
+        !outcome.timed_out,
+        "the multithreaded plugin did not finish inside its wall-clock timeout"
+    );
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "the multithreaded plugin was killed before finishing (signal: {:?}, output: {:?})",
+        outcome.signal,
+        outcome.output
+    );
+    assert_eq!(outcome.output.trim(), "ok");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the burner took unexpectedly long to be reported: {:?}",
         started.elapsed()
     );
 }

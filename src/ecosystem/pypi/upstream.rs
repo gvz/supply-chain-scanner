@@ -33,7 +33,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use rand::Rng;
@@ -98,6 +98,9 @@ pub struct Upstream {
     /// Absolute cap applied around a whole download; see
     /// [`DownloadLimits::max_duration`].
     download_max_duration: Duration,
+    /// Hard cap, in bytes, on one artifact's downloaded size; see
+    /// [`DownloadLimits::max_artifact_bytes`].
+    max_artifact_bytes: u64,
 }
 
 impl Upstream {
@@ -139,6 +142,7 @@ impl Upstream {
             base,
             cache,
             download_max_duration: limits.max_duration,
+            max_artifact_bytes: limits.max_artifact_bytes,
         })
     }
 
@@ -283,11 +287,25 @@ impl Upstream {
                 entry.filename
             )));
         }
+        // Refused before a single byte is written when upstream declares
+        // the size up front: no point opening a temp file (or waiting on
+        // a stall timeout) for a transfer `stream_to_file`'s own running
+        // check would abort anyway. A response with no `Content-Length`,
+        // or one that understates it, still goes through that check.
+        if let Some(declared) = response.content_length() {
+            if declared > self.max_artifact_bytes {
+                return Err(UpstreamError::Unavailable(format!(
+                    "upstream declared {declared} bytes for {:?}, over the \
+                     {}-byte artifact size limit",
+                    entry.filename, self.max_artifact_bytes
+                )));
+            }
+        }
 
         let tmp_path = temp_path_beside(dest)
             .with_context(|| format!("choosing a temp path beside {}", dest.display()))?;
 
-        let result = stream_to_file(response, &tmp_path).await;
+        let result = stream_to_file(response, &tmp_path, self.max_artifact_bytes).await;
 
         match result {
             Ok(digest) => match tokio::fs::rename(&tmp_path, dest).await {
@@ -360,15 +378,37 @@ impl Upstream {
 /// SHA-256 digest of everything received. Any I/O or network error during
 /// the stream is returned to the caller, who is responsible for removing
 /// the (incomplete) file at `path`.
-async fn stream_to_file(response: reqwest::Response, path: &Path) -> anyhow::Result<String> {
+///
+/// `max_bytes` bounds the running total of bytes actually received,
+/// independent of (and in addition to) the `Content-Length` precheck in
+/// [`Upstream::download_inner`]: that check only catches a response that
+/// *declares* its size, so this one is what actually stops a chunked body
+/// with no declared length, or one that understates it, from being
+/// written indefinitely — up to [`DownloadLimits::max_duration`] of it,
+/// into what is usually a RAM-backed tmpfs. Exceeding it is an error, same
+/// as any other failure on this path: nothing is served, and the caller
+/// removes the partial file.
+async fn stream_to_file(
+    response: reqwest::Response,
+    path: &Path,
+    max_bytes: u64,
+) -> anyhow::Result<String> {
     let mut file = tokio::fs::File::create(path)
         .await
         .with_context(|| format!("creating temp file {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut stream = response.bytes_stream();
+    let mut received: u64 = 0;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("reading response chunk from upstream")?;
+        received = received.saturating_add(chunk.len() as u64);
+        if received > max_bytes {
+            bail!(
+                "download exceeded the {max_bytes}-byte artifact size limit \
+                 ({received} bytes received so far)"
+            );
+        }
         hasher.update(&chunk);
         file.write_all(&chunk)
             .await

@@ -574,6 +574,7 @@ async fn a_stalled_body_still_fails_closed() {
     let limits = supply_chain_scanner::config::DownloadLimits {
         stall_timeout: std::time::Duration::from_millis(300),
         max_duration: std::time::Duration::from_secs(60),
+        ..Default::default()
     };
     let upstream = Upstream::with_limits(base, cache, &limits).expect("construct upstream");
 
@@ -612,6 +613,146 @@ async fn a_stalled_body_still_fails_closed() {
     );
 }
 
+/// N2 regression test: a body over `max_artifact_bytes`, even one that
+/// declares an honest `Content-Length` and streams at full speed (no
+/// stall, no slow trickle — the only thing wrong with it is its size),
+/// must be refused and must leave no file behind. Before the fix,
+/// `stream_to_file` had no byte budget at all, so a chunked endless body
+/// from a tampered or MITM'd upstream could write for up to
+/// `max_duration` (30 minutes by default) into the destination.
+#[tokio::test]
+async fn a_body_over_the_size_cap_is_refused_and_leaves_no_file() {
+    let server = MockServer::start().await;
+    let body = vec![0x41u8; 2048];
+    Mock::given(method("GET"))
+        .and(path("/packages/oversized-1.0.0.tar.gz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&server)
+        .await;
+
+    let (_dir, db) = open_db();
+    let cache = IndexCache::new(db);
+    let base = Url::parse(&format!("{}/simple/", server.uri())).expect("valid base url");
+    let limits = supply_chain_scanner::config::DownloadLimits {
+        max_artifact_bytes: 1024,
+        ..Default::default()
+    };
+    let upstream = Upstream::with_limits(base, cache, &limits).expect("construct upstream");
+
+    let entry = entry_at(
+        &format!("{}/packages/oversized-1.0.0.tar.gz", server.uri()),
+        "oversized-1.0.0.tar.gz",
+    );
+    let dest_dir = tempfile::tempdir().expect("create dest dir");
+    let dest = dest_dir.path().join("oversized-1.0.0.tar.gz");
+
+    let result = upstream.download(&entry, &dest).await;
+    assert!(
+        result.is_err(),
+        "a body over the configured size cap must be refused, not served"
+    );
+    assert!(
+        !dest.exists(),
+        "a refused oversized download must leave nothing at dest"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(dest_dir.path())
+        .expect("read dest dir")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a refused oversized download must not leave a partial/temp file: {leftovers:?}"
+    );
+}
+
+/// The `Content-Length` precheck must refuse an obviously oversized
+/// artifact before a single byte is written, not merely once enough of
+/// the body has streamed to trip the running-total check.
+#[tokio::test]
+async fn an_honest_content_length_over_the_cap_is_refused_before_streaming() {
+    let server = MockServer::start().await;
+    // The server declares a huge body but (deliberately) never sends it;
+    // if the proxy's precheck did not fire, this would hang rather than
+    // fail fast, which the test's own timeout turns into a clear failure.
+    Mock::given(method("GET"))
+        .and(path("/packages/huge-1.0.0.tar.gz"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(vec![0u8; 1])
+                .insert_header("content-length", "5000000000"),
+        )
+        .mount(&server)
+        .await;
+
+    let (_dir, db) = open_db();
+    let cache = IndexCache::new(db);
+    let base = Url::parse(&format!("{}/simple/", server.uri())).expect("valid base url");
+    let limits = supply_chain_scanner::config::DownloadLimits {
+        max_artifact_bytes: 1024,
+        ..Default::default()
+    };
+    let upstream = Upstream::with_limits(base, cache, &limits).expect("construct upstream");
+
+    let entry = entry_at(
+        &format!("{}/packages/huge-1.0.0.tar.gz", server.uri()),
+        "huge-1.0.0.tar.gz",
+    );
+    let dest_dir = tempfile::tempdir().expect("create dest dir");
+    let dest = dest_dir.path().join("huge-1.0.0.tar.gz");
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        upstream.download(&entry, &dest),
+    )
+    .await
+    .expect("the Content-Length precheck must refuse promptly, not hang");
+    assert!(
+        result.is_err(),
+        "a declared size over the cap must be refused"
+    );
+    assert!(!dest.exists(), "nothing may be left at dest");
+}
+
+/// A large body that stays *under* the cap must still complete — the cap
+/// must bound damage, not make ordinary artifacts unservable.
+#[tokio::test]
+async fn a_large_body_under_the_size_cap_still_completes() {
+    let server = MockServer::start().await;
+    let body: Vec<u8> = (0..2 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let expected = sha256_hex(&body);
+    Mock::given(method("GET"))
+        .and(path("/packages/big-1.0.0-py3-none-any.whl"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .mount(&server)
+        .await;
+
+    let (_dir, db) = open_db();
+    let cache = IndexCache::new(db);
+    let base = Url::parse(&format!("{}/simple/", server.uri())).expect("valid base url");
+    let limits = supply_chain_scanner::config::DownloadLimits {
+        max_artifact_bytes: 4 * 1024 * 1024,
+        ..Default::default()
+    };
+    let upstream = Upstream::with_limits(base, cache, &limits).expect("construct upstream");
+
+    let entry = entry_at(
+        &format!("{}/packages/big-1.0.0-py3-none-any.whl", server.uri()),
+        "big-1.0.0-py3-none-any.whl",
+    );
+    let dest_dir = tempfile::tempdir().expect("create dest dir");
+    let dest = dest_dir.path().join("big-1.0.0-py3-none-any.whl");
+
+    let digest = upstream
+        .download(&entry, &dest)
+        .await
+        .expect("a body under the cap must complete");
+    assert_eq!(digest, expected);
+    assert_eq!(
+        std::fs::metadata(&dest).expect("stat dest").len() as usize,
+        body.len()
+    );
+}
+
 /// The absolute cap is the backstop behind stall detection: a transfer
 /// that keeps dribbling bytes forever cannot run unbounded.
 #[tokio::test]
@@ -627,6 +768,7 @@ async fn the_absolute_download_cap_still_bounds_an_endlessly_slow_transfer() {
         // Never trips: each gap is 200ms.
         stall_timeout: std::time::Duration::from_secs(30),
         max_duration: std::time::Duration::from_secs(1),
+        ..Default::default()
     };
     let upstream = Upstream::with_limits(base, cache, &limits).expect("construct upstream");
 

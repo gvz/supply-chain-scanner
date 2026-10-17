@@ -158,6 +158,44 @@ fn parse_osv_merges_repeated_affected_entries_for_the_same_package() {
     );
 }
 
+/// Regression test for the live false positive this task fixes:
+/// `pip download torch==2.5.1` through the proxy was refused with
+/// `BLOCKED cve:GHSA-4vmg-rw8f-92f9`, whose `/why` page read "Withdrawn
+/// Advisory: PyTorch deserialization vulnerability" — the OSV feed keeps
+/// shipping documents carrying a `withdrawn` timestamp rather than
+/// deleting them, and the mirror was ingesting them, blocking a top-20
+/// package on a finding its own publisher had retracted. `fixture`
+/// `withdrawn_advisory.json` reproduces that exact document (same id,
+/// same package, same summary) with a `withdrawn` timestamp present.
+#[test]
+fn parse_osv_drops_a_withdrawn_advisory() {
+    let advisories =
+        parse_osv(&fixture("withdrawn_advisory.json")).expect("parse withdrawn_advisory fixture");
+    assert!(
+        advisories.is_empty(),
+        "a document carrying a `withdrawn` timestamp must yield no advisories"
+    );
+}
+
+/// Control for the test above: `withdrawn_advisory_active.json` is the
+/// identical document with the `withdrawn` field removed. Without this
+/// test, `parse_osv_drops_a_withdrawn_advisory` could pass for the wrong
+/// reason — e.g. a parser that drops every document, or one that fails to
+/// parse this fixture's shape at all — rather than because it specifically
+/// recognizes `withdrawn`.
+#[test]
+fn parse_osv_keeps_the_same_advisory_when_not_withdrawn() {
+    let advisories = parse_osv(&fixture("withdrawn_advisory_active.json"))
+        .expect("parse withdrawn_advisory_active fixture");
+    assert_eq!(
+        advisories.len(),
+        1,
+        "the same document without `withdrawn` must yield its advisory"
+    );
+    assert_eq!(advisories[0].id, "GHSA-4vmg-rw8f-92f9");
+    assert_eq!(advisories[0].package, "torch");
+}
+
 // ---- severity_score ----
 
 #[test]
@@ -290,6 +328,31 @@ fn replace_all_accepts_merged_rows_for_a_repeated_package() {
         introduced: Some("2.0.0".to_string()),
         fixed: Some("2.6.0".to_string()),
     }));
+}
+
+/// Store-level companion to `parse_osv_drops_a_withdrawn_advisory`: even
+/// handed a `replace_all` call, a withdrawn advisory must never be
+/// reachable through `for_package`. `parse_osv` already returns nothing
+/// for `withdrawn_advisory.json`, so this asserts the empty `Vec` round-trips
+/// through storage as "nothing to find" rather than, say, a row that
+/// `replace_all` or `for_package` resurrects some other way.
+#[test]
+fn for_package_never_returns_a_withdrawn_advisory() {
+    let (_dir, db) = open_db();
+    let store = AdvisoryStore::new(db);
+    let advisories =
+        parse_osv(&fixture("withdrawn_advisory.json")).expect("parse withdrawn_advisory fixture");
+    store
+        .replace_all("pypi", &advisories)
+        .expect("replace_all should succeed even with nothing to insert");
+
+    let found = store
+        .for_package("pypi", "torch")
+        .expect("lookup should succeed");
+    assert!(
+        found.is_empty(),
+        "a withdrawn advisory must never reach for_package"
+    );
 }
 
 // ---- OsvSync ----

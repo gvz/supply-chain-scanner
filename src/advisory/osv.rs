@@ -38,6 +38,12 @@ struct OsvDoc {
     id: String,
     #[serde(default)]
     summary: String,
+    /// RFC 3339 timestamp, present only on advisories that have been
+    /// **withdrawn**. The OSV schema is explicit that a document carrying
+    /// this field should no longer be acted on, and the feed keeps
+    /// shipping those documents rather than deleting them.
+    #[serde(default)]
+    withdrawn: Option<String>,
     #[serde(default)]
     severity: Vec<OsvSeverity>,
     #[serde(default)]
@@ -109,6 +115,31 @@ struct OsvEvent {
 /// shape ever made severity vary per entry.
 pub fn parse_osv(json: &str) -> anyhow::Result<Vec<Advisory>> {
     let doc: OsvDoc = serde_json::from_str(json).context("parsing OSV JSON document")?;
+
+    // A withdrawn advisory produces nothing. This is not a nicety: the
+    // OSV feed keeps shipping withdrawn documents, and ingesting them
+    // blocks packages on findings their own publisher has retracted.
+    // Confirmed live against this proxy before the fix — `pip download
+    // torch==2.5.1` through it was refused with `BLOCKED
+    // cve:GHSA-4vmg-rw8f-92f9`, whose `/why` page read "Withdrawn
+    // Advisory: PyTorch deserialization vulnerability". That is the
+    // false-positive anti-goal firing on one of the most-installed
+    // packages on the index, from a finding that no longer exists.
+    //
+    // Dropping it here rather than at match time is deliberate: the
+    // mirror is rebuilt wholesale on every sync (see
+    // `AdvisoryStore::replace_all`), so a previously-ingested advisory
+    // that is withdrawn upstream disappears on the next sync without any
+    // extra bookkeeping.
+    if let Some(withdrawn) = &doc.withdrawn {
+        tracing::debug!(
+            advisory = %doc.id,
+            withdrawn = %withdrawn,
+            "skipping a withdrawn OSV advisory"
+        );
+        return Ok(Vec::new());
+    }
+
     let severity = highest_severity(&doc.severity);
 
     let mut advisories: Vec<Advisory> = Vec::new();

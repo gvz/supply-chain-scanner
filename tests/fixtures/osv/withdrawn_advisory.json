@@ -1,0 +1,20 @@
+{
+  "id": "GHSA-4vmg-rw8f-92f9",
+  "summary": "Withdrawn Advisory: PyTorch deserialization vulnerability",
+  "withdrawn": "2024-03-01T00:00:00Z",
+  "severity": [
+    {
+      "type": "CVSS_V3",
+      "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    }
+  ],
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "PyPI",
+        "name": "torch"
+      },
+      "versions": ["2.5.1"]
+    }
+  ]
+}

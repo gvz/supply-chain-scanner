@@ -92,8 +92,16 @@ const FULL_SCAN_SLOTS_PER_CPU: usize = 2;
 const FULL_SCAN_SLOTS_MIN: usize = 2;
 const FULL_SCAN_SLOTS_MAX: usize = 16;
 
-/// The configured bound on concurrent full scans for this host.
-fn full_scan_slots() -> usize {
+/// The bound on concurrent full scans for this host: `override_slots`
+/// (`Config::max_concurrent_scans`) verbatim when the operator set one
+/// (clamped only to a minimum of 1 — a configured `0` would deadlock every
+/// scan forever rather than express "no limit"), otherwise derived from
+/// the host's available parallelism at 2 per CPU, clamped to
+/// `FULL_SCAN_SLOTS_MIN..=FULL_SCAN_SLOTS_MAX`.
+fn full_scan_slots(override_slots: Option<usize>) -> usize {
+    if let Some(configured) = override_slots {
+        return configured.max(1);
+    }
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
@@ -194,7 +202,8 @@ pub struct Scanner {
     /// hits and stored-clean re-serves), kept separate from
     /// `coordinator` — see [`Scanner::fetch_decision`].
     fetch_coordinator: Arc<ScanCoordinator>,
-    /// The bound on concurrent full scans; see [`FULL_SCAN_SLOTS_PER_CPU`].
+    /// The bound on concurrent full scans; see [`full_scan_slots`] and
+    /// [`Config::max_concurrent_scans`].
     full_scan_slots: Arc<Semaphore>,
 }
 
@@ -209,6 +218,7 @@ impl Scanner {
         config: Arc<ConfigHandle>,
     ) -> Self {
         let plugins = config.current().plugins.clone();
+        let slots = full_scan_slots(config.current().max_concurrent_scans);
         Self {
             verdict_store: Arc::new(verdict_store),
             upstream: Arc::new(upstream),
@@ -222,7 +232,7 @@ impl Scanner {
             config,
             coordinator: Arc::new(ScanCoordinator::new()),
             fetch_coordinator: Arc::new(ScanCoordinator::new()),
-            full_scan_slots: Arc::new(Semaphore::new(full_scan_slots())),
+            full_scan_slots: Arc::new(Semaphore::new(slots)),
         }
     }
 
@@ -1126,6 +1136,33 @@ mod tests {
     /// outside that test. This is the surviving implementation, and the
     /// one both the download gate and the index-page filter actually use.
     #[test]
+    fn full_scan_slots_honors_an_explicit_override() {
+        assert_eq!(
+            full_scan_slots(Some(7)),
+            7,
+            "an explicit override must be used verbatim"
+        );
+    }
+
+    #[test]
+    fn full_scan_slots_rejects_a_zero_override_rather_than_deadlocking() {
+        assert_eq!(
+            full_scan_slots(Some(0)),
+            1,
+            "a configured 0 must not produce a semaphore with no permits ever"
+        );
+    }
+
+    #[test]
+    fn full_scan_slots_falls_back_to_host_derived_sizing_by_default() {
+        let derived = full_scan_slots(None);
+        assert!(
+            (FULL_SCAN_SLOTS_MIN..=FULL_SCAN_SLOTS_MAX).contains(&derived),
+            "the default must stay within the documented floor/ceiling, got {derived}"
+        );
+    }
+
+    #[test]
     fn allowlist_matching_uses_pep_503_normalization() {
         let mut cfg = base_config(std::time::Duration::from_secs(12));
         cfg.allowlist = vec![AllowEntry {
@@ -1202,6 +1239,7 @@ mod tests {
             download: Default::default(),
             allowlist: Vec::new(),
             plugins: Vec::new(),
+            max_concurrent_scans: None,
         }
     }
 

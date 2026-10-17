@@ -86,3 +86,19 @@ stall_timeout = "30s"
 # retryable "scan in progress" while the detached scan finishes and stores
 # its verdict.
 max_duration = "30m"
+
+# How many full scans (download + unpack + plugins) may run at once.
+# Optional — omit it (or leave it unset) to size it automatically from the
+# host's available parallelism, at 2 per CPU, clamped to 2..=16, which is
+# the right call for most deployments. Each full scan holds a
+# `spawn_blocking` slot for the whole of a plugin's timeout, plus three
+# further OS threads for the sandbox run, and that same blocking pool also
+# serves every SQLite call this crate makes — so an unbounded number of
+# concurrent scans can starve ordinary verdict lookups under a parallel
+# dependency resolution or a pip retry storm. A request that cannot get a
+# slot returns a retryable "scan in progress" (HTTP 429) while its scan
+# waits its turn; it is never refused outright.
+#
+# Restart-only: this is baked into the scanner's internal semaphore once
+# at startup and cannot be changed by a SIGHUP reload.
+# max_concurrent_scans = 8

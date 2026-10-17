@@ -52,6 +52,23 @@ pub struct Config {
     pub allowlist: Vec<AllowEntry>,
     #[serde(default)]
     pub plugins: Vec<PluginConfig>,
+    /// Overrides the automatic sizing of the full-scan concurrency bound
+    /// (see `scan::full_scan_slots`). `None` (the default) derives the
+    /// bound from the host's available parallelism — 2 per CPU, clamped
+    /// to 2..=16 — which is the right call for most deployments: each
+    /// full scan holds a `spawn_blocking` slot for the whole of a
+    /// plugin's timeout plus three further OS threads for the sandbox
+    /// run, and that same blocking pool also serves every SQLite call
+    /// this crate makes, so an unbounded number of concurrent scans can
+    /// starve ordinary verdict lookups.
+    ///
+    /// Baked into the `Scanner`'s semaphore once at construction (see
+    /// `RESTART_ONLY_FIELDS`), not re-read on reload: shrinking a
+    /// `tokio::sync::Semaphore` that already has permits checked out is
+    /// not a well-defined operation, so this is a restart-only knob like
+    /// `download`.
+    #[serde(default)]
+    pub max_concurrent_scans: Option<usize>,
 }
 
 /// How long an artifact download may take.

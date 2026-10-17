@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -68,6 +69,7 @@ fn base_config(scan_budget: Duration) -> Config {
         download: Default::default(),
         allowlist: Vec::new(),
         plugins: Vec::new(),
+        max_concurrent_scans: None,
     }
 }
 
@@ -163,6 +165,37 @@ impl SandboxRunner for FakeSandbox {
                 spec.binary.display()
             ),
         }
+    }
+}
+
+/// A `SandboxRunner` that records the highest number of concurrent
+/// invocations it ever observed, by sleeping for `delay` on every call
+/// between incrementing and decrementing a shared counter. Safe to block
+/// synchronously here: `PluginRunner::run_one` always calls
+/// `SandboxRunner::run` inside `tokio::task::spawn_blocking`.
+struct ConcurrencyTrackingSandbox {
+    current: Arc<AtomicUsize>,
+    max_seen: Arc<AtomicUsize>,
+    delay: Duration,
+}
+
+impl ConcurrencyTrackingSandbox {
+    fn new(current: Arc<AtomicUsize>, max_seen: Arc<AtomicUsize>, delay: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            current,
+            max_seen,
+            delay,
+        })
+    }
+}
+
+impl SandboxRunner for ConcurrencyTrackingSandbox {
+    fn run(&self, _spec: &SandboxSpec) -> anyhow::Result<SandboxOutcome> {
+        let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_seen.fetch_max(now, Ordering::SeqCst);
+        std::thread::sleep(self.delay);
+        self.current.fetch_sub(1, Ordering::SeqCst);
+        Ok(exited(0, "clean\n"))
     }
 }
 
@@ -771,6 +804,103 @@ async fn concurrent_requests_for_same_artifact_download_once() {
     }
 
     server.verify().await;
+}
+
+/// Regression test for the full-scan concurrency bound: each full scan
+/// holds a `spawn_blocking` slot for the whole of a plugin's timeout
+/// (plus further OS threads for the sandbox run), and that same blocking
+/// pool serves every SQLite call this crate makes, so an unbounded
+/// number of concurrent full scans can starve ordinary verdict lookups
+/// under a parallel dependency resolution or a pip retry storm.
+///
+/// `max_concurrent_scans = Some(1)` bounds the scanner to one full scan
+/// at a time. Two *different* artifacts (so the single-flight
+/// coordinator, keyed by sha256, never merges them into one scan) are
+/// requested concurrently; the `ConcurrencyTrackingSandbox` records the
+/// highest number of simultaneous plugin invocations it ever saw, which
+/// can only exceed 1 if two full scans ran at once.
+#[tokio::test]
+async fn full_scans_beyond_the_configured_limit_queue_rather_than_run_concurrently() {
+    let server = MockServer::start().await;
+
+    let filename_a = "demo_package_a-1.0.0-py3-none-any.whl";
+    let filename_b = "demo_package_b-1.0.0-py3-none-any.whl";
+    let body_a = build_wheel_bytes();
+    let mut body_b = build_wheel_bytes();
+    body_b.extend_from_slice(b"extra-padding-so-this-hashes-differently");
+    let sha256_a = sha256_hex(&body_a);
+    let sha256_b = sha256_hex(&body_b);
+    assert_ne!(
+        sha256_a, sha256_b,
+        "the two artifacts must differ so the single-flight coordinator \
+         (keyed by sha256) does not merge them into one scan"
+    );
+
+    for (filename, body) in [(filename_a, body_a.clone()), (filename_b, body_b.clone())] {
+        Mock::given(method("GET"))
+            .and(path(format!("/packages/{filename}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+    }
+
+    let plugin_dir = tempfile::tempdir().expect("create plugin temp dir");
+    let plugin_path = plugin_dir.path().join("tracking-plugin");
+    std::fs::write(&plugin_path, b"pretend plugin binary").expect("write plugin binary");
+
+    let mut cfg = base_config(Duration::from_secs(5));
+    cfg.plugins = vec![PluginConfig {
+        name: "tracking".to_string(),
+        binary: plugin_path.clone(),
+        timeout: Duration::from_secs(5),
+    }];
+    cfg.max_concurrent_scans = Some(1);
+
+    let current = Arc::new(AtomicUsize::new(0));
+    let max_seen = Arc::new(AtomicUsize::new(0));
+    let sandbox = ConcurrencyTrackingSandbox::new(
+        Arc::clone(&current),
+        Arc::clone(&max_seen),
+        Duration::from_millis(150),
+    );
+
+    let harness = build_harness(cfg, &server, sandbox);
+
+    let key_a = key_for(&sha256_a, filename_a);
+    let entry_a = entry_for(&server, filename_a, Some(&sha256_a));
+    let key_b = key_for(&sha256_b, filename_b);
+    let entry_b = entry_for(&server, filename_b, Some(&sha256_b));
+
+    let started = std::time::Instant::now();
+    let (first, second) = tokio::join!(
+        harness.scanner.decide(&key_a, &entry_a),
+        harness.scanner.decide(&key_b, &entry_b)
+    );
+    let elapsed = started.elapsed();
+
+    for decision in [first, second] {
+        match decision {
+            Decision::Serve(_) => {}
+            other => panic!(
+                "a request that had to queue for a scan slot must still resolve \
+                 to a correct decision, not a spurious refusal, got {other:?}"
+            ),
+        }
+    }
+
+    assert_eq!(
+        max_seen.load(Ordering::SeqCst),
+        1,
+        "the configured limit of 1 concurrent full scan must never be \
+         exceeded, even for two unrelated artifacts requested at the same \
+         time"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(280),
+        "two 150ms scans serialized by a one-slot limit must take roughly \
+         300ms end to end (proving they ran one after another, not \
+         concurrently); took {elapsed:?}"
+    );
 }
 
 #[tokio::test]

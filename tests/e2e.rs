@@ -140,6 +140,7 @@ fn base_config(
         download: Default::default(),
         allowlist: Vec::new(),
         plugins: Vec::new(),
+        max_concurrent_scans: None,
     }
 }
 

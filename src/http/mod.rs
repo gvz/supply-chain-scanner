@@ -322,8 +322,11 @@ pub fn default_sandbox_factory() -> SandboxFactory {
 /// `db_path` into every open connection pool, `cache_dir` into the
 /// [`ArtifactCache`] root, `upstream_url` into both HTTP clients' base
 /// URLs, `advisory_source_url`/`advisory_sync_interval` into the sync
-/// ticker, `cache_ttl` into the eviction ticker, and `download` into the
-/// upstream clients' timeout configuration.
+/// ticker, `cache_ttl` into the eviction ticker, `download` into the
+/// upstream clients' timeout configuration, and `max_concurrent_scans`
+/// into the initial permit count of the `Scanner`'s full-scan semaphore
+/// (shrinking a `tokio::sync::Semaphore` that already has permits checked
+/// out is not well-defined, so this can't be live-reloaded either).
 ///
 /// A reload that changes any of them is **rejected in full**. That is a
 /// deliberate choice over the alternative of applying the rest: applying
@@ -339,6 +342,7 @@ const RESTART_ONLY_FIELDS: &[&str] = &[
     "advisory_sync_interval",
     "cache_ttl",
     "download",
+    "max_concurrent_scans",
 ];
 
 /// Configuration fields a reload genuinely applies, for the log line that
@@ -372,6 +376,9 @@ fn restart_only_changes(boot: &Config, candidate: &Config) -> Vec<&'static str> 
     }
     if boot.download != candidate.download {
         changed.push("download");
+    }
+    if boot.max_concurrent_scans != candidate.max_concurrent_scans {
+        changed.push("max_concurrent_scans");
     }
     changed
 }

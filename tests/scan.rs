@@ -282,7 +282,11 @@ struct StubProvider {
 
 #[async_trait]
 impl ChatProvider for StubProvider {
-    async fn complete(&self, _request: &serde_json::Value) -> Result<String, ProviderError> {
+    async fn complete(
+        &self,
+        _request: &serde_json::Value,
+        _remaining: Duration,
+    ) -> Result<String, ProviderError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         match &self.script {
             ProviderScript::Body(body) => Ok(body.clone()),

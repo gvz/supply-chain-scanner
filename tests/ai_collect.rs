@@ -234,6 +234,59 @@ fn install_surface_complete_is_true_when_there_is_no_install_surface() {
 }
 
 #[test]
+fn a_non_utf8_install_surface_file_counts_against_coverage_instead_of_vanishing() {
+    let root = tempfile::tempdir().unwrap();
+    // A `setup.py` with a PEP 263 coding declaration and one non-UTF-8
+    // byte: real, executable Python that `fs::read_to_string` cannot
+    // decode. This must stay in `reviewable_bytes_total` and must mark
+    // the install surface incomplete, not disappear into the opaque
+    // pile and report 100% coverage over a package no one actually saw.
+    write_bytes(
+        root.path(),
+        "setup.py",
+        b"# -*- coding: latin-1 -*-\nvalue = 0\n\xe9\n",
+    );
+    write_file(root.path(), "pkg/__init__.py", &plain(100));
+
+    let payload = collect(root.path(), &PYPI, 100_000).unwrap();
+
+    assert!(
+        !payload.install_surface_complete,
+        "an unreadable install-surface file must not read as complete"
+    );
+    assert_eq!(
+        payload.skipped_reviewable,
+        vec![FileSize {
+            path: "setup.py".to_string(),
+            bytes: payload.skipped_reviewable[0].bytes,
+        }]
+    );
+    assert!(
+        payload.coverage().unwrap() < 1.0,
+        "coverage must fall, not read as complete, when a reviewable file could not be decoded"
+    );
+    assert!(
+        payload.files.iter().all(|f| f.path != "setup.py"),
+        "an unreadable file must never be sent to the model as content"
+    );
+}
+
+#[test]
+fn a_non_utf8_ordinary_module_also_counts_against_coverage() {
+    let root = tempfile::tempdir().unwrap();
+    write_bytes(root.path(), "pkg/mod.py", b"value = 0\n\xe9\n");
+    write_file(root.path(), "pkg/other.py", &plain(100));
+
+    let payload = collect(root.path(), &PYPI, 100_000).unwrap();
+
+    assert!(payload
+        .skipped_reviewable
+        .iter()
+        .any(|f| f.path == "pkg/mod.py"));
+    assert!(payload.coverage().unwrap() < 1.0);
+}
+
+#[test]
 fn selection_is_deterministic_for_identical_trees() {
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();

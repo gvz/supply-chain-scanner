@@ -11,6 +11,7 @@
 //! derived `Debug` and never will.
 
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -23,9 +24,20 @@ use crate::config::AiReviewConfig;
 const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
 
 /// Sends one chat-completions request and returns the raw response body.
+///
+/// `remaining` is how much of the caller's overall review deadline is
+/// left when the call starts. An implementation that retries must spend
+/// no more than `remaining` in total across every attempt — a retry
+/// that restarts the clock on a fresh, full-length timeout turns one
+/// configured budget into a multiple of itself and can push a review
+/// past the scan budget it was supposed to fit inside.
 #[async_trait]
 pub trait ChatProvider: Send + Sync {
-    async fn complete(&self, request: &serde_json::Value) -> Result<String, ProviderError>;
+    async fn complete(
+        &self,
+        request: &serde_json::Value,
+        remaining: Duration,
+    ) -> Result<String, ProviderError>;
 }
 
 /// Everything that can go wrong in one provider call.
@@ -125,9 +137,14 @@ impl OpenAiCompatible {
         })
     }
 
-    /// Sends one request and classifies the outcome.
-    async fn send_once(&self, request: &serde_json::Value) -> Result<String, ProviderError> {
-        let mut attempt = self.client.post(self.endpoint.clone());
+    /// Sends one request, capped at `timeout` regardless of the
+    /// client's own default, and classifies the outcome.
+    async fn send_once(
+        &self,
+        request: &serde_json::Value,
+        timeout: Duration,
+    ) -> Result<String, ProviderError> {
+        let mut attempt = self.client.post(self.endpoint.clone()).timeout(timeout);
         if let Some(key) = &self.key {
             attempt = attempt.bearer_auth(&key.value);
         }
@@ -168,17 +185,40 @@ impl OpenAiCompatible {
 
 #[async_trait]
 impl ChatProvider for OpenAiCompatible {
-    async fn complete(&self, request: &serde_json::Value) -> Result<String, ProviderError> {
-        let first = self.send_once(request).await;
-        match first {
-            Ok(body) => return Ok(body),
+    /// Spends no more than `remaining` in total across both attempts: the
+    /// first attempt gets the whole of it, and a retry — when the
+    /// failure looks transient — gets only what the first attempt did
+    /// not use. A failure with nothing left to retry with returns the
+    /// first attempt's own error rather than paying for a second call
+    /// that would itself be issued with zero time to run.
+    async fn complete(
+        &self,
+        request: &serde_json::Value,
+        remaining: Duration,
+    ) -> Result<String, ProviderError> {
+        if remaining.is_zero() {
+            return Err(ProviderError::Timeout);
+        }
+
+        let attempt_started = Instant::now();
+        let first = self.send_once(request, remaining).await;
+        let retryable = matches!(
+            &first,
+            Err(ProviderError::Status { code, .. }) if *code == 429 || *code >= 500
+        );
+        if first.is_ok() || !retryable {
+            return first;
+        }
+
+        let left = remaining.saturating_sub(attempt_started.elapsed());
+        if left.is_zero() {
             // The failures worth one retry: 429 and any 5xx. Another 4xx
             // is the provider answering the question, so repeating the
-            // same question cannot help.
-            Err(ProviderError::Status { code, .. }) if code == 429 || code >= 500 => {}
-            Err(e) => return Err(e),
+            // same question cannot help — but here there is also
+            // nothing left in the budget to retry with.
+            return first;
         }
-        self.send_once(request).await
+        self.send_once(request, left).await
     }
 }
 
@@ -191,10 +231,50 @@ fn classify_transport(err: reqwest::Error) -> ProviderError {
     ProviderError::Transport(err.to_string())
 }
 
-/// Caps an error body to [`MAX_ERROR_BODY_BYTES`].
+/// Caps an error body to [`MAX_ERROR_BODY_BYTES`] bytes, not characters:
+/// a multi-byte-heavy body must not survive at a multiple of the named
+/// limit. Backs off to the nearest earlier UTF-8 character boundary so
+/// the result is never split mid-character.
 fn cap_body(body: &str) -> String {
-    match body.char_indices().nth(MAX_ERROR_BODY_BYTES) {
-        Some((idx, _)) => body[..idx].to_string(),
-        None => body.to_string(),
+    if body.len() <= MAX_ERROR_BODY_BYTES {
+        return body.to_string();
+    }
+    let mut end = MAX_ERROR_BODY_BYTES;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    body[..end].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cap_body, MAX_ERROR_BODY_BYTES};
+
+    #[test]
+    fn a_body_within_the_cap_is_unchanged() {
+        assert_eq!(cap_body("short body"), "short body");
+    }
+
+    #[test]
+    fn a_multi_byte_heavy_body_is_capped_in_bytes_not_characters() {
+        // Each "e" with an acute accent is two UTF-8 bytes, so a byte cap
+        // and a character cap diverge sharply here: a char-counting cap
+        // would let this body survive at roughly twice the named limit.
+        let body: String = std::iter::repeat_n('\u{e9}', MAX_ERROR_BODY_BYTES).collect();
+        let capped = cap_body(&body);
+        assert!(
+            capped.len() <= MAX_ERROR_BODY_BYTES,
+            "capped body is {} bytes, over the {MAX_ERROR_BODY_BYTES}-byte limit",
+            capped.len()
+        );
+    }
+
+    #[test]
+    fn capping_never_splits_a_multi_byte_character() {
+        let body: String = std::iter::repeat_n('\u{e9}', MAX_ERROR_BODY_BYTES).collect();
+        // This panics on an invalid UTF-8 boundary, so merely reaching
+        // the assertion proves the cap landed on a character edge.
+        let capped = cap_body(&body);
+        assert!(capped.chars().all(|c| c == '\u{e9}'));
     }
 }

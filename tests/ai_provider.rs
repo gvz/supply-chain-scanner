@@ -63,7 +63,10 @@ async fn a_successful_call_returns_the_response_body() {
     let provider = provider_with_key(&cfg(&server, Duration::from_secs(5)));
 
     let body = provider
-        .complete(&serde_json::json!({"model": "test-model"}))
+        .complete(
+            &serde_json::json!({"model": "test-model"}),
+            Duration::from_secs(5),
+        )
         .await
         .expect("a 200 with a body must succeed");
     assert_eq!(
@@ -91,7 +94,10 @@ async fn the_request_goes_to_chat_completions_under_the_base_url() {
     let provider = provider_with_key(&cfg(&server, Duration::from_secs(5)));
 
     provider
-        .complete(&serde_json::json!({"model": "test-model"}))
+        .complete(
+            &serde_json::json!({"model": "test-model"}),
+            Duration::from_secs(5),
+        )
         .await
         .expect("the request must land under the configured base url");
 }
@@ -112,7 +118,10 @@ async fn a_configured_key_becomes_a_bearer_header() {
     let provider = provider_with_key(&cfg(&server, Duration::from_secs(5)));
 
     provider
-        .complete(&serde_json::json!({"model": "test-model"}))
+        .complete(
+            &serde_json::json!({"model": "test-model"}),
+            Duration::from_secs(5),
+        )
         .await
         .expect("the bearer header must match the configured key");
 
@@ -135,7 +144,10 @@ async fn no_configured_key_sends_no_authorization_header() {
     let provider = OpenAiCompatible::new(&c).expect("provider builds without a key");
 
     provider
-        .complete(&serde_json::json!({"model": "test-model"}))
+        .complete(
+            &serde_json::json!({"model": "test-model"}),
+            Duration::from_secs(5),
+        )
         .await
         .expect("a keyless provider must still complete");
 
@@ -176,7 +188,10 @@ async fn a_429_is_retried_once_and_then_succeeds() {
     let provider = provider_with_key(&cfg(&server, Duration::from_secs(5)));
 
     let body = provider
-        .complete(&serde_json::json!({"model": "test-model"}))
+        .complete(
+            &serde_json::json!({"model": "test-model"}),
+            Duration::from_secs(5),
+        )
         .await
         .expect("a single 429 followed by 200 must succeed");
     assert_eq!(body, SUCCESS_BODY);
@@ -194,7 +209,10 @@ async fn a_500_is_retried_once_and_then_succeeds() {
     let provider = provider_with_key(&cfg(&server, Duration::from_secs(5)));
 
     provider
-        .complete(&serde_json::json!({"model": "test-model"}))
+        .complete(
+            &serde_json::json!({"model": "test-model"}),
+            Duration::from_secs(5),
+        )
         .await
         .expect("a single 500 followed by 200 must succeed");
 }
@@ -210,7 +228,10 @@ async fn a_second_429_is_a_status_error() {
     let provider = provider_with_key(&cfg(&server, Duration::from_secs(5)));
 
     let err = provider
-        .complete(&serde_json::json!({"model": "test-model"}))
+        .complete(
+            &serde_json::json!({"model": "test-model"}),
+            Duration::from_secs(5),
+        )
         .await
         .expect_err("a 429 on both attempts must fail");
     match &err {
@@ -247,7 +268,10 @@ async fn a_400_is_not_retried() {
     let provider = provider_with_key(&cfg(&server, Duration::from_secs(5)));
 
     let err = provider
-        .complete(&serde_json::json!({"model": "test-model"}))
+        .complete(
+            &serde_json::json!({"model": "test-model"}),
+            Duration::from_secs(5),
+        )
         .await
         .expect_err("a 400 must fail");
     match &err {
@@ -284,14 +308,84 @@ async fn a_provider_that_hangs_fails_with_timeout_inside_the_configured_timeout(
 
     let started = Instant::now();
     let err = provider
-        .complete(&serde_json::json!({"model": "test-model"}))
+        .complete(
+            &serde_json::json!({"model": "test-model"}),
+            Duration::from_millis(300),
+        )
         .await
         .expect_err("a provider that accepts the connection and then hangs must fail");
     let elapsed = started.elapsed();
     assert!(matches!(err, ProviderError::Timeout), "got {err:?}");
     assert!(
         elapsed < Duration::from_secs(2),
-        "a {elapsed:?} call breaks the scan budget; both attempts must stay inside the timeout"
+        "a {elapsed:?} call breaks the scan budget; a timeout is never retried, so this must \
+         be one attempt"
+    );
+}
+
+#[tokio::test]
+async fn a_retry_never_gets_a_fresh_full_length_timeout() {
+    let server = MockServer::start().await;
+    // Every attempt is a 500, always after the same 250ms delay. The
+    // first attempt gets the whole 300ms `remaining` and succeeds in
+    // reaching a response (250ms < 300ms). Whatever is left over -- at
+    // most 50ms -- is all a retry is allowed: nowhere near enough to
+    // outlast the mock's 250ms delay a second time, so a retry can only
+    // ever end in its own timeout, never in a second full `remaining`.
+    // Before this test's fix, a retry was issued with no override on the
+    // client's own default timeout, which was the *original* 5-second
+    // config value below -- plenty of room for the mock to answer, and
+    // exactly the bug: a shrinking deadline silently became a full one
+    // again on every retry.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_string("slow failure")
+                .set_delay(Duration::from_millis(250)),
+        )
+        .mount(&server)
+        .await;
+    let provider = provider_with_key(&cfg(&server, Duration::from_secs(5)));
+
+    let started = Instant::now();
+    let err = provider
+        .complete(
+            &serde_json::json!({"model": "test-model"}),
+            Duration::from_millis(300),
+        )
+        .await
+        .expect_err("every attempt is scripted to fail");
+    let elapsed = started.elapsed();
+
+    // Either the retry was skipped outright (the 300ms budget was
+    // already spent -- one request, the original 500 stands) or a
+    // retry was attempted with whatever small remainder was left and
+    // could not possibly outlast the mock's 250ms delay a second time
+    // (two requests, the retry's own timeout is the final error). A
+    // retry succeeding here -- getting far enough into its own 250ms
+    // delay to receive a real response -- is exactly what a fresh
+    // full-length timeout would have allowed and this fix forbids.
+    assert!(
+        matches!(
+            err,
+            ProviderError::Status { code: 500, .. } | ProviderError::Timeout
+        ),
+        "got {err:?}; a retry must not live long enough to receive a real response"
+    );
+    assert!(
+        elapsed < Duration::from_millis(600),
+        "a {elapsed:?} call ran long enough for a retry to have gotten a fresh ~300ms budget \
+         rather than only what was left of the original one"
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("collect requests")
+        .len();
+    assert!(
+        requests <= 2,
+        "at most one retry may ever be attempted, got {requests} requests"
     );
 }
 
@@ -308,7 +402,10 @@ async fn the_error_for_a_status_failure_does_not_contain_the_key() {
     let provider = provider_with_key(&cfg(&server, Duration::from_secs(5)));
 
     let err = provider
-        .complete(&serde_json::json!({"model": "test-model"}))
+        .complete(
+            &serde_json::json!({"model": "test-model"}),
+            Duration::from_secs(5),
+        )
         .await
         .expect_err("5xx on both attempts must fail");
     let rendered = format!("{err:?}");

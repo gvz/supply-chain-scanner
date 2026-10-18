@@ -15,6 +15,9 @@
 //! order (Task 3).
 
 use std::path::{Component, Path};
+use std::str::FromStr;
+
+use pep440_rs::Version;
 
 /// File names, at the unpacked root, that execute at sdist build time
 /// or at Python interpreter startup, before any ordinary module of the
@@ -73,29 +76,65 @@ impl InstallSurface for PyPiInstallSurface {
             }
         }
 
-        match components.first().map(String::as_str) {
-            // The sdist build entry points, plus the two files the
-            // interpreter executes at startup. A `.pth` file at the
-            // root joins them, but only at the root.
-            Some(first) if components.len() == 1 => {
-                ROOT_INSTALL_FILE_NAMES.contains(&first)
-                    || extension_of(relative_path).as_deref() == Some("pth")
-            }
-            // A top-level `__init__.py`: a wheel's two-component path
-            // is `pkg/__init__.py`, an sdist's usual one is too.
-            Some(_) if components.len() == 2 => {
-                components[1].as_str() == PACKAGE_INIT_FILE
-                    && !components[0].ends_with(WHEEL_DATA_SUFFIX)
-            }
-            // Everything a wheel installs under `<name>-<version>.data/scripts/`
-            // lands on the developer's `PATH` as an executable file.
-            Some(_) if components.len() >= 3 => {
-                components[0].ends_with(WHEEL_DATA_SUFFIX)
-                    && components[1].as_str() == WHEEL_SCRIPTS_DIR
-            }
-            _ => false,
+        if matches_wheel_shape(&components) {
+            return true;
         }
+
+        // A wheel's top-level entries are the package itself: `pkg/`,
+        // `pkg-1.0.data/`. An sdist unpacks with its `<name>-<version>`
+        // directory still wrapping everything (`src/plugin/unpack.rs`
+        // does no prefix stripping), so `setup.py` sits at
+        // `demo-1.0/setup.py` and the package's own `__init__.py` at
+        // `demo-1.0/demo/__init__.py` — one level deeper than the wheel
+        // shape above checks. Re-check the remainder once the leading
+        // component looks like that directory, recognized by a PEP 440
+        // version suffix (the same parser this proxy already uses for
+        // advisory matching) rather than by name alone, which would
+        // also match an ordinary package directory that happens to
+        // contain a file named `setup.py`.
+        if components.len() > 1 && looks_like_sdist_root(&components[0]) {
+            return matches_wheel_shape(&components[1..]);
+        }
+
+        false
     }
+}
+
+/// Whether `components` names install surface under the wheel shape:
+/// a root-level entry point or `.pth` file, a top-level `__init__.py`,
+/// or a file under `<name>-<version>.data/scripts/`.
+fn matches_wheel_shape(components: &[String]) -> bool {
+    match components.len() {
+        1 => {
+            let first = components[0].as_str();
+            ROOT_INSTALL_FILE_NAMES.contains(&first)
+                || extension_of(Path::new(first)).as_deref() == Some("pth")
+        }
+        2 => {
+            components[1].as_str() == PACKAGE_INIT_FILE
+                && !components[0].ends_with(WHEEL_DATA_SUFFIX)
+        }
+        n if n >= 3 => {
+            components[0].ends_with(WHEEL_DATA_SUFFIX)
+                && components[1].as_str() == WHEEL_SCRIPTS_DIR
+        }
+        _ => false,
+    }
+}
+
+/// Whether `name` looks like an sdist's `<project>-<version>` root
+/// directory: some suffix after a `-` parses as a PEP 440 version.
+/// Tries progressively earlier hyphens so a project name that itself
+/// contains one (`my-project-1.0`) still resolves.
+fn looks_like_sdist_root(name: &str) -> bool {
+    let mut search_from = name.len();
+    while let Some(idx) = name[..search_from].rfind('-') {
+        if Version::from_str(&name[idx + 1..]).is_ok() {
+            return true;
+        }
+        search_from = idx;
+    }
+    false
 }
 
 /// Resolves an ecosystem id (the one from
@@ -180,5 +219,42 @@ mod tests {
     #[test]
     fn install_surface_for_returns_none_for_an_unknown_ecosystem() {
         assert!(install_surface_for("npm").is_none());
+    }
+
+    #[test]
+    fn pypi_install_surface_matches_sdist_root_entry_points() {
+        for path in [
+            "demo-1.0/setup.py",
+            "demo-1.0/setup.cfg",
+            "demo-1.0/pyproject.toml",
+        ] {
+            assert!(
+                PyPiInstallSurface.is_install_surface(Path::new(path)),
+                "{path} was not an install surface"
+            );
+        }
+    }
+
+    #[test]
+    fn pypi_install_surface_matches_sdist_root_top_level_dunder_init() {
+        assert!(PyPiInstallSurface.is_install_surface(Path::new("demo-1.0/demo/__init__.py")));
+    }
+
+    #[test]
+    fn pypi_install_surface_skips_ordinary_modules_inside_an_sdist_root() {
+        assert!(!PyPiInstallSurface.is_install_surface(Path::new("demo-1.0/demo/util.py")));
+    }
+
+    #[test]
+    fn pypi_install_surface_recognizes_a_project_name_that_itself_contains_a_hyphen() {
+        assert!(PyPiInstallSurface.is_install_surface(Path::new("my-demo-1.0/setup.py")));
+    }
+
+    #[test]
+    fn pypi_install_surface_does_not_treat_an_ordinary_package_directory_as_an_sdist_root() {
+        // "pkg" carries no version suffix, so this must not be
+        // reinterpreted as a wrapped sdist — it is just a module that
+        // happens to be named like an entry point, inside a package.
+        assert!(!PyPiInstallSurface.is_install_surface(Path::new("pkg/setup.py")));
     }
 }

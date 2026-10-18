@@ -101,6 +101,17 @@ struct ReviewsJson {
 
 /// `GET /api/reviews`.
 pub async fn reviews_handler(State(state): State<AppState>, RawQuery(query): RawQuery) -> Response {
+    // The route is always registered -- `ai_review` is reloadable, so a
+    // deployment that starts without it can turn it on at runtime, and
+    // axum has no way to add a route a running router does not already
+    // have. Gating here instead keeps an unconfigured deployment's
+    // *behavior* unchanged (a 404, exactly as if the route did not
+    // exist) without reaching for the one thing that cannot change: the
+    // set of routes themselves.
+    if state.config.current().ai_review.is_none() {
+        return not_found();
+    }
+
     let (filter, requested_limit) = match parse_filter(query.as_deref()) {
         Ok(parsed) => parsed,
         Err(detail) => return bad_request(&detail),
@@ -236,6 +247,10 @@ fn review_json(review: &crate::db::review::StoredReview) -> ReviewJson {
 
 fn bad_request(detail: &str) -> Response {
     plain_response(StatusCode::BAD_REQUEST, detail)
+}
+
+fn not_found() -> Response {
+    plain_response(StatusCode::NOT_FOUND, "not found")
 }
 
 fn internal_error() -> Response {

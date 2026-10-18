@@ -265,10 +265,23 @@ pub enum BlockOn {
     Suspicious,
 }
 
-/// Whether a `base_url` host is a loopback address, to which plain HTTP
-/// is acceptable (the traffic cannot leave the machine).
-fn is_loopback_host(host: &str) -> bool {
-    host == "127.0.0.1" || host == "localhost" || host == "::1"
+/// Whether `url`'s host is a loopback address, to which plain HTTP is
+/// acceptable (the traffic cannot leave the machine).
+///
+/// Matches on `Url::host()`, not `Url::host_str()`: an IPv6 literal's
+/// string form in a URL's authority carries its brackets (`[::1]`), so a
+/// plain string comparison against `"::1"` never matches, and the design
+/// calls a local provider on an IPv6 loopback address first-class.
+/// `Host`'s `Ipv4`/`Ipv6` variants carry a parsed `IpAddr` instead of
+/// that string, so `is_loopback()` is correct regardless of bracket or
+/// zone-id formatting.
+fn is_loopback_host(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 impl Config {
@@ -327,11 +340,7 @@ fn validate_ai_review(ai: &AiReviewConfig, scan_budget: Duration) -> anyhow::Res
     }
     let scheme = ai.base_url.scheme();
     if scheme != "https" {
-        let is_loopback = ai
-            .base_url
-            .host_str()
-            .map(is_loopback_host)
-            .unwrap_or(false);
+        let is_loopback = is_loopback_host(&ai.base_url);
         if scheme != "http" || !is_loopback {
             bail!(
                 "ai_review base_url of \"{}\" must use https, or http with a loopback host \

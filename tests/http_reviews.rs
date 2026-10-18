@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use supply_chain_scanner::artifact_cache::ArtifactCache;
-use supply_chain_scanner::config::{Config, ConfigHandle, CveLine, UnknownSeverity};
+use supply_chain_scanner::config::{
+    AiReviewConfig, BlockOn, Config, ConfigHandle, CveLine, UnknownSeverity,
+};
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::db::index_cache::IndexCache;
 use supply_chain_scanner::db::review::{NewReview, ReviewStore};
@@ -61,7 +63,22 @@ fn base_config() -> Config {
         allowlist: Vec::new(),
         plugins: Vec::new(),
         max_concurrent_scans: None,
-        ai_review: None,
+        // `/api/reviews` 404s when `ai_review` is unset (see
+        // `reviews_handler`); these tests are about the listing's own
+        // behavior, not about that gate, so they need it configured.
+        // `ai_review_route_is_not_found_when_ai_review_is_unset` is the
+        // one test for the gate itself and builds its own config.
+        ai_review: Some(AiReviewConfig {
+            base_url: "http://127.0.0.1:9/chat/".parse().unwrap(),
+            model: "test-model".to_string(),
+            api_key_env: None,
+            timeout: Duration::from_secs(5),
+            max_payload_bytes: 262_144,
+            max_output_tokens: 256,
+            coverage_threshold: 0.8,
+            block_on: BlockOn::Malicious,
+            block_opaque_executables: false,
+        }),
     }
 }
 
@@ -83,6 +100,10 @@ impl Drop for Harness {
 }
 
 async fn harness() -> Harness {
+    harness_with_config(base_config()).await
+}
+
+async fn harness_with_config(cfg: Config) -> Harness {
     let db_dir = tempfile::tempdir().expect("create db temp dir");
     let db = Db::open(&db_dir.path().join("scanner.db")).expect("open db");
     let cache_dir = tempfile::tempdir().expect("create cache temp dir");
@@ -103,7 +124,6 @@ async fn harness() -> Harness {
     let reviews_store = ReviewStore::new(db.clone());
     let advisory_store = AdvisoryStore::new(db.clone());
     let plugin_runner = PluginRunner::new(Arc::new(NeverCalledSandbox));
-    let cfg = base_config();
     let policy = Policy::build(Arc::new(cfg.clone())).expect("build policy");
     let config_handle = Arc::new(ConfigHandle::new(cfg));
 
@@ -375,6 +395,21 @@ async fn the_endpoint_returns_an_empty_list_rather_than_404_when_nothing_matches
     let (status, json) = get_json(&harness, "?package=pkg-absent").await;
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_eq!(entries(&json).len(), 0);
+}
+
+#[tokio::test]
+async fn the_endpoint_is_not_found_when_ai_review_is_unset() {
+    // The route is always registered -- `ai_review` is reloadable, so it
+    // cannot be added or removed from the router at runtime -- but an
+    // unconfigured deployment must not gain a new always-on, enumerable
+    // endpoint just by upgrading to a binary that carries this feature.
+    let mut cfg = base_config();
+    cfg.ai_review = None;
+    let harness = harness_with_config(cfg).await;
+
+    let (status, _json) = get_json(&harness, "").await;
+
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

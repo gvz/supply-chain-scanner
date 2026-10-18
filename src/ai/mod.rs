@@ -190,7 +190,6 @@ fn refusal(code: &'static str, detail: &str) -> RefusalReason {
 }
 
 /// Orchestrates one review: collect under the sandbox, call the
-/// Orchestrates one review: collect under the sandbox, call the
 /// provider, parse the reply, decide, then store the row.
 ///
 /// Every completed review stores a row, blocked or clean alike. Every
@@ -233,17 +232,25 @@ impl AiReviewer {
         fingerprint: &str,
     ) -> ReviewOutcome {
         let started = Instant::now();
+        // `cfg.timeout` is the budget for the whole review, not for each
+        // step separately: the collector run and the provider call (plus
+        // its possible retry) all draw from this one deadline, so a slow
+        // collector leaves correspondingly less for the provider rather
+        // than each stage getting its own full-length timeout stacked on
+        // top of the others.
+        let deadline = started + self.cfg.timeout;
 
         // The sandbox is synchronous, so the collector run goes to the
         // blocking pool, exactly as `PluginRunner::run_one` runs it.
-        let payload = match self.collect(key, package_dir).await {
+        let payload = match self.collect(key, package_dir, deadline).await {
             Ok(payload) => payload,
             Err(reason) => return unverifiable(key, &reason, "the collector could not run"),
         };
 
         let request =
             prompt::build_request(&self.cfg.model, self.cfg.max_output_tokens, key, &payload);
-        let body = match self.provider.complete(&request).await {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let body = match self.provider.complete(&request, remaining).await {
             Ok(body) => body,
             Err(error) => {
                 // The provider error text goes to the log, not the detail:
@@ -272,6 +279,32 @@ impl AiReviewer {
 
         let reply = match prompt::parse_reply(&body) {
             Ok(reply) => reply,
+            // Truncation is the one reply failure with a known, fixable
+            // cause, so it gets its own log line naming the knob rather
+            // than folding into the generic "not readable" case below,
+            // where repeated occurrences would look like a broken
+            // provider or a broken parser instead of an undersized
+            // `max_output_tokens`.
+            Err(error @ prompt::ReplyError::Truncated) => {
+                tracing::warn!(
+                    package = %key.package,
+                    version = %key.version,
+                    max_output_tokens = self.cfg.max_output_tokens,
+                    error = %error,
+                    "the model reply was truncated at max_output_tokens"
+                );
+                return unverifiable(
+                    key,
+                    &refusal(
+                        code::REPLY,
+                        &format!(
+                            "the model reply for {} {} was truncated at max_output_tokens",
+                            key.package, key.version
+                        ),
+                    ),
+                    "the model reply was truncated",
+                );
+            }
             Err(error) => {
                 // Same discipline as the provider error: the reply error
                 // chain can quote model text, so the log carries it and
@@ -309,7 +342,7 @@ impl AiReviewer {
             fingerprint: fingerprint.to_string(),
             verdict: verdict_str(reply.verdict),
             blocked: blocked.is_some(),
-            summary: reply.summary.clone(),
+            summary: sanitize_review_text(&reply.summary),
             findings_json: findings_json(&reply),
             coverage: payload.coverage(),
             reviewable_bytes_total: payload.reviewable_bytes_total as i64,
@@ -365,17 +398,24 @@ impl AiReviewer {
 
     /// Runs the collector under the sandbox and parses its payload.
     /// Every collector failure maps to the unverifiable collector code.
+    ///
+    /// The sandbox timeout is whatever remains of `deadline`, not the
+    /// full configured timeout: this is the first of the two steps the
+    /// review's single deadline is shared across, so it must not spend
+    /// more than its share.
     async fn collect(
         &self,
         key: &ArtifactKey,
         package_dir: &Path,
+        deadline: Instant,
     ) -> Result<CollectedPayload, RefusalReason> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
         let spec = collector_spec(
             &self.collector_binary,
             package_dir,
             key,
             self.cfg.max_payload_bytes,
-            self.cfg.timeout,
+            remaining,
         );
         let sandbox = Arc::clone(&self.sandbox);
         let outcome = tokio::task::spawn_blocking(move || sandbox.run(&spec))
@@ -483,20 +523,43 @@ fn verdict_str(verdict: prompt::ModelVerdict) -> &'static str {
     }
 }
 
-/// The findings, serialized once, exactly as the row stores them. A
-/// serialization failure falls back to an empty array rather than
-/// failing the store step: the verdict and coverage are what the block
-/// turns on, and `findings_json`'s readers already tolerate an empty
-/// list.
+/// The cap, in characters, on model-supplied text stored in a review
+/// row: the summary and each finding field. Not [`DETAIL_MAX_BYTES`] —
+/// that much smaller cap is for text that also has to fit an HTTP
+/// reason phrase, which this text never does. It is read back on
+/// `/why` and `/api/reviews` instead, so it can afford far more room,
+/// but it is still attacker-influenced and gets the same stripping
+/// discipline [`crate::scan`], [`crate::plugin`] and
+/// [`crate::advisory::matching`] already apply to their own
+/// model-or-package-supplied text: no control bytes, printable ASCII
+/// only.
+const REVIEW_TEXT_MAX_CHARS: usize = 4_000;
+
+/// Strips ASCII control characters and non-ASCII characters, then caps
+/// at [`REVIEW_TEXT_MAX_CHARS`]. Applied to every piece of model text a
+/// review row stores, so a stored row — and everything that reads it
+/// back — never carries raw, unbounded model output.
+fn sanitize_review_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii() && !c.is_ascii_control())
+        .take(REVIEW_TEXT_MAX_CHARS)
+        .collect()
+}
+
+/// The findings, serialized once, exactly as the row stores them, with
+/// every text field passed through [`sanitize_review_text`] first. A
+/// serialization failure is not possible here: every value is already
+/// a plain, sanitized `String` or `Option<String>`, neither of which
+/// `serde_json` can fail to encode.
 fn findings_json(reply: &prompt::ModelReply) -> String {
     json!(reply
         .findings
         .iter()
         .map(|f| json!({
-            "path": f.path,
-            "lines": f.lines,
-            "behavior": f.behavior,
-            "severity": f.severity,
+            "path": sanitize_review_text(&f.path),
+            "lines": f.lines.as_deref().map(sanitize_review_text),
+            "behavior": sanitize_review_text(&f.behavior),
+            "severity": sanitize_review_text(&f.severity),
         }))
         .collect::<Vec<_>>())
     .to_string()
@@ -702,5 +765,43 @@ mod tests {
         let parsed = parse_collector_output(&outcome(Some(0), &json, false))
             .expect("a valid payload must parse");
         assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn sanitize_review_text_strips_control_bytes_and_non_ascii() {
+        let sanitized = super::sanitize_review_text("clean\r\nbut\u{0007}bell\u{00e9}accent");
+        assert_eq!(sanitized, "cleanbutbellaccent");
+    }
+
+    #[test]
+    fn sanitize_review_text_caps_at_the_configured_length() {
+        let long = "a".repeat(super::REVIEW_TEXT_MAX_CHARS + 500);
+        let sanitized = super::sanitize_review_text(&long);
+        assert_eq!(sanitized.len(), super::REVIEW_TEXT_MAX_CHARS);
+    }
+
+    #[test]
+    fn findings_json_sanitizes_every_text_field() {
+        let reply = crate::ai::prompt::ModelReply {
+            verdict: crate::ai::prompt::ModelVerdict::Malicious,
+            summary: "irrelevant here".to_string(),
+            findings: vec![crate::ai::prompt::Finding {
+                path: "pkg/\u{0007}evil.py".to_string(),
+                lines: Some("1\r\n-2".to_string()),
+                behavior: "reads AWS_SECRET\u{0007}".to_string(),
+                severity: "high\r".to_string(),
+            }],
+        };
+        let json = super::findings_json(&reply);
+        assert!(
+            !json.contains('\u{0007}'),
+            "a bell character reached the stored row: {json}"
+        );
+        assert!(
+            !json.contains('\r'),
+            "a carriage return reached the stored row: {json}"
+        );
+        assert!(json.contains("pkg/evil.py"));
+        assert!(json.contains("reads AWS_SECRET"));
     }
 }

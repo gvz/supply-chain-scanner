@@ -372,12 +372,20 @@ pub fn collect(
         let abs_path = root.join(&entry.rel);
         let content = match fs::read_to_string(&abs_path) {
             Ok(content) => content,
-            // The file turned out not to be UTF-8 text, so it goes
-            // back to the opaque pile: the bytes leave the reviewable
-            // total again and count as plain data instead.
+            // The file turned out not to be UTF-8 text. Its bytes stay
+            // in `total` and it goes to `skipped_reviewable` rather than
+            // the opaque pile: it was already counted as reviewable (its
+            // extension or head said so), so dropping it from the
+            // denominator here would silently inflate coverage, and
+            // treating it as mere data would let an install-surface file
+            // vanish from `install_surface_complete` instead of failing
+            // it. A file this proxy could not actually show the model is
+            // uncovered, not clean.
             Err(_) => {
-                total -= entry.size;
-                opaque_data_bytes += entry.size;
+                skipped_reviewable.push(FileSize {
+                    path: entry.rel,
+                    bytes: entry.size,
+                });
                 continue;
             }
         };

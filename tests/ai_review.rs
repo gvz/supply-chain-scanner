@@ -172,7 +172,11 @@ struct StubProvider {
 
 #[async_trait]
 impl ChatProvider for StubProvider {
-    async fn complete(&self, _request: &serde_json::Value) -> Result<String, ProviderError> {
+    async fn complete(
+        &self,
+        _request: &serde_json::Value,
+        _remaining: Duration,
+    ) -> Result<String, ProviderError> {
         self.reply.clone().resolve()
     }
 }
@@ -287,6 +291,24 @@ async fn review_with(
     reviewer(cfg, sandbox, provider, store)
         .review(&key(), package_dir, FINGERPRINT)
         .await
+}
+
+/// Like [`review_with`], but keeps the review store alive and hands it
+/// back (with the temp dir backing it, which must outlive the store),
+/// for a test that needs to assert on the row count a reply failure
+/// must leave behind.
+async fn review_with_store(
+    cfg: AiReviewConfig,
+    package_dir: &Path,
+    reply: ScriptedReply,
+) -> (ReviewOutcome, TempDir, Arc<ReviewStore>) {
+    let sandbox: Arc<dyn SandboxRunner> = Arc::new(StubSandbox::Serve);
+    let provider = Arc::new(StubProvider { reply });
+    let (dir, store) = store();
+    let outcome = reviewer(cfg, sandbox, provider, Arc::clone(&store))
+        .review(&key(), package_dir, FINGERPRINT)
+        .await;
+    (outcome, dir, store)
 }
 
 // ---------------------------------------------------------------------------
@@ -628,7 +650,7 @@ async fn a_provider_failure_is_unverifiable_and_records_nothing() {
 async fn an_unparseable_reply_is_unverifiable_and_records_nothing() {
     let (_dir, package_dir) = module_tree();
 
-    let outcome = review_with(
+    let (outcome, _db_dir, store) = review_with_store(
         base_cfg(),
         &package_dir,
         // A 200 body whose content JSON does not match the reply schema.
@@ -638,12 +660,17 @@ async fn an_unparseable_reply_is_unverifiable_and_records_nothing() {
 
     let (code, _) = reason_of(&outcome);
     assert_eq!(code, "unverifiable:ai-reply");
+    assert_eq!(
+        review_count(&store, "demo-package"),
+        0,
+        "no review happened, so no row may exist"
+    );
 }
 
 #[tokio::test]
 async fn a_reply_that_is_not_json_is_unverifiable() {
     let (_dir, package_dir) = module_tree();
-    let outcome = review_with(
+    let (outcome, _db_dir, store) = review_with_store(
         base_cfg(),
         &package_dir,
         // Content that carries no JSON at all.
@@ -655,6 +682,7 @@ async fn a_reply_that_is_not_json_is_unverifiable() {
 
     let (code, _) = reason_of(&outcome);
     assert_eq!(code, "unverifiable:ai-reply");
+    assert_eq!(review_count(&store, "demo-package"), 0);
 }
 
 #[tokio::test]

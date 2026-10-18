@@ -229,6 +229,31 @@ fn ai_review_accepts_plain_http_to_loopback() {
 }
 
 #[test]
+fn ai_review_accepts_plain_http_to_ipv6_loopback() {
+    // `Url::host_str()` returns an IPv6 literal's authority form with
+    // its brackets intact (`[::1]`), so a validator that compared
+    // against the bare string `"::1"` would reject this and silently
+    // contradict the error message's own claim that `::1` is allowed.
+    let toml = toml_with_ai_review("base_url = \"http://[::1]:8000/v1/\"\nmodel = \"reviewer-1\"");
+    let file = write_temp_toml(&toml);
+
+    let config = Config::load(file.path()).expect("plain http to an ipv6 loopback must load");
+
+    assert!(config.ai_review.is_some());
+}
+
+#[test]
+fn ai_review_accepts_plain_http_to_localhost() {
+    let toml =
+        toml_with_ai_review("base_url = \"http://localhost:8000/v1/\"\nmodel = \"reviewer-1\"");
+    let file = write_temp_toml(&toml);
+
+    let config = Config::load(file.path()).expect("plain http to localhost must load");
+
+    assert!(config.ai_review.is_some());
+}
+
+#[test]
 fn ai_review_accepts_https_to_non_loopback() {
     let file = write_temp_toml(&toml_with_ai_review(AI_REVIEW_BASE));
 

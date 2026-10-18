@@ -119,6 +119,40 @@ pub const MIGRATIONS: &[&str] = &[
         last_access  INTEGER NOT NULL
     )
     "#,
+    // 4: reviews — the audit trail of every completed AI review (the
+    // optional third gate). One row is appended per completed review;
+    // there is deliberately no unique constraint, because the check is
+    // not deterministic and the design requires every completed review
+    // to survive: a repeat review appends beside its predecessor rather
+    // than replacing it, and `newest_for_artifact` picks the latest row.
+    // `fingerprint` records the policy that produced the review, like
+    // the `verdicts` table's column of the same name does.
+    r#"
+    CREATE TABLE reviews (
+        id                     INTEGER PRIMARY KEY,
+        ecosystem              TEXT NOT NULL,
+        package                TEXT NOT NULL,
+        version                TEXT NOT NULL,
+        filename               TEXT NOT NULL,
+        sha256                 TEXT NOT NULL,
+        fingerprint            TEXT NOT NULL,
+        verdict                TEXT NOT NULL,
+        blocked                INTEGER NOT NULL,
+        summary                TEXT NOT NULL,
+        findings_json          TEXT NOT NULL,
+        coverage               REAL,
+        reviewable_bytes_total INTEGER NOT NULL,
+        reviewable_bytes_sent  INTEGER NOT NULL,
+        opaque_json            TEXT NOT NULL,
+        reviewed_paths_json    TEXT NOT NULL,
+        model                  TEXT NOT NULL,
+        prompt_version         TEXT NOT NULL,
+        collector_version      TEXT NOT NULL,
+        reviewed_at            INTEGER NOT NULL
+    );
+    CREATE INDEX idx_reviews_artifact_fingerprint
+        ON reviews(ecosystem, package, version, filename, sha256, fingerprint)
+    "#,
 ];
 
 /// Applies every migration in [`MIGRATIONS`] that hasn't already run

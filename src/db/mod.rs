@@ -7,6 +7,7 @@ pub mod advisory;
 pub mod cache;
 pub mod index_cache;
 pub mod migrations;
+pub mod review;
 pub mod verdict;
 
 use std::path::Path;

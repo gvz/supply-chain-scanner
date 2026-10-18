@@ -69,6 +69,11 @@ pub struct Config {
     /// `download`.
     #[serde(default)]
     pub max_concurrent_scans: Option<usize>,
+    /// The optional third scan gate: a language model reviews a package's
+    /// source and judges whether it behaves maliciously. Absent means off,
+    /// and an unconfigured deployment behaves as it does today.
+    #[serde(default)]
+    pub ai_review: Option<AiReviewConfig>,
 }
 
 /// How long an artifact download may take.
@@ -201,6 +206,71 @@ pub struct PluginConfig {
     pub timeout: Duration,
 }
 
+/// The smallest `max_payload_bytes` this proxy accepts. Below this, the
+/// collector cannot hold even a small install-surface file plus the JSON
+/// envelope.
+const MIN_MAX_PAYLOAD_BYTES: usize = 4096;
+
+fn default_ai_review_timeout() -> Duration {
+    Duration::from_secs(8)
+}
+
+fn default_ai_review_max_payload_bytes() -> usize {
+    262_144
+}
+
+fn default_ai_review_max_output_tokens() -> u32 {
+    1024
+}
+
+fn default_ai_review_coverage_threshold() -> f32 {
+    0.8
+}
+
+/// The reviewer and its bounds, read from the optional `[ai_review]`
+/// table.
+///
+/// The struct holds the *name* of the environment variable that carries
+/// the provider's API key. It never holds the key itself: the key must not
+/// appear in a log line, a report, or a `Debug` output.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AiReviewConfig {
+    pub base_url: Url,
+    pub model: String,
+    /// Name of the environment variable that holds the API key. `None`
+    /// sends no Authorization header. The variable must resolve at load
+    /// and reload time, or the config is rejected.
+    pub api_key_env: Option<String>,
+    #[serde(with = "humantime_serde", default = "default_ai_review_timeout")]
+    pub timeout: Duration,
+    #[serde(default = "default_ai_review_max_payload_bytes")]
+    pub max_payload_bytes: usize,
+    #[serde(default = "default_ai_review_max_output_tokens")]
+    pub max_output_tokens: u32,
+    #[serde(default = "default_ai_review_coverage_threshold")]
+    pub coverage_threshold: f32,
+    #[serde(default)]
+    pub block_on: BlockOn,
+    #[serde(default)]
+    pub block_opaque_executables: bool,
+}
+
+/// Which model verdicts block the artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BlockOn {
+    #[default]
+    Malicious,
+    Suspicious,
+}
+
+/// Whether a `base_url` host is a loopback address, to which plain HTTP
+/// is acceptable (the traffic cannot leave the machine).
+fn is_loopback_host(host: &str) -> bool {
+    host == "127.0.0.1" || host == "localhost" || host == "::1"
+}
+
 impl Config {
     /// Reads and parses the config file at `path`, rejecting unknown
     /// fields, missing required fields, and a `scan_budget` above the
@@ -224,8 +294,61 @@ impl Config {
                 PIP_DEFAULT_TIMEOUT
             );
         }
+        if let Some(ai) = self.ai_review.as_ref() {
+            validate_ai_review(ai, self.scan_budget)?;
+        }
         Ok(())
     }
+}
+
+/// Validates `[ai_review]`. In order: `timeout` against the scan budget,
+/// `coverage_threshold` bounds, `max_payload_bytes` floor, `base_url`
+/// scheme and host, `api_key_env` resolution.
+fn validate_ai_review(ai: &AiReviewConfig, scan_budget: Duration) -> anyhow::Result<()> {
+    if ai.timeout >= scan_budget {
+        bail!(
+            "ai_review timeout of {:?} must be below the scan_budget of {:?}",
+            ai.timeout,
+            scan_budget
+        );
+    }
+    if !(0.0..=1.0).contains(&ai.coverage_threshold) {
+        bail!(
+            "ai_review coverage_threshold of {} is outside the allowed range 0.0 to 1.0",
+            ai.coverage_threshold
+        );
+    }
+    if ai.max_payload_bytes < MIN_MAX_PAYLOAD_BYTES {
+        bail!(
+            "ai_review max_payload_bytes of {} is below the minimum of {}",
+            ai.max_payload_bytes,
+            MIN_MAX_PAYLOAD_BYTES
+        );
+    }
+    let scheme = ai.base_url.scheme();
+    if scheme != "https" {
+        let is_loopback = ai
+            .base_url
+            .host_str()
+            .map(is_loopback_host)
+            .unwrap_or(false);
+        if scheme != "http" || !is_loopback {
+            bail!(
+                "ai_review base_url of \"{}\" must use https, or http with a loopback host \
+                 (127.0.0.1, ::1, localhost)",
+                ai.base_url
+            );
+        }
+    }
+    if let Some(name) = ai.api_key_env.as_ref() {
+        if std::env::var(name).is_err() {
+            bail!(
+                "ai_review api_key_env of \"{name}\" does not resolve: the environment variable \
+                 is not set"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Holds the currently active [`Config`] and allows it to be reloaded from

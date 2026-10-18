@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
-use supply_chain_scanner::config::{Config, ConfigHandle, UnknownSeverity};
+use supply_chain_scanner::config::{BlockOn, Config, ConfigHandle, UnknownSeverity};
 
 /// A minimal, fully valid config covering every required field. Individual
 /// tests mutate this string to exercise one failure mode at a time.
@@ -99,6 +99,195 @@ fn scan_budget_above_fourteen_seconds_is_rejected() {
         result.is_err(),
         "a scan_budget above 14s must be rejected (pip's default timeout is 15s)"
     );
+}
+
+/// `VALID_TOML` plus an `[ai_review]` table whose body is `body`.
+/// `VALID_TOML` ends with a `[[plugins]]` array, so the table header
+/// after it starts a fresh TOML table.
+fn toml_with_ai_review(body: &str) -> String {
+    format!("{VALID_TOML}\n[ai_review]\n{body}\n")
+}
+
+const AI_REVIEW_BASE: &str = "base_url = \"https://provider.example/v1/\"\nmodel = \"reviewer-1\"";
+
+fn env_var_name_for_the_debug_test() -> &'static str {
+    "SCS_TEST_DEBUG_KEY"
+}
+
+#[test]
+fn ai_review_absent_leaves_none() {
+    let file = write_temp_toml(VALID_TOML);
+
+    let config = Config::load(file.path()).expect("load config");
+
+    assert!(
+        config.ai_review.is_none(),
+        "a config without an [ai_review] table must leave ai_review as None"
+    );
+}
+
+#[test]
+fn ai_review_minimal_applies_documented_defaults() {
+    let toml = toml_with_ai_review(AI_REVIEW_BASE);
+    let file = write_temp_toml(&toml);
+
+    let config = Config::load(file.path()).expect("load config");
+    let ai = config
+        .ai_review
+        .as_ref()
+        .expect("[ai_review] with base_url and model must load");
+
+    assert_eq!(ai.base_url.as_str(), "https://provider.example/v1/");
+    assert_eq!(ai.model, "reviewer-1");
+    assert_eq!(ai.api_key_env, None);
+    assert_eq!(ai.timeout, Duration::from_secs(8));
+    assert_eq!(ai.max_payload_bytes, 262_144);
+    assert_eq!(ai.max_output_tokens, 1024);
+    assert!((ai.coverage_threshold - 0.8).abs() < 1e-6);
+    assert_eq!(ai.block_on, BlockOn::Malicious);
+    assert!(!ai.block_opaque_executables);
+}
+
+#[test]
+fn ai_review_rejects_timeout_at_or_above_scan_budget() {
+    let toml = toml_with_ai_review(&format!("{AI_REVIEW_BASE}\ntimeout = \"12s\""));
+    let file = write_temp_toml(&toml);
+
+    let result = Config::load(file.path());
+
+    let err = result.expect_err("a timeout equal to scan_budget must be rejected");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("timeout") && message.contains("scan_budget"),
+        "the error must name both settings, got: {message}"
+    );
+    assert!(
+        message.contains("12"),
+        "the error must state both offending values, got: {message}"
+    );
+}
+
+#[test]
+fn ai_review_rejects_coverage_threshold_above_one() {
+    let toml = toml_with_ai_review(&format!("{AI_REVIEW_BASE}\ncoverage_threshold = 1.5"));
+    let file = write_temp_toml(&toml);
+
+    let result = Config::load(file.path());
+
+    let err = result.expect_err("a coverage_threshold above 1.0 must be rejected");
+    assert!(
+        format!("{err:#}").contains("1.5"),
+        "the error must state the offending value, got: {err:#}"
+    );
+}
+
+#[test]
+fn ai_review_rejects_negative_coverage_threshold() {
+    let toml = toml_with_ai_review(&format!("{AI_REVIEW_BASE}\ncoverage_threshold = -0.1"));
+    let file = write_temp_toml(&toml);
+
+    let result = Config::load(file.path());
+
+    let err = result.expect_err("a negative coverage_threshold must be rejected");
+    assert!(
+        format!("{err:#}").contains("-0.1"),
+        "the error must state the offending value, got: {err:#}"
+    );
+}
+
+#[test]
+fn ai_review_rejects_plain_http_to_non_loopback() {
+    let toml =
+        toml_with_ai_review("base_url = \"http://provider.example/v1/\"\nmodel = \"reviewer-1\"");
+    let file = write_temp_toml(&toml);
+
+    let result = Config::load(file.path());
+
+    let err = result.expect_err("plain http to a non-loopback host must be rejected");
+    assert!(
+        format!("{err:#}").contains("http://provider.example/v1/"),
+        "the error must state the offending value, got: {err:#}"
+    );
+}
+
+#[test]
+fn ai_review_accepts_plain_http_to_loopback() {
+    let toml =
+        toml_with_ai_review("base_url = \"http://127.0.0.1:8000/v1/\"\nmodel = \"reviewer-1\"");
+    let file = write_temp_toml(&toml);
+
+    let config = Config::load(file.path()).expect("plain http to loopback must load");
+
+    assert_eq!(
+        config
+            .ai_review
+            .expect("ai_review must be present")
+            .base_url
+            .as_str(),
+        "http://127.0.0.1:8000/v1/"
+    );
+}
+
+#[test]
+fn ai_review_accepts_https_to_non_loopback() {
+    let file = write_temp_toml(&toml_with_ai_review(AI_REVIEW_BASE));
+
+    let config = Config::load(file.path()).expect("https to a non-loopback host must load");
+
+    assert!(config.ai_review.is_some());
+}
+
+#[test]
+fn ai_review_rejects_unset_api_key_env() {
+    // No test in this file sets this name, so it stays unset. Remove it
+    // first to keep this test true even if it runs after another one.
+    std::env::remove_var("SCS_TEST_UNSET_KEY");
+    let toml = toml_with_ai_review(&format!(
+        "{AI_REVIEW_BASE}\napi_key_env = \"SCS_TEST_UNSET_KEY\""
+    ));
+    let file = write_temp_toml(&toml);
+
+    let result = Config::load(file.path());
+
+    let err = result.expect_err("an api_key_env that does not resolve must be rejected");
+    assert!(
+        format!("{err:#}").contains("SCS_TEST_UNSET_KEY"),
+        "the error must name the variable, got: {err:#}"
+    );
+}
+
+#[test]
+fn ai_review_rejects_max_payload_below_4096() {
+    let toml = toml_with_ai_review(&format!("{AI_REVIEW_BASE}\nmax_payload_bytes = 1024"));
+    let file = write_temp_toml(&toml);
+
+    let result = Config::load(file.path());
+
+    let err = result.expect_err("a max_payload_bytes below 4096 must be rejected");
+    assert!(
+        format!("{err:#}").contains("1024"),
+        "the error must state the offending value, got: {err:#}"
+    );
+}
+
+#[test]
+fn ai_review_config_debug_never_contains_a_key() {
+    // This test uses its own variable name. The unset-key test uses a
+    // different name, so the two tests do not race on one variable even
+    // though each test process runs them in parallel threads.
+    let name = env_var_name_for_the_debug_test();
+    std::env::set_var(name, "sk-test-value-that-must-not-leak");
+    let toml = toml_with_ai_review(&format!("{AI_REVIEW_BASE}\napi_key_env = \"{name}\""));
+    let file = write_temp_toml(&toml);
+
+    let config = Config::load(file.path()).expect("load config with a resolvable key variable");
+
+    let debug = format!("{config:?}");
+    assert!(
+        !debug.contains("sk-test-value-that-must-not-leak"),
+        "Debug output of Config must not contain the API key, got: {debug}"
+    );
+    std::env::remove_var(name);
 }
 
 #[test]

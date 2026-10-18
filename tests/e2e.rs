@@ -141,6 +141,7 @@ fn base_config(
         allowlist: Vec::new(),
         plugins: Vec::new(),
         max_concurrent_scans: None,
+        ai_review: None,
     }
 }
 

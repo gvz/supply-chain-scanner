@@ -27,6 +27,9 @@ It refuses to start when:
 
 - a configured plugin binary is missing or unreadable
 - `bwrap` is not on `PATH` and at least one plugin is configured
+- `bwrap` is not on `PATH` and `[ai_review]` is present
+- an `[ai_review]` table with an unresolvable `api_key_env` or a `base_url` the
+  rules above reject
 - the database cannot be opened — note the parent directory of `db_path` is **not**
   created for you
 - the initial advisory sync fails
@@ -47,7 +50,21 @@ changing the plugin list takes effect, and stored verdicts produced under the ol
 policy are invalidated through the policy fingerprint. A reload that does not
 validate — a missing plugin binary, say — fails and keeps the running policy.
 
-**Reloadable:** `public_url`, `scan_budget`, `cve`, `allowlist`, `plugins`.
+**Reloadable:** `public_url`, `scan_budget`, `cve`, `allowlist`, `plugins`,
+`ai_review`. A reload can turn the reviewer on or off, retarget it at another
+provider or model, or adjust its thresholds. The reload rebuilds the reviewer
+and the policy atomically. A reload whose `[ai_review]` table cannot be built
+fails and keeps the running policy. The causes are the same ones startup
+refuses: an unresolvable `api_key_env`, a `base_url` the rules above reject,
+or a missing `bwrap` for a newly configured reviewer.
+
+The model, prompt version, collector version, coverage threshold, blocking
+level and opaque-executable rule are all part of the policy fingerprint.
+Changing any of them invalidates every stored verdict. The next request for
+each artifact re-reviews it, which means one fresh provider call per artifact.
+Turning the reviewer off changes the fingerprint too. It then matches the
+fingerprint of an unconfigured deployment, so each artifact needs a full
+rescan without a review step.
 
 **Restart-only** — a reload that changes any of these is *rejected by name* rather
 than silently ignored: `bind`, `db_path`, `cache_dir`, `upstream_url`,
@@ -110,6 +127,105 @@ count bounded by `RLIMIT_NPROC` at host-threads-at-launch + 512.
 Plugins are third-party code from the proxy's point of view. The sandbox is the
 containment boundary for both the package and the plugin, and the list above is
 what that boundary is actually worth.
+
+## The AI reviewer: an optional third gate
+
+A third scan gate, off by default. It stays off until an `[ai_review]` table
+appears in the configuration. With the table absent, the scan path is untouched
+and the policy fingerprint matches what an older binary produced. An upgrade
+changes nothing for an unconfigured deployment.
+
+Configured, one review runs per artifact, after the plugins. The proxy invokes
+its own binary as a hidden `collect` subcommand inside the bwrap sandbox.
+The collector reads the unpacked tree and emits one size-capped JSON payload of
+the package's reviewable text. The proxy sends that payload in a single
+chat-completions call to any OpenAI-compatible endpoint. It maps the reply to
+a verdict, stores a row in the `reviews` table, and either refuses the
+artifact or lets the scan continue.
+
+**Settings and defaults.** Every default below comes from `src/config.rs`.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `base_url` | required | Provider base. `chat/completions` is appended. Must be `https`, or `http` pointed at a loopback host. |
+| `model` | required | Model name. Sent with every request and stored in every review row. |
+| `api_key_env` | unset | Name of the environment variable that holds the API key. Unset sends no Authorization header. |
+| `timeout` | 8s | Total deadline for one provider call. Must stay below `scan_budget`. |
+| `max_payload_bytes` | 262144 | Cap on the file content sent to the model in one review. Floor: 4096. |
+| `max_output_tokens` | 1024 | The request's `max_tokens`. |
+| `coverage_threshold` | 0.8 | Minimum share of reviewable bytes that must reach the model. |
+| `block_on` | `malicious` | Set `suspicious` to block on both verdicts. |
+| `block_opaque_executables` | false | Set true to block packages that carry native executables. |
+
+**The API key never lives in a file.** `api_key_env` names an environment
+variable. The proxy reads that variable at startup and again at every reload.
+A name that does not resolve is a configuration error. Startup refuses, and a
+reload is rejected with the running policy kept. The configuration stores only
+the variable's name. The key itself never reaches a log line, a refusal
+detail, or the policy fingerprint.
+
+**`bwrap` becomes mandatory.** The collector runs inside the same sandbox as
+the plugins. When `[ai_review]` is present and `bwrap` is not on `PATH`, the
+proxy refuses to start. This is the same rule, and the same reason, as the
+plugin requirement above.
+
+**What the sandbox holds.** The collector is this proxy's own executable
+rather than a third-party binary, but the containment is the plugin sandbox
+unchanged. Everything the "Plugin containment" section above lists as holding
+or not holding applies here. That means no network, the package mounted
+read-only at `/pkg`, no host path writable, a cleared environment, and the
+same resource caps. The collector writes one JSON payload to stdout and
+nothing else.
+
+That stdout is capped by the sandbox at `max_payload_bytes` plus a fixed
+16384-byte allowance for the JSON envelope. Package text that needs more
+escaping than the allowance covers arrives truncated, the payload fails to
+parse, and the review reports `unverifiable:ai-collector`. That path fails
+closed and never yields a clean verdict. Classifying a file reads at most its
+first 8192 bytes.
+
+**Blocking codes** are durable verdicts with a `/why` page:
+
+- `ai:malicious`: the model judged the package malicious.
+- `ai:suspicious`: the model judged it suspicious, and `block_on` is
+  `suspicious`.
+- `ai:coverage`: the review saw too little. This fires when measured coverage
+  is below the threshold, and when an install-surface file was too large to
+  send whole. The first case states the measured coverage and the threshold in
+  the refusal detail.
+- `ai:opaque-executable`: the package carries native code the model cannot
+  read, and `block_opaque_executables` is true.
+
+The block order is fixed. The model verdict comes first, then the install
+surface, then coverage, then opaque executables. A package whose tree holds no
+reviewable text at all has undefined coverage, not zero. It passes this gate,
+and its review row records a NULL coverage. A pure compiled wheel crosses
+unless `block_opaque_executables` is set. Like every durable block, an
+allowlist entry is the sign-off that lifts one.
+
+**Unverifiable codes** return 503 and store nothing, so the next request
+re-attempts:
+
+- `unverifiable:ai-collector`: the sandboxed collection failed.
+- `unverifiable:ai-provider`: the provider call failed. A 429 or a 5xx is
+  retried exactly once, a timeout is not.
+- `unverifiable:ai-reply`: the reply was empty, not JSON, or carried an
+  unknown verdict.
+- `unverifiable:ai-store`: the review row could not be written.
+
+**`GET /api/reviews` publishes the audit trail.** It returns stored review
+rows as JSON, newest first, with filters for verdict, package and timestamp,
+plus cursor pagination. The default page is 50 rows and the maximum is 200.
+The endpoint is unauthenticated, and unlike `/why` it is enumerable. Anyone who
+can reach the proxy can page through the whole list of packages the
+organization installs, with their verdicts and summaries. Network placement is
+the only access control, as everywhere else in this proxy.
+
+**Review rows accumulate without bound.** Every completed review appends one
+row. A repeat review sits beside its predecessor rather than replacing it, on
+purpose: the check is not deterministic, and the audit trail keeps every
+answer. Nothing evicts rows and nothing caps the table. An operator who wants
+a bound needs to prune the `reviews` table externally.
 
 ## Archive extraction
 
@@ -233,4 +349,16 @@ Recorded honestly so nobody rediscovers them the hard way.
 - The `Ecosystem` trait is a half-realized seam: the HTTP layer goes through it,
   but the scanner still holds a concrete `Upstream` and calls `unpack` directly.
   Adding npm or cargo means finishing that first.
+- **The AI review is not deterministic.** Two reviews of identical bytes can
+  disagree. The stored verdict is whichever answer arrived first under the
+  current policy fingerprint. Once a verdict is stored, later requests serve
+  it without another call. Only a fingerprint change re-reviews, and the new
+  answer replaces nothing.
+- **Each review costs one provider call.** A wheel costs one call when it is
+  requested. A package that offers many wheels costs one call per wheel
+  actually requested. A cached clean verdict costs nothing until the
+  fingerprint changes.
+- **Nothing bounds total spend.** The per-review payload cap and the output
+  cap bound one call. No counter, budget or rate limit spans calls across
+  artifacts or time.
 - Two tests depend on wall-clock timing and can flake on a loaded machine.

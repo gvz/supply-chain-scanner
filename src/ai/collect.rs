@@ -1,12 +1,21 @@
-//! File classification for the AI reviewer's payload collector.
+//! File classification and payload selection for the AI reviewer's
+//! collector.
 //!
 //! This module holds the pure filesystem side of collection: which
-//! files a model can read at all, and how suspicious a readable file
-//! looks to a cheap local heuristic. Selection, coverage, and the JSON
-//! payload wire type arrive in the next task. Everything here runs
-//! inside the sandbox with no network, no database, and no config.
+//! files a model can read at all, how suspicious a readable file looks
+//! to a cheap local heuristic, which of those files fit a size-capped
+//! payload, and the JSON wire type that carries them. Everything here
+//! runs inside the sandbox with no network, no database, and no config.
+//! It uses only `std`, so nothing outside the mounted package is
+//! reachable.
 
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+use crate::ecosystem::install_surface::InstallSurface;
 
 /// Version of the collector's file-selection logic. It joins the policy
 /// fingerprint, so any change here re-reviews every artifact.
@@ -218,6 +227,264 @@ fn has_long_base64_run(content: &str) -> bool {
 /// Counts the `\x` byte-escape occurrences.
 fn hex_escape_count(content: &str) -> usize {
     content.matches("\\x").count()
+}
+
+/// One reviewable file exactly as the model receives it: the path
+/// relative to the package root, the install-surface flag, and the full
+/// text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectedFile {
+    pub path: String,
+    pub install_surface: bool,
+    pub content: String,
+}
+
+/// One reviewable file the payload left out, with its size on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSize {
+    pub path: String,
+    pub bytes: u64,
+}
+
+/// The collector's output. This is the wire type between the sandboxed
+/// collector and the proxy: one JSON value on stdout, nothing else.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollectedPayload {
+    pub collector_version: String,
+    /// The reviewable files in send order: install-surface files first,
+    /// then the remainder by descending suspicion score.
+    pub files: Vec<CollectedFile>,
+    pub reviewable_bytes_total: u64,
+    pub reviewable_bytes_sent: u64,
+    pub skipped_reviewable: Vec<FileSize>,
+    pub opaque_executables: Vec<FileSize>,
+    pub opaque_data_bytes: u64,
+    pub install_surface_complete: bool,
+}
+
+impl CollectedPayload {
+    /// The fraction of reviewable bytes the model received. `None`
+    /// means the package holds no reviewable source at all, so coverage
+    /// is undefined rather than zero. Callers treat it as no evidence.
+    pub fn coverage(&self) -> Option<f32> {
+        if self.reviewable_bytes_total == 0 {
+            return None;
+        }
+        Some(self.reviewable_bytes_sent as f32 / self.reviewable_bytes_total as f32)
+    }
+}
+
+/// Everything the classifier needs about one walked file.
+struct Entry {
+    /// Path relative to the root, with `/` separators.
+    rel: String,
+    /// Size on disk in bytes. This is the recorded size a skipped file
+    /// reports, and a file whose size alone exceeds the cap is skipped
+    /// through it without any read.
+    size: u64,
+    install_surface: bool,
+    score: u32,
+}
+
+impl Entry {
+    /// The sort key for the reviewable remainder: suspicion score first,
+    /// then a smaller file, then a smaller path. The path key makes two
+    /// identical trees produce identical output, because no two files
+    /// in one unpacked artifact share a path.
+    fn rank(&self) -> (std::cmp::Reverse<u32>, u64, &str) {
+        (std::cmp::Reverse(self.score), self.size, self.rel.as_str())
+    }
+}
+
+/// Builds the size-capped review payload for one unpacked package.
+///
+/// `root` is the package root as the sandbox mounts it. `surface`
+/// decides which paths run at install or import time. Selection takes
+/// install-surface files first, then the remainder by descending
+/// suspicion score, and sends each chosen file whole while the running
+/// total of content bytes stays within `max_payload_bytes`. A file that
+/// never arrives whole is never read at all.
+///
+/// Returns an error only when the walk itself fails, for example on a
+/// unreadable directory. A package with no reviewable source yields an
+/// empty payload, not an error.
+pub fn collect(
+    root: &Path,
+    surface: &dyn InstallSurface,
+    max_payload_bytes: usize,
+) -> anyhow::Result<CollectedPayload> {
+    let mut reviewable: Vec<Entry> = Vec::new();
+    let mut opaque_executables: Vec<FileSize> = Vec::new();
+    let mut opaque_data_bytes: u64 = 0;
+
+    walk(root, "", &mut |rel, size, class, head| {
+        match class {
+            FileClass::Reviewable => {
+                // A reviewable file is scored wherever its text is
+                // already at hand; the rest read one file when its turn
+                // comes, so an oversize candidate never reaches memory.
+                let score = std::str::from_utf8(head).map_or(0, suspicion_score);
+                reviewable.push(Entry {
+                    rel: rel.to_string(),
+                    size,
+                    install_surface: surface.is_install_surface(Path::new(rel)),
+                    score,
+                });
+            }
+            FileClass::OpaqueExecutable => {
+                opaque_executables.push(FileSize {
+                    path: rel.to_string(),
+                    bytes: size,
+                });
+            }
+            FileClass::OpaqueData => opaque_data_bytes += size,
+        }
+    })?;
+
+    // Install-surface files first, sorted by path.
+    let (mut surface_files, mut others): (Vec<Entry>, Vec<Entry>) = reviewable
+        .into_iter()
+        .partition(|entry| entry.install_surface);
+    surface_files.sort_by(|a, b| a.rel.cmp(&b.rel));
+    others.sort_by(|a, b| a.rank().cmp(&b.rank()));
+
+    let mut files: Vec<CollectedFile> = Vec::new();
+    let mut skipped_reviewable: Vec<FileSize> = Vec::new();
+    let mut sent: usize = 0;
+    let mut total: u64 = 0;
+    let mut install_surface_complete = true;
+
+    let candidates = surface_files.into_iter().chain(others);
+    for entry in candidates {
+        total += entry.size;
+        if entry.size as usize > max_payload_bytes || sent + entry.size as usize > max_payload_bytes
+        {
+            // Send whole or not at all. Oversize and closed-out
+            // candidates alike are skipped on their recorded size and
+            // never read.
+            skipped_reviewable.push(FileSize {
+                path: entry.rel,
+                bytes: entry.size,
+            });
+            continue;
+        }
+
+        let abs_path = root.join(&entry.rel);
+        let content = match fs::read_to_string(&abs_path) {
+            Ok(content) => content,
+            // The file turned out not to be UTF-8 text, so it goes
+            // back to the opaque pile: the bytes leave the reviewable
+            // total again and count as plain data instead.
+            Err(_) => {
+                total -= entry.size;
+                opaque_data_bytes += entry.size;
+                continue;
+            }
+        };
+        sent += content.len();
+        files.push(CollectedFile {
+            path: entry.rel,
+            install_surface: entry.install_surface,
+            content,
+        });
+    }
+
+    // An install-surface file that did not fit makes the review of the
+    // install surface incomplete, which matters more than any coverage
+    // figure.
+    for skipped in &skipped_reviewable {
+        if surface.is_install_surface(Path::new(&skipped.path)) {
+            install_surface_complete = false;
+            break;
+        }
+    }
+
+    Ok(CollectedPayload {
+        collector_version: COLLECTOR_VERSION.to_string(),
+        files,
+        reviewable_bytes_total: total,
+        reviewable_bytes_sent: sent as u64,
+        skipped_reviewable,
+        opaque_executables,
+        opaque_data_bytes,
+        install_surface_complete,
+    })
+}
+
+/// Reads the first [`HEAD_BYTES`] bytes of `path` and returns them in a
+/// buffer. Returns an empty buffer when the file cannot be opened or
+/// read, because the walk already saw it as a readable regular file,
+/// so a failure here is transient.
+fn read_head(path: &Path) -> Vec<u8> {
+    let mut head = vec![0; HEAD_BYTES];
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return Vec::new(),
+    };
+    match Read::read(&mut file, &mut head) {
+        Ok(0) => Vec::new(),
+        Ok(read) => {
+            head.truncate(read);
+            head
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The callback [`walk`] fires for every regular file: the path
+/// relative to the walk root, the size on disk, the classified
+/// [`FileClass`], and the first [`HEAD_BYTES`] bytes.
+type Visit<'a> = &'a mut dyn FnMut(&str, u64, FileClass, &[u8]);
+
+/// Walks `dir` and its subdirectories in unspecified order. For each
+/// regular file calls `visit` with the path relative to the walk's
+/// root, the size on disk, the classified [`FileClass`], and its first
+/// [`HEAD_BYTES`] bytes. Directories, symlinks, and every other
+/// irregular entry are skipped without error. An `Err` names the
+/// directory `read_dir` could not list.
+fn walk(dir: &Path, rel: &str, visit: Visit<'_>) -> anyhow::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let mut rel_path = String::with_capacity(rel.len() + name.len() + 1);
+        if !rel.is_empty() {
+            rel_path.push_str(rel);
+            rel_path.push('/');
+        }
+        rel_path.push_str(&name.to_string_lossy());
+        let head = read_head(&entry.path());
+        let class = classify(Path::new(&rel_path), &head);
+        visit(&rel_path, metadata.len(), class, &head);
+    }
+
+    // Recurse into the subdirectories the flat pass just saw, so one
+    // unreadable file cannot abort the whole walk.
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if file_type.is_dir() {
+            let name = entry.file_name();
+            let mut rel_sub = String::with_capacity(rel.len() + name.len() + 1);
+            if !rel.is_empty() {
+                rel_sub.push_str(rel);
+                rel_sub.push('/');
+            }
+            rel_sub.push_str(&name.to_string_lossy());
+            walk(&entry.path(), &rel_sub, visit)?;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

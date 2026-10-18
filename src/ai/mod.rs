@@ -17,6 +17,7 @@ use crate::model::ArtifactKey;
 use crate::plugin::sandbox::{SandboxOutcome, SandboxSpec, SANDBOX_PACKAGE_DIR};
 
 pub mod collect;
+pub mod prompt;
 
 use collect::CollectedPayload;
 

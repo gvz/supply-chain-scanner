@@ -10,26 +10,53 @@
 //! on the HTTP/1.1 status line's reason phrase, which has no HTTP/2
 //! equivalent.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
+use supply_chain_scanner::ai::collect::collect;
 use supply_chain_scanner::artifact_cache::ArtifactCache;
 use supply_chain_scanner::config::Config;
+use supply_chain_scanner::ecosystem::install_surface::install_surface_for;
 use supply_chain_scanner::http::{bootstrap, watch_for_reload};
 
 /// An HTTP proxy that scans PyPI artifacts before serving them.
 #[derive(Debug, Parser)]
 #[command(name = "supply-chain-scanner", version)]
 struct Cli {
-    /// Path to the TOML configuration file.
+    /// Path to the TOML configuration file. The server requires this
+    /// flag. A subcommand reads no config.
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
+
+    /// The subcommand to run. With no subcommand, the process is the
+    /// proxy server and reads `--config`.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Collects a package's reviewable source into one JSON payload on
+    /// stdout. Invoked by the proxy itself under the sandbox, with the
+    /// package mounted read-only and no network. Reads no config file,
+    /// opens no database, and starts no runtime.
+    Collect {
+        /// Package root as mounted inside the sandbox.
+        #[arg(long)]
+        package_dir: PathBuf,
+        /// Ecosystem id, e.g. `pypi`.
+        #[arg(long)]
+        ecosystem: String,
+        /// Cap on the sum of sent file-content bytes.
+        #[arg(long)]
+        max_payload_bytes: usize,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -40,10 +67,52 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let config = Config::load(&cli.config)?;
+
+    // The collector arm stays self-contained on purpose: inside the
+    // sandbox there is no database, no config file, and no runtime, and
+    // none of the server's startup path must run here.
+    if let Some(Command::Collect {
+        package_dir,
+        ecosystem,
+        max_payload_bytes,
+    }) = cli.command
+    {
+        return run_collector(&package_dir, &ecosystem, max_payload_bytes);
+    }
+
+    let config_path = cli
+        .config
+        .ok_or_else(|| anyhow::anyhow!("--config is required when no subcommand is given"))?;
+    let config = Config::load(&config_path)?;
 
     let runtime = tokio::runtime::Runtime::new().context("building the tokio runtime")?;
-    runtime.block_on(run(config, cli.config))
+    runtime.block_on(run(config, config_path))
+}
+
+/// Runs the `collect` subcommand. `package_dir` is the packaged tree as
+/// mounted, so `/pkg` inside the sandbox and a host cache directory
+/// alike. An unknown ecosystem or a failed walk exits non-zero through
+/// `main`'s error path.
+///
+/// This path writes the payload JSON to stdout and nothing else.
+/// Stdout is the one channel the sandbox carries back to the proxy.
+/// The proxy parses it with
+/// [`supply_chain_scanner::ai::parse_collector_output`] as a whole
+/// document. Stderr goes to a diagnostic log.
+fn run_collector(
+    package_dir: &Path,
+    ecosystem: &str,
+    max_payload_bytes: usize,
+) -> anyhow::Result<()> {
+    let surface = install_surface_for(ecosystem).unwrap_or_else(|| {
+        eprintln!("unknown ecosystem: \"{ecosystem}\"");
+        std::process::exit(2);
+    });
+
+    let payload = collect(package_dir, surface, max_payload_bytes)?;
+    serde_json::to_writer(std::io::stdout().lock(), &payload)
+        .context("writing the collected payload to stdout")?;
+    Ok(())
 }
 
 async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {

@@ -18,6 +18,7 @@ use crate::plugin::sandbox::{SandboxOutcome, SandboxSpec, SANDBOX_PACKAGE_DIR};
 
 pub mod collect;
 pub mod prompt;
+pub mod provider;
 
 use collect::CollectedPayload;
 

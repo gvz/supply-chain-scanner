@@ -20,6 +20,7 @@ use supply_chain_scanner::artifact_cache::ArtifactCache;
 use supply_chain_scanner::config::{Config, ConfigHandle, CveLine, UnknownSeverity};
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::db::index_cache::IndexCache;
+use supply_chain_scanner::db::review::{NewReview, ReviewStore};
 use supply_chain_scanner::db::verdict::VerdictStore;
 use supply_chain_scanner::db::Db;
 use supply_chain_scanner::ecosystem::pypi::upstream::Upstream;
@@ -93,6 +94,7 @@ fn app_state() -> (tempfile::TempDir, tempfile::TempDir, AppState) {
     )
     .expect("construct ecosystem upstream");
     let verdict_store = VerdictStore::new(db.clone());
+    let reviews_store = ReviewStore::new(db.clone());
     let advisory_store = AdvisoryStore::new(db.clone());
     let plugin_runner = PluginRunner::new(Arc::new(NeverCalledSandbox));
     let cfg = base_config();
@@ -113,6 +115,7 @@ fn app_state() -> (tempfile::TempDir, tempfile::TempDir, AppState) {
     let state = AppState {
         scanner: Arc::new(scanner),
         verdicts: Arc::new(verdict_store),
+        reviews: Arc::new(reviews_store),
         config: config_handle,
         ecosystem: Arc::new(PyPi::new(Arc::new(ecosystem_upstream))),
     };
@@ -475,5 +478,279 @@ async fn refusal_reason_phrase_reaches_the_wire_over_real_http1() {
     assert!(
         !status_line.contains('\r') && status_line.is_ascii(),
         "status line must be clean ASCII, got {status_line:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// /why/<id> — the AI review section
+// ---------------------------------------------------------------------------
+
+/// A review row the `/why` page can render, stored under a fingerprint
+/// and then read back through the verdict itself. This is the exact
+/// contract Task 10 pins: the verdict's own fingerprint, not the
+/// scanner's current one, picks the review.
+#[allow(clippy::too_many_arguments)] // a test fixture builder; mirrors NewReview's field list
+fn new_review(
+    key: &ArtifactKey,
+    fingerprint: &str,
+    verdict: &'static str,
+    blocked: bool,
+    summary: &str,
+    findings_json: &str,
+    coverage: Option<f32>,
+    opaque_json: &str,
+) -> NewReview {
+    NewReview {
+        key: key.clone(),
+        fingerprint: fingerprint.to_string(),
+        verdict,
+        blocked,
+        summary: summary.to_string(),
+        findings_json: findings_json.to_string(),
+        coverage,
+        reviewable_bytes_total: 10_000,
+        reviewable_bytes_sent: 9_000,
+        opaque_json: opaque_json.to_string(),
+        reviewed_paths_json: r#"["setup.py","pkg/__init__.py"]"#.to_string(),
+        model: "test-model".to_string(),
+        prompt_version: "1",
+        collector_version: "1".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn a_why_page_for_an_ai_block_shows_the_summary_and_findings() {
+    let (_db_dir, _cache_dir, state) = app_state();
+    let key = artifact_key();
+    let reason = RefusalReason {
+        code: "ai:malicious".to_string(),
+        detail: "the model judged this package malicious".to_string(),
+    };
+    let why_id = state
+        .verdicts
+        .put(&key, &Verdict::Blocked(reason), "fp")
+        .expect("store verdict");
+    state
+        .reviews
+        .put(&new_review(
+            &key,
+            "fp",
+            "malicious",
+            true,
+            "The setup hook decodes a payload and executes it.",
+            r#"[{"path":"setup.py","lines":"12-18","behavior":"decodes a base64 blob and passes it to exec","severity":"high"}]"#,
+            Some(0.95),
+            r#"{"opaque_data_bytes":0,"opaque_executables":[]}"#,
+        ))
+        .expect("store review");
+
+    let response = why_handler(State(state), Path(why_id)).await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = body_text(response).await;
+
+    assert!(body.contains("AI review"), "{body}");
+    assert!(
+        body.contains("The setup hook decodes a payload and executes it."),
+        "{body}"
+    );
+    assert!(body.contains("setup.py"), "{body}");
+    assert!(
+        body.contains("decodes a base64 blob and passes it to exec"),
+        "{body}"
+    );
+    assert!(body.contains("malicious"), "{body}");
+    assert!(body.contains("test-model"), "{body}");
+}
+
+#[tokio::test]
+async fn a_why_page_for_an_ai_block_shows_coverage_and_opaque_content() {
+    let (_db_dir, _cache_dir, state) = app_state();
+    let key = artifact_key();
+    let reason = RefusalReason {
+        code: "ai:malicious".to_string(),
+        detail: "the model judged this package malicious".to_string(),
+    };
+    let why_id = state
+        .verdicts
+        .put(&key, &Verdict::Blocked(reason), "fp")
+        .expect("store verdict");
+    state
+        .reviews
+        .put(&new_review(
+            &key,
+            "fp",
+            "malicious",
+            true,
+            "summary",
+            "[]",
+            Some(0.9),
+            r#"{"opaque_data_bytes":4321,"opaque_executables":[{"path":"pkg/_speedup.so","bytes":5120}]}"#,
+        ))
+        .expect("store review");
+
+    let response = why_handler(State(state), Path(why_id)).await;
+    let body = body_text(response).await;
+
+    assert!(
+        body.contains("90.0 percent of reviewable bytes"),
+        "the coverage figure must appear: {body}"
+    );
+    assert!(
+        body.contains("opaque data: 4321 bytes"),
+        "the opaque data byte count must appear: {body}"
+    );
+    assert!(
+        body.contains("pkg/_speedup.so"),
+        "the opaque executable must appear: {body}"
+    );
+    assert!(
+        body.contains("5120 bytes"),
+        "the opaque executable byte count must appear: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_why_page_for_a_clean_artifact_shows_its_review() {
+    let (_db_dir, _cache_dir, state) = app_state();
+    let key = artifact_key();
+    let why_id = state
+        .verdicts
+        .put(&key, &Verdict::Clean, "fp")
+        .expect("store verdict");
+    state
+        .reviews
+        .put(&new_review(
+            &key,
+            "fp",
+            "clean",
+            false,
+            "Ordinary packaging code, nothing suspicious.",
+            "[]",
+            Some(1.0),
+            r#"{"opaque_data_bytes":0,"opaque_executables":[]}"#,
+        ))
+        .expect("store review");
+
+    let response = why_handler(State(state), Path(why_id)).await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = body_text(response).await;
+
+    assert!(body.contains("AI review"), "{body}");
+    assert!(
+        body.contains("Ordinary packaging code, nothing suspicious."),
+        "{body}"
+    );
+    assert!(body.contains("clean"), "{body}");
+}
+
+#[tokio::test]
+async fn a_why_page_for_an_artifact_with_no_review_omits_the_section() {
+    let (_db_dir, _cache_dir, state) = app_state();
+    let key = artifact_key();
+    let reason = RefusalReason {
+        code: "cve:high".to_string(),
+        detail: "CVE-2024-99999".to_string(),
+    };
+    let why_id = state
+        .verdicts
+        .put(&key, &Verdict::Blocked(reason), "fp")
+        .expect("store verdict");
+
+    let response = why_handler(State(state), Path(why_id)).await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = body_text(response).await;
+
+    assert!(
+        !body.contains("AI review"),
+        "a verdict with no review must omit the section: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_model_summary_containing_html_is_escaped() {
+    let (_db_dir, _cache_dir, state) = app_state();
+    let key = artifact_key();
+    let reason = RefusalReason {
+        code: "ai:malicious".to_string(),
+        detail: "the model judged this package malicious".to_string(),
+    };
+    let why_id = state
+        .verdicts
+        .put(&key, &Verdict::Blocked(reason), "fp")
+        .expect("store verdict");
+    state
+        .reviews
+        .put(&new_review(
+            &key,
+            "fp",
+            "malicious",
+            true,
+            "<script>alert(1)</script>",
+            r#"[{"path":"<b>evil</b>.py","lines":null,"behavior":"<i>behaves badly</i>","severity":"high"}]"#,
+            Some(1.0),
+            r#"{"opaque_data_bytes":0,"opaque_executables":[]}"#,
+        ))
+        .expect("store review");
+
+    let response = why_handler(State(state), Path(why_id)).await;
+    let body = body_text(response).await;
+
+    assert!(
+        !body.contains("<script>"),
+        "model markup must not reach the page unescaped: {body}"
+    );
+    assert!(
+        !body.contains("<b>evil</b>"),
+        "finding markup must not reach the page unescaped: {body}"
+    );
+    assert!(
+        body.contains("&lt;script&gt;"),
+        "model markup must appear HTML-escaped: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_why_page_for_a_coverage_block_explains_the_sign_off_route() {
+    let (_db_dir, _cache_dir, state) = app_state();
+    let key = artifact_key();
+    let reason = RefusalReason {
+        code: "ai:coverage".to_string(),
+        detail: "the review covered 0.400 of reviewable bytes, below the threshold of 0.800"
+            .to_string(),
+    };
+    let why_id = state
+        .verdicts
+        .put(&key, &Verdict::Blocked(reason), "fp")
+        .expect("store verdict");
+    state
+        .reviews
+        .put(&new_review(
+            &key,
+            "fp",
+            "clean",
+            true,
+            "Nothing suspicious in what was reviewed.",
+            "[]",
+            Some(0.4),
+            r#"{"opaque_data_bytes":0,"opaque_executables":[]}"#,
+        ))
+        .expect("store review");
+
+    let response = why_handler(State(state), Path(why_id)).await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = body_text(response).await;
+
+    assert!(body.contains("AI review"), "{body}");
+    assert!(
+        body.contains("40.0 percent of reviewable bytes"),
+        "the low coverage figure must appear: {body}"
+    );
+    assert!(
+        body.to_lowercase().contains("allowlist"),
+        "the page must name the allowlist as the sign-off route: {body}"
+    );
+    assert!(
+        body.contains("how much source the review saw"),
+        "the page must state the block is about coverage: {body}"
     );
 }

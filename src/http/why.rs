@@ -12,6 +12,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 
+use crate::db::review::StoredReview;
 use crate::db::verdict::StoredVerdict;
 use crate::model::{ArtifactKey, RefusalReason, Verdict};
 
@@ -32,7 +33,27 @@ pub async fn why_handler(State(state): State<AppState>, Path(why_id): Path<Strin
     let lookup = tokio::task::spawn_blocking(move || verdicts.get_by_why_id(&lookup_id)).await;
 
     match lookup {
-        Ok(Ok(Some((key, stored)))) => render_why_page(&key, &stored),
+        Ok(Ok(Some((key, stored)))) => {
+            // The review that goes with this verdict. Looked up by the
+            // verdict's own fingerprint, never the scanner's current
+            // one: this verdict may predate the running policy, and a
+            // lookup with the live fingerprint would attach the wrong
+            // report or none. A missing review is not an error — every
+            // verdict without an AI gate has none — so it renders as no
+            // section, and a lookup failure costs the report, not the
+            // explanation.
+            let reviews = state.reviews.clone();
+            let review_key = key.clone();
+            let review_fingerprint = stored.fingerprint.clone();
+            let review = tokio::task::spawn_blocking(move || {
+                reviews.newest_for_artifact(&review_key, &review_fingerprint)
+            })
+            .await
+            .ok()
+            .and_then(|result| result.ok())
+            .flatten();
+            render_why_page(&key, &stored, review.as_ref())
+        }
         Ok(Ok(None)) => not_found_response(),
         Ok(Err(_)) | Err(_) => lookup_failed_response(),
     }
@@ -68,12 +89,20 @@ fn fail_closed() -> Response {
     response
 }
 
-fn render_why_page(key: &ArtifactKey, stored: &StoredVerdict) -> Response {
+fn render_why_page(
+    key: &ArtifactKey,
+    stored: &StoredVerdict,
+    review: Option<&StoredReview>,
+) -> Response {
     let html = match &stored.verdict {
-        Verdict::Blocked(reason) => {
-            blocked_page(key, stored.why_id.as_str(), stored.scanned_at, reason)
-        }
-        Verdict::Clean => clean_page(key, stored.why_id.as_str(), stored.scanned_at),
+        Verdict::Blocked(reason) => blocked_page(
+            key,
+            stored.why_id.as_str(),
+            stored.scanned_at,
+            reason,
+            review,
+        ),
+        Verdict::Clean => clean_page(key, stored.why_id.as_str(), stored.scanned_at, review),
     };
 
     Response::builder()
@@ -88,6 +117,7 @@ fn blocked_page(
     why_id: &str,
     scanned_at: i64,
     reason: &RefusalReason,
+    review: Option<&StoredReview>,
 ) -> String {
     format!(
         "<!doctype html>\
@@ -115,6 +145,7 @@ the integrity check the download still has to pass.</p>\
 whoever owns this proxy's CVE line (the <code>cve.min_severity</code> \
 and <code>cve.require_fix_available</code> settings) — adjusting that \
 line changes which advisories block a package going forward.</p>\
+{review_section}
 </body></html>",
         code = escape_html(&reason.code),
         detail = escape_html(&reason.detail),
@@ -125,10 +156,16 @@ line changes which advisories block a package going forward.</p>\
         sha256 = escape_html(&key.sha256),
         scanned_at = scanned_at,
         why_id = escape_html(why_id),
+        review_section = review_section(Some(reason.code.as_str()), review),
     )
 }
 
-fn clean_page(key: &ArtifactKey, why_id: &str, scanned_at: i64) -> String {
+fn clean_page(
+    key: &ArtifactKey,
+    why_id: &str,
+    scanned_at: i64,
+    review: Option<&StoredReview>,
+) -> String {
     format!(
         "<!doctype html>\
 <html><head><meta charset=\"utf-8\"><title>Scanned clean</title></head>\
@@ -145,6 +182,7 @@ fn clean_page(key: &ArtifactKey, why_id: &str, scanned_at: i64) -> String {
 </table>\
 <p>No check blocked this artifact. If you were expecting a refusal here, \
 the verdict may have been recorded before a later policy change.</p>\
+{review_section}
 </body></html>",
         ecosystem = escape_html(&key.ecosystem),
         package = escape_html(&key.package),
@@ -153,7 +191,174 @@ the verdict may have been recorded before a later policy change.</p>\
         sha256 = escape_html(&key.sha256),
         scanned_at = scanned_at,
         why_id = escape_html(why_id),
+        review_section = review_section(None, review),
     )
+}
+
+/// What the `/why` page shows when the difference is coverage rather
+/// than what was found: the block is lifted by a human sign-off, which
+/// is the allowlist.
+const COVERAGE_REMEDY: &str = "\
+<h3>What lifts this</h3>\
+<p>This block is about how much source the review saw, not what it \
+found. To let this artifact through, ask whoever manages this proxy's \
+configuration to add an allowlist entry for this exact package and \
+version. That is the required sign-off. No coverage figure improves \
+until an operator changes the policy.</p>";
+
+/// Renders the AI review section for a why page, or an empty string when
+/// this verdict has no review. Each field on the page — the model's own
+/// summary above all — is attacker-influenced text, so every fragment
+/// goes through [`escape_html`] on its way in.
+///
+/// `reason_code` is the refusal code on the page, or `None` on a clean
+/// page. A coverage block adds the sign-off paragraph of its own,
+/// because that is what tells the person reading the page what actually
+/// lifts the block, and it differs from every other refusal on this page.
+fn review_section(reason_code: Option<&str>, review: Option<&StoredReview>) -> String {
+    let Some(review) = review else {
+        return String::new();
+    };
+
+    let findings = findings_html(review);
+    let coverage = coverage_html(review);
+    let opaque = opaque_html(review);
+    let paths = paths_html(review);
+
+    let coverage_remedy = match reason_code {
+        Some(crate::ai::code::COVERAGE) => COVERAGE_REMEDY,
+        _ => "",
+    };
+
+    format!(
+        "<h2>AI review</h2>\
+<p>The review that produced the verdict above, recorded under \
+the same policy fingerprint. Nothing on this page is a prompt to \
+execute — it is the model's opinion, reported as it was recorded.</p>\
+<table>
+<tr><th>Model verdict</th><td>{verdict}</td></tr>\
+<tr><th>Summary</th><td>{summary}</td></tr>\
+<tr><th>Coverage</th><td>{coverage}</td></tr>\
+<tr><th>Opaque content</th><td>{opaque}</td></tr>\
+<tr><th>Model</th><td>{model}</td></tr>\
+<tr><th>Prompt version</th><td>{prompt_version}</td></tr>\
+</table>\
+<h3>What the model claimed</h3>\
+<ul>
+{findings}</ul>\
+<h3>What the model received</h3>\
+<ul>
+{paths}</ul>\
+{coverage_remedy}",
+        verdict = escape_html(&review.verdict),
+        summary = escape_html(&review.summary),
+        coverage = coverage,
+        opaque = opaque,
+        model = escape_html(&review.model),
+        prompt_version = escape_html(&review.prompt_version),
+        findings = findings,
+        paths = paths,
+        coverage_remedy = coverage_remedy,
+    )
+}
+
+/// The coverage figure as the page states it, or the plain statement
+/// that there was no source to review.
+fn coverage_html(review: &StoredReview) -> String {
+    match review.coverage {
+        Some(figure) => escape_html(&format!(
+            "{:.1} percent of reviewable bytes \
+({} of {} bytes)",
+            figure * 100.0,
+            review.reviewable_bytes_sent,
+            review.reviewable_bytes_total
+        )),
+        None => "There was no source to review in this artifact.".to_string(),
+    }
+}
+
+/// The opaque content figures with byte counts. The reviewable bytes
+/// the model did not receive are named with their count; the opaque
+/// executables and opaque data come from the row's own JSON object,
+/// which is what the collector measured.
+fn opaque_html(review: &StoredReview) -> String {
+    let opaque: serde_json::Value =
+        serde_json::from_str(&review.opaque_json).unwrap_or_else(|_| serde_json::json!({}));
+    let opaque_data_bytes = opaque
+        .get("opaque_data_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    escape_html(&format!(
+        "opaque data: {opaque_data_bytes} bytes; opaque executables: {}",
+        opaque_executable_names(review)
+    ))
+}
+
+/// Each finding's path and claimed behaviour, as a single escaped HTML
+/// list. The row stores them as a JSON array; a parse failure degrades
+/// to an empty list rather than failing the page.
+fn findings_html(review: &StoredReview) -> String {
+    let empty: Vec<serde_json::Value> = Vec::new();
+    let findings = serde_json::from_str(&review.findings_json).unwrap_or(empty);
+    findings
+        .iter()
+        .map(|finding| {
+            let path = finding.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let behavior = finding
+                .get("behavior")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!(
+                "<li><code>{path}</code>: {behavior}</li>",
+                path = escape_html(path),
+                behavior = escape_html(behavior)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The paths the model actually received, escaped, as a single list.
+fn paths_html(review: &StoredReview) -> String {
+    let empty: Vec<String> = Vec::new();
+    let paths: Vec<String> = serde_json::from_str(&review.reviewed_paths_json).unwrap_or(empty);
+    paths
+        .iter()
+        .map(|path| format!("<li><code>{path}</code></li>", path = escape_html(path)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The opaque executables with their byte counts, read out of the row's
+/// own JSON object. Names and sizes both, because a reviewer reading the
+/// page needs to be able to see which parts nobody could read.
+fn opaque_executable_names(review: &StoredReview) -> String {
+    let opaque: serde_json::Value =
+        serde_json::from_str(&review.opaque_json).unwrap_or_else(|_| serde_json::json!({}));
+    let empty: Vec<serde_json::Value> = Vec::new();
+    let executables: Vec<serde_json::Value> = opaque
+        .get("opaque_executables")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or(empty);
+    if executables.is_empty() {
+        return "none".to_string();
+    }
+    executables
+        .iter()
+        .map(|exe| {
+            let path = exe
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let bytes = exe
+                .get("bytes")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            format!("{path} ({bytes} bytes)")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Escapes the five bytes that matter for safely embedding arbitrary text

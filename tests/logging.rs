@@ -179,6 +179,9 @@ fn build_harness(server: &MockServer) -> Harness {
     let state = AppState {
         scanner: Arc::clone(&scanner),
         verdicts: Arc::new(VerdictStore::new(db.clone())),
+        reviews: Arc::new(supply_chain_scanner::db::review::ReviewStore::new(
+            db.clone(),
+        )),
         config: config_handle,
         ecosystem: pypi,
     };

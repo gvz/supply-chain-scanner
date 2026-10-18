@@ -27,12 +27,19 @@ const BASE32_ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 const WHY_ID_LEN: usize = 16;
 
 /// A verdict as read back from the store, together with the identifiers
-/// that let it be looked up again.
+/// that let it be looked up again. `fingerprint` is the policy that
+/// produced this verdict, read back so a caller can fetch exactly the
+/// artifacts recorded alongside it — for `/why`, the AI review made
+/// under that same policy. It must not be confused with the scanner's
+/// *current* fingerprint: the verdict on the page may predate the
+/// running policy, and looking its review up with the live fingerprint
+/// would attach the wrong report or none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredVerdict {
     pub why_id: String,
     pub verdict: Verdict,
     pub scanned_at: i64,
+    pub fingerprint: String,
 }
 
 /// The durable record of every artifact this scanner has ever scanned.
@@ -56,7 +63,7 @@ impl VerdictStore {
     ) -> anyhow::Result<Option<StoredVerdict>> {
         let conn = self.db.conn()?;
         conn.query_row(
-            "SELECT why_id, blocked, reason_code, reason_detail, scanned_at
+            "SELECT why_id, blocked, reason_code, reason_detail, scanned_at, fingerprint
              FROM verdicts
              WHERE ecosystem = ?1 AND package = ?2 AND version = ?3
                AND filename = ?4 AND sha256 = ?5 AND fingerprint = ?6",
@@ -141,7 +148,7 @@ impl VerdictStore {
         let conn = self.db.conn()?;
         conn.query_row(
             "SELECT ecosystem, package, version, filename, sha256,
-                    why_id, blocked, reason_code, reason_detail, scanned_at
+                    why_id, blocked, reason_code, reason_detail, scanned_at, fingerprint
              FROM verdicts
              WHERE why_id = ?1",
             [why_id],
@@ -193,20 +200,21 @@ impl VerdictStore {
 }
 
 /// Builds a [`StoredVerdict`] from a row shaped
-/// `(why_id, blocked, reason_code, reason_detail, scanned_at)`.
+/// `(why_id, blocked, reason_code, reason_detail, scanned_at, fingerprint)`.
 fn row_to_stored_verdict(row: &rusqlite::Row) -> rusqlite::Result<StoredVerdict> {
     stored_verdict_from_row(row, 0)
 }
 
-/// Builds a [`StoredVerdict`] from five consecutive columns
-/// `(why_id, blocked, reason_code, reason_detail, scanned_at)` starting at
-/// `offset`.
+/// Builds a [`StoredVerdict`] from six consecutive columns
+/// `(why_id, blocked, reason_code, reason_detail, scanned_at, fingerprint)`
+/// starting at `offset`.
 fn stored_verdict_from_row(row: &rusqlite::Row, offset: usize) -> rusqlite::Result<StoredVerdict> {
     let why_id: String = row.get(offset)?;
     let blocked: bool = row.get(offset + 1)?;
     let reason_code: Option<String> = row.get(offset + 2)?;
     let reason_detail: Option<String> = row.get(offset + 3)?;
     let scanned_at: i64 = row.get(offset + 4)?;
+    let fingerprint: String = row.get(offset + 5)?;
 
     let verdict = if blocked {
         Verdict::Blocked(RefusalReason {
@@ -221,6 +229,7 @@ fn stored_verdict_from_row(row: &rusqlite::Row, offset: usize) -> rusqlite::Resu
         why_id,
         verdict,
         scanned_at,
+        fingerprint,
     })
 }
 

@@ -17,6 +17,7 @@
 
 pub mod artifact;
 pub mod refusal;
+pub mod reviews;
 pub mod simple;
 pub mod why;
 
@@ -54,6 +55,7 @@ use crate::scan::Scanner;
 pub struct AppState {
     pub scanner: Arc<Scanner>,
     pub verdicts: Arc<VerdictStore>,
+    pub reviews: Arc<ReviewStore>,
     pub config: Arc<ConfigHandle>,
     pub ecosystem: Arc<dyn Ecosystem>,
 }
@@ -72,6 +74,7 @@ pub fn router(state: AppState, upstream: Arc<Upstream>) -> Router {
             get(artifact::artifact_handler),
         )
         .route("/why/{id}", get(why::why_handler))
+        .route("/api/reviews", get(reviews::reviews_handler))
         .layer(Extension(upstream))
         .layer(axum::middleware::from_fn(access_log))
         .with_state(state)
@@ -264,6 +267,7 @@ pub async fn bootstrap(config: Config) -> anyhow::Result<Wired> {
     let state = AppState {
         scanner: Arc::new(scanner),
         verdicts: Arc::new(VerdictStore::new(db.clone())),
+        reviews: Arc::new(ReviewStore::new(db.clone())),
         config: Arc::clone(&config_handle),
         ecosystem: pypi,
     };

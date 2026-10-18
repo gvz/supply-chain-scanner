@@ -150,7 +150,7 @@ artifact or lets the scan continue.
 | `base_url` | required | Provider base. `chat/completions` is appended. Must be `https`, or `http` pointed at a loopback host. |
 | `model` | required | Model name. Sent with every request and stored in every review row. |
 | `api_key_env` | unset | Name of the environment variable that holds the API key. Unset sends no Authorization header. |
-| `timeout` | 8s | Total deadline for one provider call. Must stay below `scan_budget`. |
+| `timeout` | 8s | Total deadline for one *review*: the collector run and the provider call, including its one possible retry, all draw from this single budget. Must stay below `scan_budget`. |
 | `max_payload_bytes` | 262144 | Cap on the file content sent to the model in one review. Floor: 4096. |
 | `max_output_tokens` | 1024 | The request's `max_tokens`. |
 | `coverage_threshold` | 0.8 | Minimum share of reviewable bytes that must reach the model. |
@@ -209,8 +209,11 @@ re-attempts:
 - `unverifiable:ai-collector`: the sandboxed collection failed.
 - `unverifiable:ai-provider`: the provider call failed. A 429 or a 5xx is
   retried exactly once, a timeout is not.
-- `unverifiable:ai-reply`: the reply was empty, not JSON, or carried an
-  unknown verdict.
+- `unverifiable:ai-reply`: the reply was empty, not JSON, carried an
+  unknown verdict, or was cut off at `max_output_tokens` before the model
+  finished (logged with `max_output_tokens` named, so this cause is never
+  confused with a broken provider or a broken parser). Raise
+  `max_output_tokens` if this recurs.
 - `unverifiable:ai-store`: the review row could not be written.
 
 **`GET /api/reviews` publishes the audit trail.** It returns stored review
@@ -220,6 +223,13 @@ The endpoint is unauthenticated, and unlike `/why` it is enumerable. Anyone who
 can reach the proxy can page through the whole list of packages the
 organization installs, with their verdicts and summaries. Network placement is
 the only access control, as everywhere else in this proxy.
+
+The route itself is always registered — `ai_review` is reloadable, and a
+router cannot gain or lose a route once it is bound — but the handler 404s
+whenever `[ai_review]` is absent from the running configuration, so a
+deployment that never enables the reviewer never exposes this surface at
+all. Enabling the reviewer later, through a reload, makes the endpoint live
+without a restart.
 
 **Review rows accumulate without bound.** Every completed review appends one
 row. A repeat review sits beside its predecessor rather than replacing it, on

@@ -3,9 +3,11 @@
 //! whether an artifact may be served.
 //!
 //! Each test builds a full [`Scanner`] against a real (temp-file) SQLite
-//! database, a `wiremock` stand-in for upstream PyPI, and a scripted fake
-//! [`SandboxRunner`] (the same style of fake `tests/plugin.rs` uses) so
-//! plugin behavior is deterministic and independent of `bwrap`.
+//! database, a `wiremock` stand-in for upstream PyPI, a scripted fake
+//! [`SandboxRunner`] (the same style of fake `tests/plugin.rs` uses) and,
+//! for the AI-review gate, a scripted fake [`ChatProvider`] (the style
+//! `tests/ai_review.rs` uses) so plugin and review behavior is deterministic
+//! and independent of `bwrap` and of any model provider.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -14,24 +16,31 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use supply_chain_scanner::advisory::Advisory;
+use supply_chain_scanner::ai::provider::{ChatProvider, ProviderError};
+use supply_chain_scanner::ai::AiReviewer;
 use supply_chain_scanner::artifact_cache::ArtifactCache;
 use supply_chain_scanner::config::{
-    AllowEntry, Config, ConfigHandle, CveLine, PluginConfig, UnknownSeverity,
+    AiReviewConfig, AllowEntry, BlockOn, Config, ConfigHandle, CveLine, PluginConfig,
+    UnknownSeverity,
 };
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::db::index_cache::IndexCache;
+use supply_chain_scanner::db::review::ReviewStore;
 use supply_chain_scanner::db::verdict::VerdictStore;
 use supply_chain_scanner::db::Db;
 use supply_chain_scanner::ecosystem::pypi::index::IndexEntry;
 use supply_chain_scanner::ecosystem::pypi::upstream::Upstream;
 use supply_chain_scanner::model::{ArtifactKey, RefusalReason, Verdict};
-use supply_chain_scanner::plugin::{PluginRunner, SandboxOutcome, SandboxRunner, SandboxSpec};
+use supply_chain_scanner::plugin::{
+    PluginRunner, SandboxOutcome, SandboxRunner, SandboxSpec, SANDBOX_PACKAGE_DIR,
+};
 use supply_chain_scanner::policy::Policy;
 use supply_chain_scanner::scan::{Decision, Scanner};
 
@@ -226,6 +235,170 @@ fn exited(code: i32, output: &str) -> SandboxOutcome {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AI-review gate fixtures
+// ---------------------------------------------------------------------------
+
+/// An `[ai_review]` table the scan tests can build a real reviewer from.
+/// Plain HTTP to loopback satisfies validation; nothing dials it, because
+/// the provider below is always a stub.
+fn ai_review_cfg() -> AiReviewConfig {
+    AiReviewConfig {
+        base_url: "http://127.0.0.1:9/chat/".parse().unwrap(),
+        model: "test-model".to_string(),
+        api_key_env: None,
+        timeout: Duration::from_secs(5),
+        max_payload_bytes: 262_144,
+        max_output_tokens: 256,
+        coverage_threshold: 0.8,
+        block_on: BlockOn::Malicious,
+        block_opaque_executables: false,
+    }
+}
+
+/// What the provider stub does when the reviewer calls it.
+#[derive(Clone)]
+enum ProviderScript {
+    /// Return this body (a full chat-completions envelope).
+    Body(String),
+    /// Fail with a provider error, so the review is unverifiable.
+    Error,
+    /// Sleep past `Duration`, so the review outlives the scan budget.
+    Sleep(Duration),
+    /// Panic: the reviewer must never be reached in the tests that use it.
+    NeverCalled,
+}
+
+/// The provider stub, shared by every AI-gate test. It never touches the
+/// network. `NeverCalled` turns a stray review into a test failure by
+/// panicking inside the provider call, which `AiReviewer::review` contains
+/// the same way `PluginRunner` contains a panicking sandbox: the review
+/// resolves to `unverifiable:ai-provider`, and the test's assertion on the
+/// *decision* then fails loudly rather than silently passing.
+struct StubProvider {
+    script: ProviderScript,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl ChatProvider for StubProvider {
+    async fn complete(&self, _request: &serde_json::Value) -> Result<String, ProviderError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match &self.script {
+            ProviderScript::Body(body) => Ok(body.clone()),
+            ProviderScript::Error => Err(ProviderError::Transport(
+                "the stub is scripted to fail".to_string(),
+            )),
+            ProviderScript::Sleep(delay) => {
+                tokio::time::sleep(*delay).await;
+                Ok(clean_reply())
+            }
+            ProviderScript::NeverCalled => {
+                panic!("the provider must never be called in this test: no review may run here")
+            }
+        }
+    }
+}
+
+/// A chat-completions envelope whose content embeds `reply_json`.
+fn model_reply_body(reply_json: &str) -> String {
+    let content = serde_json::to_string(reply_json).expect("escape the reply content");
+    format!(
+        r#"{{"id":"resp_1","choices":[{{"index":0,"message":{{"role":"assistant","content":{content}}},"finish_reason":"stop"}}]}}"#
+    )
+}
+
+fn clean_reply() -> String {
+    model_reply_body(r#"{"verdict":"clean","summary":"ordinary packaging code","findings":[]}"#)
+}
+
+fn malicious_reply() -> String {
+    model_reply_body(
+        r#"{"verdict":"malicious","summary":"sends the environment off the machine","findings":[]}"#,
+    )
+}
+
+/// A database plus its review store under one temp dir, shared with the
+/// harness's verdict/advisory stores only through the same file.
+struct ReviewDb {
+    _dir: tempfile::TempDir,
+    store: Arc<ReviewStore>,
+}
+
+fn review_db() -> ReviewDb {
+    let dir = tempfile::tempdir().expect("create review db temp dir");
+    let db = Db::open(&dir.path().join("reviews.db")).expect("open review db");
+    ReviewDb {
+        _dir: dir,
+        store: Arc::new(ReviewStore::new(db)),
+    }
+}
+
+/// Builds a real [`AiReviewer`] over the stub provider and a stub sandbox
+/// that serves the unpacked tree through the real collector binary (the
+/// pattern `tests/ai_review.rs` uses): the reviewer's own coverage and
+/// selection code runs for real against the artifact the scanner unpacked.
+fn reviewer_with(
+    sandbox: Arc<dyn SandboxRunner>,
+    script: ProviderScript,
+) -> (Arc<AiReviewer>, ReviewDb) {
+    let reviews = review_db();
+    let reviewer = AiReviewer::new(
+        ai_review_cfg(),
+        sandbox,
+        Arc::new(StubProvider {
+            script,
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::clone(&reviews.store),
+        PathBuf::from(env!("CARGO_BIN_EXE_supply-chain-scanner")),
+    );
+    (Arc::new(reviewer), reviews)
+}
+
+/// The reviewer's serving sandbox: runs the real collector binary on the
+/// host tree the spec mounts, unconfined, exactly like `StubSandbox::Serve`
+/// in `tests/ai_review.rs`. The scanner's plugin sandbox stays whatever
+/// the test configured, so the two sandboxes never interfere.
+struct ServingSandbox;
+
+impl SandboxRunner for ServingSandbox {
+    fn run(&self, spec: &SandboxSpec) -> anyhow::Result<SandboxOutcome> {
+        let host = spec.package_dir.to_string_lossy().to_string();
+        let args: Vec<String> = spec
+            .args
+            .iter()
+            .map(|arg| {
+                if arg == SANDBOX_PACKAGE_DIR {
+                    host.clone()
+                } else {
+                    arg.clone()
+                }
+            })
+            .collect();
+        let output = std::process::Command::new(&spec.binary)
+            .args(&args)
+            .output()
+            .map_err(|e| anyhow::anyhow!("the stub could not spawn the collector: {e}"))?;
+        Ok(SandboxOutcome {
+            exit_code: output.status.code(),
+            output: String::from_utf8_lossy(&output.stdout).to_string(),
+            timed_out: false,
+            signal: None,
+        })
+    }
+}
+
+/// A panicking sandbox for the reviewer: proves a test's reviewer was
+/// never reached by failing the review loudly if it ever runs.
+struct NeverCalledSandbox;
+
+impl SandboxRunner for NeverCalledSandbox {
+    fn run(&self, _spec: &SandboxSpec) -> anyhow::Result<SandboxOutcome> {
+        panic!("the reviewer must never run in this test");
+    }
+}
+
 /// Everything one test needs to drive a [`Scanner`] plus the raw stores
 /// to assert against directly, bypassing the scanner's own decision path.
 struct Harness {
@@ -242,12 +415,15 @@ struct Harness {
 /// against an already-open `db` and `cache_root`, so a test can build a
 /// *second* scanner sharing the same durable state under a different
 /// policy (see `policy_fingerprint_change_triggers_a_rescan`).
+/// `ai_reviewer` is `None` for every test that does not exercise the
+/// review gate.
 fn scanner_from(
     cfg: Config,
     server: &MockServer,
     sandbox: Arc<dyn SandboxRunner>,
     db: Db,
     cache_root: PathBuf,
+    ai_reviewer: Option<Arc<AiReviewer>>,
 ) -> (Scanner, String) {
     let artifact_cache = ArtifactCache::new(db.clone(), cache_root).expect("create artifact cache");
     let index_cache = IndexCache::new(db.clone());
@@ -268,11 +444,21 @@ fn scanner_from(
         plugin_runner,
         artifact_cache,
         config_handle,
+        ai_reviewer,
     );
     (scanner, fingerprint)
 }
 
 fn build_harness(cfg: Config, server: &MockServer, sandbox: Arc<dyn SandboxRunner>) -> Harness {
+    build_harness_with_reviewer(cfg, server, sandbox, None)
+}
+
+fn build_harness_with_reviewer(
+    cfg: Config,
+    server: &MockServer,
+    sandbox: Arc<dyn SandboxRunner>,
+    ai_reviewer: Option<Arc<AiReviewer>>,
+) -> Harness {
     let (db_dir, db) = open_db();
     let cache_dir = tempfile::tempdir().expect("create cache temp dir");
     let (scanner, fingerprint) = scanner_from(
@@ -281,6 +467,7 @@ fn build_harness(cfg: Config, server: &MockServer, sandbox: Arc<dyn SandboxRunne
         sandbox,
         db.clone(),
         cache_dir.path().join("artifacts"),
+        ai_reviewer,
     );
 
     Harness {
@@ -706,6 +893,7 @@ async fn policy_fingerprint_change_triggers_a_rescan() {
         FakeSandbox::empty(),
         db.clone(),
         cache_root.clone(),
+        None,
     );
     let decision_a = scanner_a.decide(&key, &entry).await;
     assert!(
@@ -727,7 +915,7 @@ async fn policy_fingerprint_change_triggers_a_rescan() {
     }];
     let sandbox_b = FakeSandbox::new([(plugin_path, Ok(exited(1, "now blocked\n")))]);
 
-    let (scanner_b, _fp_b) = scanner_from(cfg_b, &server, sandbox_b, db.clone(), cache_root);
+    let (scanner_b, _fp_b) = scanner_from(cfg_b, &server, sandbox_b, db.clone(), cache_root, None);
     let decision_b = scanner_b.decide(&key, &entry).await;
     match decision_b {
         Decision::Refuse { reason, why_id } => {
@@ -1316,4 +1504,304 @@ async fn a_plugin_that_timed_out_is_unverifiable_and_stores_no_verdict() {
             .is_none(),
         "a check that never finished must not be persisted as a verdict"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The AI-review gate (Task 9)
+// ---------------------------------------------------------------------------
+
+/// A wheel with install-surface content the reviewer can actually see:
+/// one `setup.py` plus one ordinary module. `build_wheel_bytes`' bare
+/// `demo/__init__.py` would also work (the collector reads plain modules
+/// fine), but a named install-surface file makes the intent explicit:
+/// these tests exercise the review gate, not the collector's selection.
+fn build_reviewable_wheel_bytes() -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let cursor = std::io::Cursor::new(&mut buf);
+        let mut zip = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("setup.py", options)
+            .expect("start zip entry");
+        zip.write_all(b"from setuptools import setup\nsetup(name='demo')\n")
+            .expect("write setup.py");
+        zip.start_file("demo/__init__.py", options)
+            .expect("start zip entry");
+        zip.write_all(b"VERSION = '1.0.0'\n")
+            .expect("write zip entry contents");
+        zip.finish().expect("finish zip fixture");
+    }
+    buf
+}
+
+/// Mounts the reviewable wheel on `server`, returns `(filename, sha256)`.
+async fn mount_reviewable_artifact(server: &MockServer) -> (String, String) {
+    let filename = "demo_package-1.0.0-py3-none-any.whl".to_string();
+    let body = build_reviewable_wheel_bytes();
+    let sha256 = sha256_hex(&body);
+    Mock::given(method("GET"))
+        .and(path(format!("/packages/{filename}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(server)
+        .await;
+    (filename, sha256)
+}
+
+#[tokio::test]
+async fn the_reviewer_runs_after_the_plugins() {
+    let server = MockServer::start().await;
+    let (filename, sha256) = mount_reviewable_artifact(&server).await;
+
+    let plugin_dir = tempfile::tempdir().expect("create plugin temp dir");
+    let plugin_path = plugin_dir.path().join("strict-plugin");
+    std::fs::write(&plugin_path, b"pretend plugin binary").expect("write plugin binary");
+
+    let mut cfg = base_config(Duration::from_secs(12));
+    cfg.plugins = vec![PluginConfig {
+        name: "strict".to_string(),
+        binary: plugin_path.clone(),
+        timeout: Duration::from_secs(5),
+    }];
+    cfg.ai_review = Some(ai_review_cfg());
+    let plugin_sandbox = FakeSandbox::new([(plugin_path, Ok(exited(1, "malware found\n")))]);
+
+    // The reviewer's provider panics if called: the blocking plugin must
+    // end the scan before the review gate is ever reached.
+    let (reviewer, _reviews) = reviewer_with(Arc::new(ServingSandbox), ProviderScript::NeverCalled);
+    let harness = build_harness_with_reviewer(cfg, &server, plugin_sandbox, Some(reviewer));
+
+    let key = key_for(&sha256, &filename);
+    let entry = entry_for(&server, &filename, Some(&sha256));
+
+    match harness.scanner.decide(&key, &entry).await {
+        Decision::Refuse { reason, why_id } => {
+            assert_eq!(
+                reason.code, "plugin:strict",
+                "the plugin's code must win; the review must never have run"
+            );
+            assert!(why_id.is_some());
+        }
+        other => panic!("expected the plugin to refuse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_malicious_review_blocks_the_scan_with_a_why_id() {
+    let server = MockServer::start().await;
+    let (filename, sha256) = mount_reviewable_artifact(&server).await;
+
+    let cfg = {
+        let mut cfg = base_config(Duration::from_secs(12));
+        cfg.ai_review = Some(ai_review_cfg());
+        cfg
+    };
+    let (reviewer, _reviews) = reviewer_with(
+        Arc::new(ServingSandbox),
+        ProviderScript::Body(malicious_reply()),
+    );
+    let harness = build_harness_with_reviewer(cfg, &server, FakeSandbox::empty(), Some(reviewer));
+
+    let key = key_for(&sha256, &filename);
+    let entry = entry_for(&server, &filename, Some(&sha256));
+
+    match harness.scanner.decide(&key, &entry).await {
+        Decision::Refuse { reason, why_id } => {
+            assert_eq!(reason.code, "ai:malicious");
+            assert!(
+                why_id.is_some(),
+                "a blocked review must be a stored verdict with a /why page"
+            );
+        }
+        other => panic!("a malicious review must refuse the artifact, got {other:?}"),
+    }
+
+    let stored = harness
+        .verdict_store
+        .get(&key, &harness.fingerprint)
+        .expect("query verdict")
+        .expect("a blocked review must store its verdict");
+    assert!(matches!(stored.verdict, Verdict::Blocked(_)));
+}
+
+#[tokio::test]
+async fn an_unverifiable_review_stores_no_verdict() {
+    let server = MockServer::start().await;
+    let (filename, sha256) = mount_reviewable_artifact(&server).await;
+
+    let cfg = {
+        let mut cfg = base_config(Duration::from_secs(12));
+        cfg.ai_review = Some(ai_review_cfg());
+        cfg
+    };
+    let (reviewer, _reviews) = reviewer_with(Arc::new(ServingSandbox), ProviderScript::Error);
+    let harness = build_harness_with_reviewer(cfg, &server, FakeSandbox::empty(), Some(reviewer));
+
+    let key = key_for(&sha256, &filename);
+    let entry = entry_for(&server, &filename, Some(&sha256));
+
+    match harness.scanner.decide(&key, &entry).await {
+        Decision::Unverifiable(reason) => assert_eq!(reason.code, "unverifiable:ai-provider"),
+        other => panic!("a provider failure must be Unverifiable, got {other:?}"),
+    }
+
+    assert!(
+        harness
+            .verdict_store
+            .get(&key, &harness.fingerprint)
+            .expect("query verdict")
+            .is_none(),
+        "a review that never happened must not be persisted as a verdict"
+    );
+
+    // A second decide() re-attempts: nothing was stored, so the request
+    // must go back through the full scan and reach the reviewer again
+    // (which resolves to Unverifiable again for the same reason).
+    let second = harness.scanner.decide(&key, &entry).await;
+    match second {
+        Decision::Unverifiable(reason) => assert_eq!(reason.code, "unverifiable:ai-provider"),
+        other => panic!("the retry must re-attempt the review, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_clean_review_lets_the_artifact_be_served() {
+    let server = MockServer::start().await;
+    let (filename, sha256) = mount_reviewable_artifact(&server).await;
+    let body = build_reviewable_wheel_bytes();
+
+    let cfg = {
+        let mut cfg = base_config(Duration::from_secs(12));
+        cfg.ai_review = Some(ai_review_cfg());
+        cfg
+    };
+    let (reviewer, _reviews) = reviewer_with(
+        Arc::new(ServingSandbox),
+        ProviderScript::Body(clean_reply()),
+    );
+    let harness = build_harness_with_reviewer(cfg, &server, FakeSandbox::empty(), Some(reviewer));
+
+    let key = key_for(&sha256, &filename);
+    let entry = entry_for(&server, &filename, Some(&sha256));
+
+    match harness.scanner.decide(&key, &entry).await {
+        Decision::Serve(served_path) => {
+            assert_eq!(std::fs::read(&served_path).expect("read served file"), body);
+        }
+        other => panic!("a clean review must fall through to Serve, got {other:?}"),
+    }
+
+    let stored = harness
+        .verdict_store
+        .get(&key, &harness.fingerprint)
+        .expect("query verdict")
+        .expect("a clean scan must store its verdict");
+    assert_eq!(stored.verdict, Verdict::Clean);
+}
+
+#[tokio::test]
+async fn no_reviewer_configured_leaves_the_scan_path_untouched() {
+    let server = MockServer::start().await;
+    let (filename, sha256) = mount_reviewable_artifact(&server).await;
+    let body = build_reviewable_wheel_bytes();
+
+    // No reviewer, an ordinary config: the scan path must behave exactly
+    // as it did before the gate existed. A panicking reviewer would prove
+    // the gate was reached; there is nothing to hand the harness, so the
+    // None path in Scanner::new is what this exercises end to end.
+    let harness = build_harness(
+        base_config(Duration::from_secs(12)),
+        &server,
+        FakeSandbox::empty(),
+    );
+
+    let key = key_for(&sha256, &filename);
+    let entry = entry_for(&server, &filename, Some(&sha256));
+
+    match harness.scanner.decide(&key, &entry).await {
+        Decision::Serve(served_path) => {
+            assert_eq!(std::fs::read(&served_path).expect("read served file"), body);
+        }
+        other => panic!("with no reviewer configured the scan must serve, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_review_slower_than_the_scan_budget_returns_in_progress() {
+    let server = MockServer::start().await;
+    let (filename, sha256) = mount_reviewable_artifact(&server).await;
+
+    // The provider sleeps well past the scan budget, so the review cannot
+    // finish before decide()'s timeout elapses.
+    let cfg = {
+        let mut cfg = base_config(Duration::from_millis(20));
+        cfg.ai_review = Some(ai_review_cfg());
+        cfg
+    };
+    let (reviewer, _reviews) = reviewer_with(
+        Arc::new(ServingSandbox),
+        ProviderScript::Sleep(Duration::from_millis(150)),
+    );
+    let harness = build_harness_with_reviewer(cfg, &server, FakeSandbox::empty(), Some(reviewer));
+
+    let key = key_for(&sha256, &filename);
+    let entry = entry_for(&server, &filename, Some(&sha256));
+
+    let decision = harness.scanner.decide(&key, &entry).await;
+    assert_eq!(
+        decision,
+        Decision::InProgress,
+        "a review slower than the scan budget must return InProgress, not block the caller"
+    );
+
+    // The budget timeout must not have cancelled the detached scan: give
+    // the sleeping provider time to finish, then the verdict it stored
+    // must be there for the retry (the same contract a slow download
+    // already has, see `scan_exceeding_budget_returns_in_progress_then_
+    // stores_a_verdict`).
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let stored = harness
+        .verdict_store
+        .get(&key, &harness.fingerprint)
+        .expect("query verdict")
+        .expect("the detached scan must store its verdict after InProgress");
+    assert_eq!(stored.verdict, Verdict::Clean);
+
+    // The retry is not another scan: it lands on the stored verdict.
+    let retried = harness.scanner.decide(&key, &entry).await;
+    assert!(
+        matches!(retried, Decision::Serve(_)),
+        "the retry must land on the stored verdict, got {retried:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_allowlisted_package_is_never_reviewed() {
+    let server = MockServer::start().await;
+    let (filename, sha256) = mount_reviewable_artifact(&server).await;
+    let body = build_reviewable_wheel_bytes();
+
+    let mut cfg = base_config(Duration::from_secs(12));
+    cfg.allowlist = vec![AllowEntry {
+        package: "demo-package".to_string(),
+        version: "1.0.0".to_string(),
+    }];
+    cfg.ai_review = Some(ai_review_cfg());
+
+    // The reviewer's provider panics if called: the allowlist path must
+    // never reach the review gate, exactly as it never reaches the
+    // plugins. The reviewer's sandbox would panic on any stray run too.
+    let (reviewer, _reviews) =
+        reviewer_with(Arc::new(NeverCalledSandbox), ProviderScript::NeverCalled);
+    let harness = build_harness_with_reviewer(cfg, &server, FakeSandbox::empty(), Some(reviewer));
+
+    let key = key_for(&sha256, &filename);
+    let entry = entry_for(&server, &filename, Some(&sha256));
+
+    match harness.scanner.decide(&key, &entry).await {
+        Decision::Serve(served_path) => {
+            assert_eq!(std::fs::read(&served_path).expect("read served file"), body);
+        }
+        other => panic!("an allowlisted artifact must be served without any review, got {other:?}"),
+    }
 }

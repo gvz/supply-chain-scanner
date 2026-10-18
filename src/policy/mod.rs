@@ -23,6 +23,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use sha2::{Digest, Sha256};
 
+use crate::ai::collect;
+use crate::ai::prompt;
 use crate::config::{Config, CveLine, UnknownSeverity};
 
 /// Separates each hashed field so that, e.g., a plugin named `"ab"` with
@@ -33,11 +35,25 @@ const FIELD_SEP: &[u8] = &[0u8];
 /// Computes the policy fingerprint for `cfg`: a lowercase hex SHA-256
 /// digest over the serialized [`CveLine`], then — in config list order —
 /// each plugin's name and the SHA-256 of its binary's current file
-/// contents.
+/// contents, then, when `[ai_review]` is present, the reviewer's
+/// identity (see below).
 ///
 /// Reorder-sensitive by construction: swapping two plugins' positions in
 /// `cfg.plugins` changes the byte sequence fed to the hasher even though
 /// the set of plugins is unchanged.
+///
+/// The reviewer contributes the model, the prompt version, the collector
+/// version, the coverage threshold, `block_on` and
+/// `block_opaque_executables`: everything that changes which checks a
+/// review runs or how it blocks. `base_url` and `api_key_env` stay out:
+/// they are operational knobs, like `bind`, and moving a deployment to a
+/// different provider host must not invalidate every stored verdict.
+///
+/// A config with no `[ai_review]` table appends nothing at all, so an
+/// unconfigured deployment produces a byte-identical digest to the same
+/// config on a binary built before the reviewer existed. Upgrading this
+/// proxy never invalidates a stored verdict by the mere presence of the
+/// new code.
 pub fn policy_fingerprint(cfg: &Config) -> anyhow::Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(serialize_cve_line(&cfg.cve).as_bytes());
@@ -55,6 +71,35 @@ pub fn policy_fingerprint(cfg: &Config) -> anyhow::Result<String> {
             )
         })?;
         hasher.update(binary_hash.as_bytes());
+    }
+
+    if let Some(ai) = cfg.ai_review.as_ref() {
+        hasher.update(FIELD_SEP);
+        hasher.update(b"ai_review");
+        hasher.update(FIELD_SEP);
+        hasher.update(ai.model.as_bytes());
+        hasher.update(FIELD_SEP);
+        hasher.update(prompt::PROMPT_VERSION.as_bytes());
+        hasher.update(FIELD_SEP);
+        hasher.update(collect::COLLECTOR_VERSION.as_bytes());
+        hasher.update(FIELD_SEP);
+        // `{}` renders every `f32` bit pattern, including integral values
+        // as `1` rather than `1.0`, and unlike `{:?}` it cannot be
+        // confused with a numeric string that carries different bytes.
+        // Two thresholds with different bits never serialize alike here
+        // because the whole float is printed.
+        hasher.update(format!("{}", ai.coverage_threshold).as_bytes());
+        hasher.update(FIELD_SEP);
+        hasher.update(match ai.block_on {
+            crate::config::BlockOn::Malicious => b"malicious".as_slice(),
+            crate::config::BlockOn::Suspicious => b"suspicious".as_slice(),
+        });
+        hasher.update(FIELD_SEP);
+        hasher.update(if ai.block_opaque_executables {
+            b"true".as_slice()
+        } else {
+            b"false".as_slice()
+        });
     }
 
     Ok(hex::encode(hasher.finalize()))

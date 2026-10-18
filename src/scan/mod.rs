@@ -16,7 +16,7 @@
 //! and, inside a full scan, stops at the first failure:
 //!
 //! ```text
-//! advisory lookup -> download -> hash verify -> unpack + plugins -> store clean, cache, serve
+//! advisory lookup -> download -> hash verify -> unpack + plugins -> ai review -> store clean, cache, serve
 //! ```
 //!
 //! Nothing here ever produces [`Decision::Serve`] or a stored
@@ -50,6 +50,7 @@ use tokio::sync::Semaphore;
 
 use crate::advisory::matching::first_blocking;
 use crate::advisory::Advisory;
+use crate::ai::{AiReviewer, ReviewOutcome};
 use crate::artifact_cache::ArtifactCache;
 use crate::config::{Config, ConfigHandle, PluginConfig};
 use crate::db::advisory::AdvisoryStore;
@@ -168,14 +169,26 @@ pub struct ScanRules {
     policy: Arc<Policy>,
     plugins: Vec<PluginConfig>,
     plugin_runner: Arc<PluginRunner>,
+    /// The reviewer, when `[ai_review]` is configured. Travels with the
+    /// policy for the same reason the plugin runner does: the reviewer
+    /// is built from the same config that produced the fingerprint, so
+    /// a scan always runs the review policy its snapshot was built
+    /// under, and a reload swaps the two as one unit.
+    ai_reviewer: Option<Arc<AiReviewer>>,
 }
 
 impl ScanRules {
-    fn new(policy: Policy, plugin_runner: PluginRunner, plugins: Vec<PluginConfig>) -> Self {
+    fn new(
+        policy: Policy,
+        plugin_runner: PluginRunner,
+        plugins: Vec<PluginConfig>,
+        ai_reviewer: Option<Arc<AiReviewer>>,
+    ) -> Self {
         Self {
             policy: Arc::new(policy),
             plugins,
             plugin_runner: Arc::new(plugin_runner),
+            ai_reviewer,
         }
     }
 }
@@ -208,6 +221,11 @@ pub struct Scanner {
 }
 
 impl Scanner {
+    // The argument count is the plan's own interface: every construction
+    // dependency is handed in explicitly, so a test can substitute any
+    // one of them. Grouping them into a builder would hide which callers
+    // replaced which seam, for no gain at eight call sites.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         verdict_store: VerdictStore,
         upstream: Upstream,
@@ -216,6 +234,7 @@ impl Scanner {
         plugin_runner: PluginRunner,
         artifact_cache: ArtifactCache,
         config: Arc<ConfigHandle>,
+        ai_reviewer: Option<Arc<AiReviewer>>,
     ) -> Self {
         let plugins = config.current().plugins.clone();
         let slots = full_scan_slots(config.current().max_concurrent_scans);
@@ -226,6 +245,7 @@ impl Scanner {
                 policy,
                 plugin_runner,
                 plugins,
+                ai_reviewer,
             ))),
             advisory_store: Arc::new(advisory_store),
             artifact_cache: Arc::new(artifact_cache),
@@ -250,14 +270,23 @@ impl Scanner {
     /// [`crate::http::Reloader::apply`], which is the only caller and
     /// which keeps the previous rules in place if any part of that build
     /// fails.
+    ///
+    /// `ai_reviewer` is `None` when the reloaded configuration has no
+    /// `[ai_review]` table: a reload that turns the reviewer off must
+    /// remove it from the snapshot the same way the reverse adds it.
     pub fn apply_reloaded_rules(
         &self,
         policy: Policy,
         plugin_runner: PluginRunner,
         plugins: Vec<PluginConfig>,
+        ai_reviewer: Option<Arc<AiReviewer>>,
     ) {
-        self.rules
-            .store(Arc::new(ScanRules::new(policy, plugin_runner, plugins)));
+        self.rules.store(Arc::new(ScanRules::new(
+            policy,
+            plugin_runner,
+            plugins,
+            ai_reviewer,
+        )));
     }
 
     /// The fingerprint of the policy currently in force.
@@ -689,6 +718,38 @@ impl Scanner {
                 .await
                 .ok();
             return Decision::Refuse { reason, why_id };
+        }
+
+        // The AI-review gate, immediately after the plugins and before
+        // the clean verdict is stored. Uses the `rules` snapshot's
+        // reviewer, never a live config read, so a scan finishes under
+        // the review policy it started with even if a reload lands
+        // mid-scan. A `Blocked` review is stored like a plugin refusal:
+        // a durable verdict the allowlist can override. An
+        // `Unverifiable` review stores nothing, exactly like a check
+        // failure, so a later request re-attempts rather than being
+        // stuck behind a review that never happened.
+        //
+        // Allowlisted artifacts never reach here: `decide_inner` sends
+        // them down the fetch path before any scan starts, so an
+        // allowlist entry for a package+version is a human sign-off
+        // that skips the review as it skips every other check.
+        if let Some(reviewer) = rules.ai_reviewer.as_ref() {
+            match reviewer.review(key, unpack_dir.path(), fingerprint).await {
+                ReviewOutcome::Clean => {}
+                ReviewOutcome::Blocked(reason) => {
+                    cleanup_fresh_download(&artifact_path, freshly_downloaded);
+                    let why_id = self
+                        .store_verdict(key, &Verdict::Blocked(reason.clone()), fingerprint)
+                        .await
+                        .ok();
+                    return Decision::Refuse { reason, why_id };
+                }
+                ReviewOutcome::Unverifiable(reason) => {
+                    cleanup_fresh_download(&artifact_path, freshly_downloaded);
+                    return Decision::Unverifiable(reason);
+                }
+            }
         }
         drop(unpack_dir);
 
@@ -1325,6 +1386,7 @@ mod tests {
             plugin_runner,
             artifact_cache,
             config_handle,
+            None,
         );
 
         let key = ArtifactKey {

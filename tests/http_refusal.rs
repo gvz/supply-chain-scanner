@@ -107,6 +107,7 @@ fn app_state() -> (tempfile::TempDir, tempfile::TempDir, AppState) {
         plugin_runner,
         artifact_cache,
         Arc::clone(&config_handle),
+        None,
     );
 
     let state = AppState {

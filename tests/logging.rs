@@ -172,6 +172,7 @@ fn build_harness(server: &MockServer) -> Harness {
         PluginRunner::new(Arc::new(NeverCalledSandbox)),
         artifact_cache,
         Arc::clone(&config_handle),
+        None,
     ));
 
     let pypi: Arc<dyn Ecosystem> = Arc::new(PyPi::new(Arc::clone(&ecosystem_upstream)));

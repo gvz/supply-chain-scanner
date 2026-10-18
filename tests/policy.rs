@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use supply_chain_scanner::config::{Config, CveLine, PluginConfig, UnknownSeverity};
+use supply_chain_scanner::config::{
+    AiReviewConfig, BlockOn, Config, CveLine, PluginConfig, UnknownSeverity,
+};
 use supply_chain_scanner::policy::{policy_fingerprint, AdvisoryVerdictInput, Policy};
 
 /// A minimal, fully valid `Config` with no plugins and no allowlist
@@ -50,6 +52,200 @@ fn plugin(name: &str, binary: &Path) -> PluginConfig {
         binary: binary.to_path_buf(),
         timeout: Duration::from_secs(5),
     }
+}
+
+// ---------------------------------------------------------------------------
+// [ai_review] in the fingerprint
+// ---------------------------------------------------------------------------
+
+/// A minimal `[ai_review]` table. Individual tests clone and mutate the
+/// fields the plan pins as fingerprint inputs.
+fn ai_review() -> AiReviewConfig {
+    AiReviewConfig {
+        base_url: "https://provider.example/v1/".parse().unwrap(),
+        model: "gpt-reviewer".to_string(),
+        api_key_env: None,
+        timeout: Duration::from_secs(8),
+        max_payload_bytes: 262_144,
+        max_output_tokens: 1024,
+        coverage_threshold: 0.8,
+        block_on: BlockOn::Malicious,
+        block_opaque_executables: false,
+    }
+}
+
+/// The digest committed below was computed on `main` at commit 4ee4130,
+/// before any `[ai_review]` code touched `policy_fingerprint` (the plain
+/// config, and the two-plugin config, both by running the then-current
+/// fingerprint on that commit). Pinning the literal digest, rather than
+/// recomputing it with today's code, is the whole point: upgrading this
+/// binary must never invalidate a stored verdict in an unconfigured
+/// deployment, and only a fixed expected value can prove that.
+const FINGERPRINT_BEFORE_AI_REVIEW_PLAIN: &str =
+    "251d88bf8c07c0af8efb65abdc1c1c315d194436ba54d93ec0806639f820af45";
+
+/// Same, for a config with two plugins: the `ai_review` absence is
+/// appended after the plugin loop, so a deployment that runs plugins but
+/// no reviewer is pinned too.
+const FINGERPRINT_BEFORE_AI_REVIEW_WITH_PLUGINS: &str =
+    "63a7276e165548815a9c12475361d49a0697781a8190f0f5d494bc06240387c8";
+
+#[test]
+fn a_config_without_ai_review_fingerprints_exactly_as_before() {
+    let fp_plain = policy_fingerprint(&base_config()).expect("fingerprint plain");
+    assert_eq!(
+        fp_plain, FINGERPRINT_BEFORE_AI_REVIEW_PLAIN,
+        "a config with no [ai_review] table must fingerprint identically to the \
+         same config before the reviewer existed, or upgrading this binary \
+         invalidates every stored verdict in an unconfigured deployment"
+    );
+
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let binary_a = plugin_binary(&dir, "yara-malware", b"version one");
+    let binary_b = plugin_binary(&dir, "semgrep", b"semgrep rules");
+    let mut cfg = base_config();
+    cfg.plugins = vec![
+        plugin("yara-malware", &binary_a),
+        plugin("semgrep", &binary_b),
+    ];
+    let fp_plugins = policy_fingerprint(&cfg).expect("fingerprint with plugins");
+    assert_eq!(
+        fp_plugins, FINGERPRINT_BEFORE_AI_REVIEW_WITH_PLUGINS,
+        "a config with plugins but no [ai_review] table must fingerprint \
+         identically to before the reviewer existed"
+    );
+
+    // Same config with ai_review explicitly absent, stated a second way,
+    // for the reader: None appends nothing at all to the hashed bytes.
+    let mut cfg_none = base_config();
+    cfg_none.ai_review = None;
+    assert_eq!(
+        policy_fingerprint(&cfg_none).expect("fingerprint explicit none"),
+        FINGERPRINT_BEFORE_AI_REVIEW_PLAIN
+    );
+}
+
+#[test]
+fn enabling_the_reviewer_changes_the_fingerprint() {
+    let fp_off = policy_fingerprint(&base_config()).expect("fingerprint off");
+    let mut cfg = base_config();
+    cfg.ai_review = Some(ai_review());
+    let fp_on = policy_fingerprint(&cfg).expect("fingerprint on");
+
+    assert_ne!(
+        fp_off, fp_on,
+        "turning the reviewer on must change the fingerprint, or artifacts scanned \
+         clean without a review would keep serving from a verdict that never met it"
+    );
+}
+
+#[test]
+fn changing_the_model_changes_the_fingerprint() {
+    let mut cfg_a = base_config();
+    cfg_a.ai_review = Some(ai_review());
+    let mut cfg_b = base_config();
+    let mut ai = ai_review();
+    ai.model = "gpt-reviewer-v2".to_string();
+    cfg_b.ai_review = Some(ai);
+
+    assert_ne!(
+        policy_fingerprint(&cfg_a).expect("fp a"),
+        policy_fingerprint(&cfg_b).expect("fp b"),
+        "the model is which checks ran; a different model must be a different policy"
+    );
+    // The config really does differ in that field and nothing else.
+    let fp_same = {
+        let mut cfg = base_config();
+        let mut ai = ai_review();
+        ai.model = "gpt-reviewer-v2".to_string();
+        cfg.ai_review = Some(ai);
+        policy_fingerprint(&cfg).expect("fp same")
+    };
+    assert_eq!(
+        policy_fingerprint(&cfg_b).expect("fp b"),
+        fp_same,
+        "two identical configs must agree (sanity for the ne-comparison above)"
+    );
+}
+
+#[test]
+fn changing_the_coverage_threshold_changes_the_fingerprint() {
+    let mut cfg_a = base_config();
+    cfg_a.ai_review = Some(ai_review());
+    let mut cfg_b = base_config();
+    let mut ai = ai_review();
+    ai.coverage_threshold = 0.9;
+    cfg_b.ai_review = Some(ai);
+
+    assert_ne!(
+        policy_fingerprint(&cfg_a).expect("fp a"),
+        policy_fingerprint(&cfg_b).expect("fp b"),
+        "a different coverage threshold blocks different artifacts, so it is a \n         different policy"
+    );
+}
+
+#[test]
+fn changing_block_on_changes_the_fingerprint() {
+    let mut cfg_a = base_config();
+    cfg_a.ai_review = Some(ai_review());
+    let mut cfg_b = base_config();
+    let mut ai = ai_review();
+    ai.block_on = BlockOn::Suspicious;
+    cfg_b.ai_review = Some(ai);
+
+    assert_ne!(
+        policy_fingerprint(&cfg_a).expect("fp a"),
+        policy_fingerprint(&cfg_b).expect("fp b"),
+        "block_on changes which verdicts refuse the artifact, so it is a \n         different policy"
+    );
+}
+
+#[test]
+fn changing_block_opaque_executables_changes_the_fingerprint() {
+    let mut cfg_a = base_config();
+    cfg_a.ai_review = Some(ai_review());
+    let mut cfg_b = base_config();
+    let mut ai = ai_review();
+    ai.block_opaque_executables = true;
+    cfg_b.ai_review = Some(ai);
+
+    assert_ne!(
+        policy_fingerprint(&cfg_a).expect("fp a"),
+        policy_fingerprint(&cfg_b).expect("fp b"),
+        "block_opaque_executables changes which artifacts refuse, so it is \n         a different policy"
+    );
+}
+
+#[test]
+fn changing_the_base_url_leaves_the_fingerprint_alone() {
+    let mut cfg_a = base_config();
+    cfg_a.ai_review = Some(ai_review());
+    let mut cfg_b = base_config();
+    let mut ai = ai_review();
+    ai.base_url = "https://other-provider.example/v1/".parse().unwrap();
+    cfg_b.ai_review = Some(ai);
+
+    assert_eq!(
+        policy_fingerprint(&cfg_a).expect("fp a"),
+        policy_fingerprint(&cfg_b).expect("fp b"),
+        "base_url is operational, like bind: moving to a different provider \n         host must not invalidate a single stored verdict"
+    );
+}
+
+#[test]
+fn changing_the_api_key_env_leaves_the_fingerprint_alone() {
+    let mut cfg_a = base_config();
+    cfg_a.ai_review = Some(ai_review());
+    let mut cfg_b = base_config();
+    let mut ai = ai_review();
+    ai.api_key_env = Some("SCS_OTHER_PROVIDER_KEY".to_string());
+    cfg_b.ai_review = Some(ai);
+
+    assert_eq!(
+        policy_fingerprint(&cfg_a).expect("fp a"),
+        policy_fingerprint(&cfg_b).expect("fp b"),
+        "api_key_env is operational: rotating which variable holds the key \n         changes nothing about which checks ran"
+    );
 }
 
 #[test]

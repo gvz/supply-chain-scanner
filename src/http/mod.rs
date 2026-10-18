@@ -30,10 +30,13 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
 
+use crate::ai::provider::OpenAiCompatible;
+use crate::ai::AiReviewer;
 use crate::artifact_cache::ArtifactCache;
-use crate::config::{Config, ConfigHandle};
+use crate::config::{AiReviewConfig, Config, ConfigHandle};
 use crate::db::advisory::AdvisoryStore;
 use crate::db::index_cache::IndexCache;
+use crate::db::review::ReviewStore;
 use crate::db::verdict::VerdictStore;
 use crate::db::Db;
 use crate::ecosystem::pypi::upstream::Upstream;
@@ -176,11 +179,11 @@ pub struct Wired {
 /// The fail-closed startup sequence, in order: open the database
 /// (migrations run inside [`Db::open`]), build the [`Policy`] (fails if
 /// a configured plugin binary is missing or unreadable), detect the
-/// sandbox only if plugins are configured at all (fails if `bwrap` is
-/// absent from `PATH`), build the [`Scanner`], and run an initial
-/// advisory sync if the mirror is empty. A failure anywhere in that
-/// chain is returned as `Err` — this function never produces a `Wired`
-/// backed by fewer checks than the configuration asked for.
+/// sandbox when plugins or the AI reviewer are configured (fails if
+/// `bwrap` is absent from `PATH`), build the [`Scanner`], and run an
+/// initial advisory sync if the mirror is empty. A failure anywhere in
+/// that chain is returned as `Err` — this function never produces a
+/// `Wired` backed by fewer checks than the configuration asked for.
 ///
 /// Deliberately stops short of binding a listener, spawning the
 /// periodic sync/eviction tickers, or installing the `SIGHUP` reload
@@ -198,7 +201,17 @@ pub async fn bootstrap(config: Config) -> anyhow::Result<Wired> {
 
     let sandbox_factory = default_sandbox_factory();
     let sandbox = sandbox_factory(&config)?;
-    let plugin_runner = PluginRunner::new(sandbox);
+    let plugin_runner = PluginRunner::new(Arc::clone(&sandbox));
+
+    // The reviewer, when `[ai_review]` is present. It reuses the sandbox
+    // built above (the same `bwrap` configuration the plugins get, which
+    // `default_sandbox_factory` already failed closed on), the review
+    // store on this same database, and this process's own executable as
+    // the collector binary it runs under the sandbox.
+    let ai_reviewer = match config.ai_review.as_ref() {
+        Some(cfg) => Some(build_ai_reviewer(cfg, Arc::clone(&sandbox), db.clone())?),
+        None => None,
+    };
 
     let index_cache = IndexCache::new(db.clone());
     let simple_base = config
@@ -243,6 +256,7 @@ pub async fn bootstrap(config: Config) -> anyhow::Result<Wired> {
         plugin_runner,
         artifact_cache,
         Arc::clone(&config_handle),
+        ai_reviewer,
     );
 
     let pypi: Arc<dyn Ecosystem> = Arc::new(PyPi::new(Arc::clone(&ecosystem_upstream)));
@@ -259,6 +273,7 @@ pub async fn bootstrap(config: Config) -> anyhow::Result<Wired> {
         Arc::clone(&state.scanner),
         &config,
         sandbox_factory,
+        db.clone(),
     ));
 
     let router = router(state.clone(), ecosystem_upstream);
@@ -269,6 +284,37 @@ pub async fn bootstrap(config: Config) -> anyhow::Result<Wired> {
         db,
         reloader,
     })
+}
+
+/// Builds the [`AiReviewer`] a configuration calls for, or `None` when
+/// `[ai_review]` is absent. Fails — propagating `Err`, so startup and
+/// reload both keep the fail-closed contract — when the provider cannot
+/// be built (an unresolvable `api_key_env`, an unusable `base_url`) or
+/// this process cannot learn its own executable path. Both reload and
+/// startup share this function, so a reload cannot wire a reviewer that
+/// a cold boot would have refused.
+///
+/// Takes the sandbox the caller already built, not the config's: the
+/// reviewer runs the collector under the same sandbox configuration the
+/// plugins get, and the caller (`bootstrap`, a reload) has already
+/// failed closed on it when the configuration requires a real one.
+fn build_ai_reviewer(
+    cfg: &AiReviewConfig,
+    sandbox: Arc<dyn SandboxRunner>,
+    db: Db,
+) -> anyhow::Result<Arc<AiReviewer>> {
+    let provider = OpenAiCompatible::new(cfg)
+        .context("building the model provider for the [ai_review] table")?;
+    let collector_binary = std::env::current_exe().context(
+        "learning this process's own executable path, which the ai_review collector runs",
+    )?;
+    Ok(Arc::new(AiReviewer::new(
+        cfg.clone(),
+        sandbox,
+        Arc::new(provider),
+        Arc::new(ReviewStore::new(db)),
+        collector_binary,
+    )))
 }
 
 /// A [`SandboxRunner`] that must never actually be invoked: used only
@@ -295,19 +341,21 @@ impl SandboxRunner for NeverCalledSandbox {
 pub type SandboxFactory =
     Arc<dyn Fn(&Config) -> anyhow::Result<Arc<dyn SandboxRunner>> + Send + Sync>;
 
-/// The production sandbox: a real [`BubblewrapSandbox`] when plugins are
-/// configured (failing if `bwrap` is absent, so the proxy never runs
-/// fewer checks than the org asked for), and the panicking
-/// [`NeverCalledSandbox`] stub when the plugin list is empty and
-/// [`PluginRunner::run_all`]'s loop can therefore never reach it.
+/// The production sandbox: a real [`BubblewrapSandbox`] when plugins or
+/// the AI reviewer are configured (failing if `bwrap` is absent, so the
+/// proxy never runs fewer checks than the org asked for), and the
+/// panicking [`NeverCalledSandbox`] stub when neither is configured and
+/// neither [`PluginRunner::run_all`]'s loop nor the reviewer can
+/// therefore ever reach it.
 pub fn default_sandbox_factory() -> SandboxFactory {
     Arc::new(
         |config: &Config| -> anyhow::Result<Arc<dyn SandboxRunner>> {
-            if config.plugins.is_empty() {
+            let sandboxed_checks = !config.plugins.is_empty() || config.ai_review.is_some();
+            if !sandboxed_checks {
                 Ok(Arc::new(NeverCalledSandbox))
             } else {
                 Ok(Arc::new(BubblewrapSandbox::detect().context(
-                    "detecting the bubblewrap sandbox (required because plugins are configured)",
+                    "detecting the bubblewrap sandbox (required because plugins or ai_review are configured)",
                 )?))
             }
         },
@@ -347,7 +395,14 @@ const RESTART_ONLY_FIELDS: &[&str] = &[
 
 /// Configuration fields a reload genuinely applies, for the log line that
 /// says so.
-const RELOADABLE_FIELDS: &[&str] = &["cve", "plugins", "allowlist", "public_url", "scan_budget"];
+const RELOADABLE_FIELDS: &[&str] = &[
+    "cve",
+    "plugins",
+    "allowlist",
+    "public_url",
+    "scan_budget",
+    "ai_review",
+];
 
 /// Which restart-only fields `candidate` changes relative to the values
 /// this process actually booted under.
@@ -409,13 +464,14 @@ impl ReloadSummary {
 /// most of the file, with the fingerprint column no longer identifying
 /// the checks that produced a row.
 ///
-/// `apply` therefore parses, validates, builds the new `Policy` and the
-/// new sandbox *first*, and only swaps anything in once all of that has
-/// succeeded. A failure anywhere — malformed TOML, a `scan_budget` over
-/// the ceiling, a plugin binary that cannot be read, no usable `bwrap`
-/// for a newly added plugin, a restart-only field that changed — returns
-/// `Err` with the previous configuration, policy and sandbox all still in
-/// force. That is [`Policy::build`]'s fail-closed contract extended
+/// `apply` therefore parses, validates, builds the new `Policy`, the new
+/// sandbox and the new reviewer *first*, and only swaps anything in once
+/// all of that has succeeded. A failure anywhere — malformed TOML, a
+/// `scan_budget` over the ceiling, a plugin binary that cannot be read,
+/// no usable `bwrap` for a newly added plugin, an `[ai_review]` table
+/// whose reviewer cannot be built, a restart-only field that changed —
+/// returns `Err` with the previous configuration, policy and checks all
+/// still in force. That is [`Policy::build`]'s fail-closed contract extended
 /// across reload.
 pub struct Reloader {
     config: Arc<ConfigHandle>,
@@ -423,12 +479,15 @@ pub struct Reloader {
     /// The values this process booted under, for [`restart_only_changes`].
     boot: Config,
     sandbox_factory: SandboxFactory,
+    /// The reload's own connection to the database, for rebuilding the
+    /// reviewer's review store against the same SQLite file.
+    db: Db,
 }
 
 impl Reloader {
     /// The production constructor: [`default_sandbox_factory`].
-    pub fn new(config: Arc<ConfigHandle>, scanner: Arc<Scanner>, boot: &Config) -> Self {
-        Self::with_sandbox_factory(config, scanner, boot, default_sandbox_factory())
+    pub fn new(config: Arc<ConfigHandle>, scanner: Arc<Scanner>, boot: &Config, db: Db) -> Self {
+        Self::with_sandbox_factory(config, scanner, boot, default_sandbox_factory(), db)
     }
 
     pub fn with_sandbox_factory(
@@ -436,12 +495,14 @@ impl Reloader {
         scanner: Arc<Scanner>,
         boot: &Config,
         sandbox_factory: SandboxFactory,
+        db: Db,
     ) -> Self {
         Self {
             config,
             scanner,
             boot: boot.clone(),
             sandbox_factory,
+            db,
         }
     }
 
@@ -471,6 +532,21 @@ impl Reloader {
             "building the sandbox for the reloaded configuration; keeping the \
              previous policy",
         )?;
+        // The reviewer is rebuilt here, from the same candidate config that
+        // produced the policy above, so the two can never disagree: a
+        // reload that turns the reviewer on lands a new fingerprint (which
+        // it must, see [`crate::policy`]) and a reviewer sealed to it in one
+        // atomic swap. A build failure keeps the previous reviewer exactly
+        // as a plugin failure keeps the previous plugins.
+        let ai_reviewer = match candidate.ai_review.as_ref() {
+            Some(cfg) => Some(
+                build_ai_reviewer(cfg, Arc::clone(&sandbox), self.db.clone()).context(
+                    "building the ai reviewer for the reloaded configuration; keeping the \
+                     previous policy",
+                )?,
+            ),
+            None => None,
+        };
 
         let summary = ReloadSummary {
             old_fingerprint: self.scanner.fingerprint(),
@@ -486,6 +562,7 @@ impl Reloader {
             policy,
             PluginRunner::new(sandbox),
             candidate.plugins.clone(),
+            ai_reviewer,
         );
 
         tracing::info!(

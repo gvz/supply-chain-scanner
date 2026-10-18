@@ -25,6 +25,7 @@ use wiremock::matchers::{method, path as mock_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use supply_chain_scanner::advisory::Advisory;
+use supply_chain_scanner::ai::AiReviewer;
 use supply_chain_scanner::artifact_cache::ArtifactCache;
 use supply_chain_scanner::config::{Config, ConfigHandle};
 use supply_chain_scanner::db::advisory::AdvisoryStore;
@@ -116,6 +117,11 @@ struct ConfigFile {
     min_severity: f32,
     plugins: Vec<(String, PathBuf)>,
     cache_ttl: &'static str,
+    /// `None` writes no `[ai_review]` table at all (the reviewer is off);
+    /// `Some(text)` writes `text` verbatim under `[ai_review]` header, so
+    /// a test can write either a valid table or a deliberately broken
+    /// one.
+    ai_review: Option<String>,
 }
 
 impl ConfigFile {
@@ -124,6 +130,7 @@ impl ConfigFile {
             min_severity: 9.0,
             plugins: Vec::new(),
             cache_ttl: "1h",
+            ai_review: None,
         }
     }
 
@@ -156,8 +163,38 @@ unknown_severity = "allow"
                 binary = binary.display()
             ));
         }
+        if let Some(ai) = self.ai_review.as_deref() {
+            toml.push_str("\n[ai_review]\n");
+            toml.push_str(ai);
+        }
         std::fs::write(path, toml).expect("write config toml");
     }
+}
+
+/// A valid `[ai_review]` table body: loopback HTTP, small caps, no key.
+/// The provider is never dialed in these tests, so the unreachable port
+/// is fine.
+fn ai_review_table() -> String {
+    r#"base_url = "http://127.0.0.1:9/v1/"
+model = "test-model"
+timeout = "5s"
+max_payload_bytes = 8192
+max_output_tokens = 256
+coverage_threshold = 0.8
+block_on = "malicious"
+block_opaque_executables = false
+"#
+    .to_string()
+}
+
+/// An `[ai_review]` table that fails validation: a `coverage_threshold`
+/// outside 0.0 to 1.0.
+fn invalid_ai_review_table() -> String {
+    r#"base_url = "http://127.0.0.1:9/v1/"
+model = "test-model"
+coverage_threshold = 1.5
+"#
+    .to_string()
 }
 
 /// Everything one reload test drives: one long-lived `Scanner`, the
@@ -198,6 +235,29 @@ impl Harness {
         let policy = Policy::build(Arc::new(config.clone())).expect("build policy");
         let config_handle = Arc::new(ConfigHandle::new(config.clone()));
 
+        // A reviewer for the initial config when it has an `[ai_review]`
+        // table: production startup builds one, so a harness that boots
+        // with the reviewer on must hand the scanner one too, or the
+        // first scan would run without the gate the config promised.
+        // The provider points at an unreachable loopback port, which no
+        // reload test ever dials: the scanner is never asked to decide
+        // here, and the reload under test rebuilds this exact shape.
+        let ai_reviewer = match config.ai_review.as_ref() {
+            Some(cfg) => {
+                let provider = supply_chain_scanner::ai::provider::OpenAiCompatible::new(cfg)
+                    .expect("build the test provider");
+                let store = supply_chain_scanner::db::review::ReviewStore::new(db.clone());
+                Some(Arc::new(AiReviewer::new(
+                    cfg.clone(),
+                    Arc::clone(&sandbox),
+                    Arc::new(provider),
+                    Arc::new(store),
+                    std::env::current_exe().expect("this test's own executable"),
+                )))
+            }
+            None => None,
+        };
+
         let scanner = Arc::new(Scanner::new(
             VerdictStore::new(db.clone()),
             upstream,
@@ -206,6 +266,7 @@ impl Harness {
             PluginRunner::new(Arc::clone(&sandbox)),
             artifact_cache,
             Arc::clone(&config_handle),
+            ai_reviewer,
         ));
 
         let reloader = Reloader::with_sandbox_factory(
@@ -213,6 +274,7 @@ impl Harness {
             Arc::clone(&scanner),
             &config,
             fixed_sandbox_factory(sandbox),
+            db.clone(),
         );
 
         Self {
@@ -241,6 +303,12 @@ impl Harness {
 
     fn reload(&self) -> anyhow::Result<()> {
         self.reloader.apply(&self.config_path).map(|_| ())
+    }
+
+    /// Like [`Harness::reload`], but hands back the reload summary so a
+    /// test can assert on the fingerprints.
+    fn reload_summary(&self) -> anyhow::Result<supply_chain_scanner::http::ReloadSummary> {
+        self.reloader.apply(&self.config_path)
     }
 
     fn seed_advisory(&self, package: &str, version: &str, severity: f32) {
@@ -513,5 +581,191 @@ async fn reload_naming_a_restart_only_field_is_rejected_and_names_it() {
         harness.config.current().cache_ttl,
         Duration::from_secs(60 * 60),
         "a rejected reload must change nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 9: the reviewer under reload
+// ---------------------------------------------------------------------------
+
+/// The environment variable the reload tests' `[ai_review]` tables name.
+/// It must resolve, or `Config::load` rejects the table; set once here
+/// and confirmed to exist, with a value no test ever sends anywhere.
+const RELOAD_KEY_ENV: &str = "SCS_RELOAD_TEST_KEY";
+
+/// The fingerprint with the reviewer on must differ from the same config\n/// with it off. Turning the reviewer on is a policy change, stored clean\n/// verdicts must not survive it, and the reload is what delivers that.
+#[tokio::test]
+async fn a_reload_can_turn_the_reviewer_on() {
+    // The named key variable must resolve for the [ai_review] table to\n    // validate. A parallel test could have set it already; setting it\n    // again with the same value changes nothing for that test.
+    std::env::set_var(RELOAD_KEY_ENV, "set-by-a_reload_can_turn_the_reviewer_on");
+
+    let server = MockServer::start().await;
+    let _ = mount_artifact(&server).await;
+
+    let harness = Harness::new(
+        &server,
+        &ConfigFile::new(),
+        FakeSandbox::new::<_, PathBuf>([]),
+    );
+    let fingerprint_before = harness.scanner.fingerprint();
+
+    let mut with_reviewer = ConfigFile::new();
+    with_reviewer.ai_review = Some({
+        let mut table = ai_review_table();
+        // The table body carries no api_key_env line by default; add one
+        // naming the variable set above so the built provider matches
+        // production shape. (A table without one is equally valid.)
+        table.push_str(&format!("api_key_env = \"{RELOAD_KEY_ENV}\"\n"));
+        table
+    });
+    harness.rewrite(&with_reviewer);
+
+    let summary = harness
+        .reload_summary()
+        .expect("the reload itself must succeed");
+    assert_ne!(
+        summary.new_fingerprint, fingerprint_before,
+        "turning the reviewer on must change the policy fingerprint"
+    );
+    assert_eq!(
+        harness.scanner.fingerprint(),
+        summary.new_fingerprint,
+        "the scanner must run under the reloaded fingerprint"
+    );
+    assert!(
+        harness.config.current().ai_review.is_some(),
+        "the reloaded config snapshot must carry the ai_review table"
+    );
+}
+
+/// Turning the reviewer off is the same contract in reverse: the
+/// fingerprint returns to the reviewer-less digest, so artifacts scanned
+/// under the reviewing policy are rescanned rather than served from a
+/// verdict a review produced.
+#[tokio::test]
+async fn a_reload_can_turn_the_reviewer_off() {
+    std::env::set_var(RELOAD_KEY_ENV, "set-by-a_reload_can_turn_the_reviewer_off");
+
+    let server = MockServer::start().await;
+    let _ = mount_artifact(&server).await;
+
+    let mut initial = ConfigFile::new();
+    initial.ai_review = Some(ai_review_table());
+    let harness = Harness::new(&server, &initial, FakeSandbox::new::<_, PathBuf>([]));
+    let fingerprint_with_reviewer = harness.scanner.fingerprint();
+
+    let without = ConfigFile::new();
+    harness.rewrite(&without);
+
+    let summary = harness.reload_summary().expect("the reload must succeed");
+    assert_ne!(
+        summary.new_fingerprint, fingerprint_with_reviewer,
+        "turning the reviewer off must change the policy fingerprint"
+    );
+    // And specifically back to a digest with no ai_review contribution:
+    // the plain-config fingerprint this same file produces without the
+    // table.
+    let plain_fp = {
+        let harness_plain = Harness::new(
+            &server,
+            &ConfigFile::new(),
+            FakeSandbox::new::<_, PathBuf>([]),
+        );
+        harness_plain.scanner.fingerprint()
+    };
+    assert_eq!(
+        harness.scanner.fingerprint(),
+        plain_fp,
+        "with the table gone the fingerprint must be exactly the one a \
+         config that never had it produces"
+    );
+    assert!(
+        harness.config.current().ai_review.is_none(),
+        "the reloaded config snapshot must not carry an ai_review table"
+    );
+}
+
+/// A reload whose `[ai_review]` table fails validation is rejected like a
+/// missing plugin binary: the previously running config, policy and
+/// reviewer all stay in force, and the reload returns `Err`.
+#[tokio::test]
+async fn a_reload_whose_ai_review_table_is_invalid_keeps_the_running_policy() {
+    std::env::set_var(
+        RELOAD_KEY_ENV,
+        "set-by-a_reload_whose_ai_review_table_is_invalid",
+    );
+
+    let server = MockServer::start().await;
+    let (filename, sha256) = mount_artifact(&server).await;
+
+    let harness = Harness::new(
+        &server,
+        &ConfigFile::new(),
+        FakeSandbox::new::<_, PathBuf>([]),
+    );
+    let key = key_for(&sha256, &filename);
+    let entry = entry_for(&server, &filename, &sha256);
+
+    let before = harness.scanner.decide(&key, &entry).await;
+    assert!(matches!(before, Decision::Serve(_)), "{before:?}");
+    let fingerprint_before = harness.scanner.fingerprint();
+
+    let mut broken = ConfigFile::new();
+    broken.ai_review = Some(invalid_ai_review_table());
+    harness.rewrite(&broken);
+
+    let err = harness
+        .reload()
+        .expect_err("a reload with an invalid [ai_review] table must fail");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("coverage_threshold") || message.contains("ai_review"),
+        "the rejection must name the ai_review problem, got {message}"
+    );
+
+    assert_eq!(
+        harness.scanner.fingerprint(),
+        fingerprint_before,
+        "a rejected reload must leave the policy fingerprint untouched"
+    );
+    assert!(
+        harness.config.current().ai_review.is_none(),
+        "a rejected reload must leave the previous config in place"
+    );
+
+    let after = harness.scanner.decide(&key, &entry).await;
+    assert!(
+        matches!(after, Decision::Serve(_)),
+        "the proxy must keep serving under the old policy after a rejected \
+         reload, got {after:?}"
+    );
+}
+
+/// `ai_review` is a reloadable field: adding the table must never trip the\n/// restart-only rejection, and the module's public field list must not\n/// name it there. This test exists because the two lists are hand-kept\n/// and a future field could land in the wrong one silently.
+#[test]
+fn ai_review_is_not_a_restart_only_field() {
+    // Observed through behavior rather than a private const: a reload that\n    // adds [ai_review] must not be rejected as a restart-only change.\n    // `a_reload_can_turn_the_reviewer_on` above already proves the\n    // behavior end to end; the assertion here pins the source, which is\n    // the only place the field lists live.
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/http/mod.rs"))
+        .expect("read the http module source");
+    let restart_only_block = source
+        .split("RESTART_ONLY_FIELDS")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .expect("the const must exist");
+    assert!(
+        !restart_only_block.contains("ai_review"),
+        "ai_review must not appear in RESTART_ONLY_FIELDS: the reviewer is \
+         rebuilt on reload, so a restart would be demanded for a change a \
+         SIGHUP delivers"
+    );
+    let reloadable_block = source
+        .split("RELOADABLE_FIELDS")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .expect("the const must exist");
+    assert!(
+        reloadable_block.contains("ai_review") && !reloadable_block.contains("restart_only"),
+        "ai_review must appear in RELOADABLE_FIELDS so the startup log and the \
+         reload log line both tell the operator the truth"
     );
 }

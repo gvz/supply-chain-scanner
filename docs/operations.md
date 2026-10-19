@@ -432,12 +432,25 @@ convenience of one place to look, but they are not the case it exists to solve.
 A database error renders a 500 and never an empty table, because "nothing was
 refused" and "the refusals could not be read" are different answers.
 
-**What is wired today.** The config table, its fingerprint contribution, the
-sparse-index client, the cargo-vet parser, store and sync, the cascade decision
-core, and `/refusals` exist and are tested. The cargo bootstrap path, the index
-and download handlers, and the two periodic tickers are not wired into the binary
-yet. Until they are, a `[cargo_registry]` table changes the policy fingerprint
-and nothing at request time, and the process still boots the PyPI path.
+**Startup dispatch.** The binary checks for a `[cargo_registry]` table. If the
+table is present, the process boots the cargo path. If the table is absent, the
+process boots the PyPI path. No process serves both ecosystems.
+
+The cargo path builds its parts in this order: the database, the policy, the
+plugin sandbox, the plugin runner, the AI reviewer, the artifact cache, the
+upstream client, the advisory mirror, the cargo-vet audit store, the cascade
+scanner, and the router. A failure anywhere in that chain stops startup. It
+never produces a process that runs fewer checks than the config asked for.
+
+The first start does two syncs before it serves a request. It syncs the
+`crates.io` advisory mirror when the mirror is empty. It syncs the cargo-vet
+audit store when that store is empty. After startup, two tickers keep both
+stores current.
+
+**SIGHUP does not reload a cargo deployment.** Configuration reload is a
+deployment feature of the PyPI path only. A cargo deployment logs a warning at
+startup and installs no signal handler. To change the config of a cargo
+deployment, restart the process.
 
 ## The crate version the proxy cannot see
 
@@ -472,11 +485,7 @@ An operator or a developer should do this, in order:
    index declared.
 
 Step 2 costs nothing and fixes the common case. Step 3 is an explicit human
-decision, recorded in the config, and that is the right place for it. Both steps
-describe the intended behaviour of the cargo path. The section above records
-which parts of it are wired today. An allowlist override reaches cargo only once
-the cargo bootstrap path is connected, and until then this limitation has no
-workaround on the proxy side.
+decision, recorded in the config, and that is the right place for it.
 
 ## Known defects, not yet fixed
 

@@ -1,8 +1,8 @@
 //! Integration tests for `supply_chain_scanner::db` (SQLite store, migrations,
 //! per-artifact verdict store).
 
-use supply_chain_scanner::db::Db;
 use supply_chain_scanner::db::verdict::VerdictStore;
+use supply_chain_scanner::db::Db;
 use supply_chain_scanner::model::{ArtifactKey, RefusalReason, Verdict};
 
 const FINGERPRINT_A: &str = "fingerprint-a";
@@ -297,11 +297,9 @@ fn a_freshly_stored_clean_verdict_is_not_yet_plugin_checked() {
         .put(&k, &Verdict::Clean, FINGERPRINT_A)
         .expect("put clean verdict");
 
-    assert!(
-        !store
-            .is_plugin_checked(&k, FINGERPRINT_A)
-            .expect("is_plugin_checked should succeed")
-    );
+    assert!(!store
+        .is_plugin_checked(&k, FINGERPRINT_A)
+        .expect("is_plugin_checked should succeed"));
 }
 
 #[test]
@@ -320,11 +318,9 @@ fn mark_plugin_checked_flips_it_true() {
         .mark_plugin_checked(&k, FINGERPRINT_A)
         .expect("mark plugin checked");
 
-    assert!(
-        store
-            .is_plugin_checked(&k, FINGERPRINT_A)
-            .expect("is_plugin_checked should succeed")
-    );
+    assert!(store
+        .is_plugin_checked(&k, FINGERPRINT_A)
+        .expect("is_plugin_checked should succeed"));
 }
 
 #[test]
@@ -336,11 +332,9 @@ fn is_plugin_checked_is_false_for_a_fingerprint_with_no_stored_verdict_at_all() 
         "7".repeat(64).as_str(),
     );
 
-    assert!(
-        !store
-            .is_plugin_checked(&k, "never-scanned-fp")
-            .expect("is_plugin_checked should succeed")
-    );
+    assert!(!store
+        .is_plugin_checked(&k, "never-scanned-fp")
+        .expect("is_plugin_checked should succeed"));
 }
 
 #[test]
@@ -382,11 +376,9 @@ fn put_resets_plugin_checked_so_a_rewritten_verdict_re_runs_the_plugin_gate() {
     store
         .mark_plugin_checked(&k, FINGERPRINT_A)
         .expect("mark plugin checked");
-    assert!(
-        store
-            .is_plugin_checked(&k, FINGERPRINT_A)
-            .expect("is_plugin_checked should succeed")
-    );
+    assert!(store
+        .is_plugin_checked(&k, FINGERPRINT_A)
+        .expect("is_plugin_checked should succeed"));
 
     // Rewriting the verdict in place must clear the plugin-checked mark:
     // the plugins that passed before have not passed for this new verdict.

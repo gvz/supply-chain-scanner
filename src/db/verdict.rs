@@ -42,6 +42,35 @@ pub struct StoredVerdict {
     pub fingerprint: String,
 }
 
+/// One blocked artifact as the `/refusals` page lists it: the identifiers
+/// the page prints plus the refusal that caused the block.
+///
+/// This is a separate type rather than a widened [`StoredVerdict`]
+/// because [`StoredVerdict`]'s shape is what every gate reads — the scan
+/// path, `/why`, the plugin-checked bookkeeping — and it deliberately
+/// carries only what a *decision* needs. A listing row needs the
+/// artifact's own name and the human-readable refusal as well, and
+/// adding those fields to `StoredVerdict` would put data no gate reads
+/// on the path of every gate. This type is
+/// read-only page data, so it can grow without touching a single gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedVerdict {
+    /// The id a `/why/<id>` link on the page points at.
+    pub why_id: String,
+    pub package: String,
+    pub version: String,
+    /// The refusal code, e.g. `plugin:fail`. Empty only for a row whose
+    /// `blocked` flag is set without a recorded reason, which
+    /// [`VerdictStore::put`] never writes.
+    pub reason_code: String,
+    /// The refusal detail. This is attacker-influenceable text (it can
+    /// quote what the scan found inside the package), so a renderer must
+    /// HTML-escape it.
+    pub reason_detail: String,
+    /// Unix epoch seconds, as stored.
+    pub scanned_at: i64,
+}
+
 /// The durable record of every artifact this scanner has ever scanned.
 pub struct VerdictStore {
     db: Db,
@@ -231,6 +260,62 @@ impl VerdictStore {
         )
         .optional()
         .context("querying verdict by why_id")
+    }
+
+    /// Lists the most recently blocked artifacts for `ecosystem`, newest
+    /// first, at most `limit` rows.
+    ///
+    /// This is the `/refusals` page's query. It reads the same `verdicts`
+    /// table the gates use and filters on the stored `blocked` flag, so a
+    /// refusal is listed exactly when a row says the artifact was blocked
+    /// — there is no second notion of "recently refused" to drift from
+    /// the first. Insertion order orders the results, because
+    /// `scanned_at` has one-second resolution and two blocks in the same
+    /// second must still have a stable order. The `verdicts` table has no
+    /// integer id column — `why_id` is its primary key — so the ordering
+    /// uses SQLite's implicit `rowid`, which follows insertion order and
+    /// therefore reads the table's history backwards.
+    ///
+    /// No fingerprint filter is applied: this is an audit view of what
+    /// this proxy actually refused, and a row blocked under a superseded
+    /// policy is still something a developer was refused at the time.
+    /// Its `/why` link explains it under its own stored fingerprint.
+    pub fn recent_blocked(
+        &self,
+        ecosystem: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<BlockedVerdict>> {
+        let conn = self.db.conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT why_id, package, version, reason_code, reason_detail, scanned_at
+                 FROM verdicts
+                 WHERE ecosystem = ?1 AND blocked = 1
+                 ORDER BY rowid DESC
+                 LIMIT ?2",
+            )
+            .context("preparing recent_blocked query")?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![ecosystem, i64::try_from(limit).unwrap_or(i64::MAX)],
+                |row| {
+                    Ok(BlockedVerdict {
+                        why_id: row.get(0)?,
+                        package: row.get(1)?,
+                        version: row.get(2)?,
+                        reason_code: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        reason_detail: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        scanned_at: row.get(5)?,
+                    })
+                },
+            )
+            .context("querying recent blocked verdicts")?;
+
+        let mut blocked = Vec::new();
+        for row in rows {
+            blocked.push(row.context("reading recent blocked verdict row")?);
+        }
+        Ok(blocked)
     }
 
     /// Lists the filenames currently blocked for `(ecosystem, package)`

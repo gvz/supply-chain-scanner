@@ -3,8 +3,9 @@
 //! [`AppState`] is shared by every handler; [`router`] wires it to the
 //! actual routes: the PEP 503 simple index passthrough (`simple`), the
 //! download/metadata proxy (`artifact`), the `/why/<id>` explanation page
-//! (`why`), and the reason-phrase refusal responses (`refusal`) every
-//! blocked or unverifiable request falls back to.
+//! (`why`), the `/refusals` listing of recent blocks (`refusals`), and
+//! the reason-phrase refusal responses (`refusal`) every blocked or
+//! unverifiable request falls back to.
 //!
 //! The simple-index and artifact handlers take `Arc<dyn
 //! crate::ecosystem::Ecosystem>` rather than a concrete PyPI type, so this
@@ -17,6 +18,7 @@
 
 pub mod artifact;
 pub mod refusal;
+pub mod refusals;
 pub mod reviews;
 pub mod simple;
 pub mod why;
@@ -61,8 +63,8 @@ pub struct AppState {
 }
 
 /// Builds the router: the simple index, the artifact/metadata proxy,
-/// `/why/<id>`, and `/healthz`. `upstream` is layered on as an
-/// [`Extension`] so the artifact handler can call the PEP 658/714
+/// `/why/<id>`, `/refusals`, `/api/reviews`, and `/healthz`. `upstream`
+/// is layered on as an [`Extension`] so the artifact handler can call the PEP 658/714
 /// metadata sidecar directly (see the module docs) without widening
 /// [`AppState`] or the [`Ecosystem`] trait for a PyPI-only concern.
 pub fn router(state: AppState, upstream: Arc<Upstream>) -> Router {
@@ -75,6 +77,7 @@ pub fn router(state: AppState, upstream: Arc<Upstream>) -> Router {
         )
         .route("/why/{id}", get(why::why_handler))
         .route("/api/reviews", get(reviews::reviews_handler))
+        .route("/refusals", get(refusals::refusals_handler))
         .layer(Extension(upstream))
         .layer(axum::middleware::from_fn(access_log))
         .with_state(state)

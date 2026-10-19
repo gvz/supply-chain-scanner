@@ -1,5 +1,8 @@
 //! Cargo/crates.io ecosystem support.
 
+pub mod index;
+pub mod upstream;
+
 /// Normalizes a crate name the way crates.io does: lowercase it, then
 /// replace every `_` with `-`.
 ///

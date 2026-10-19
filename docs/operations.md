@@ -330,6 +330,154 @@ placement. Put it where only your developers and CI can reach it.
 available parallelism. The bound matters: each in-flight scan can hold a blocking
 thread for a plugin's whole timeout, and the same pool serves every database call.
 
+## Running a cargo/crates.io deployment
+
+A cargo deployment is this same binary with a different config file. One process
+serves one ecosystem. A config file that carries a `[cargo_registry]` table is
+therefore the cargo deployment, and a config file without one is the PyPI
+deployment. The split is deliberate. `Config` carries a single `upstream_url`, and
+the HTTP layer routes nothing by ecosystem, so a second deployment is the change
+that fits what is there. A developer points cargo at the proxy with a source
+replacement in `.cargo/config.toml`, and nothing else on the machine changes,
+exactly as `index-url` works for pip.
+
+**Settings and defaults.** Every default below comes from `src/config.rs`.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `upstream_index_url` | required | The sparse index this proxy fetches crate metadata from. Normally `https://index.crates.io/`. |
+| `cargo_vet_sync_interval` | 1h | How often the local cargo-vet audit store is refreshed from every configured source. |
+| `cargo_vet_sources` | empty | The trusted cargo-vet audit sets to fetch. Each entry is a `name` for logs and errors and the `url` of that source's `audits.toml`. Empty leaves the fast path with no proof to consult. |
+| `required_criterion` | `safe-to-deploy` | The criterion an audit must carry to stand in for AI review. Set `safe-to-run` for the looser bar. |
+| `trusted_reviewers` | empty | The specific auditors whose entry counts, when the list is not empty. Empty means any entry from a trusted source counts, by whoever audited it. |
+
+The table is additive. The base fields stay required in a cargo deployment —
+`bind`, `db_path`, `cache_dir`, `upstream_url`, `public_url`, `scan_budget` and
+`[cve]` — because one `Config` type parses both deployments. The cargo path does
+not read `upstream_url`, but the field must still be present and valid.
+
+Set `advisory_source_url` to the crates.io OSV feed in a cargo deployment. The
+default points at the PyPI feed. The mirrors are per ecosystem, so a cargo
+deployment that keeps the default syncs the wrong advisory data.
+
+**The cargo-vet fast path.** A version carries a qualifying audit when two things
+hold. A trusted source recorded an audit of that exact crate and version against
+`required_criterion`. And `trusted_reviewers` accepts the auditor who signed it.
+Such a version skips AI review, because a human already read it. The fast path
+never replaces CVE filtering and never replaces the plugin gate. Those two
+check different things from "a person read this", and a static trust database
+cannot answer either of them.
+
+**What a reload invalidates.** `required_criterion` and the cargo-vet source
+list — each name and URL, in config order — are part of the policy fingerprint.
+Editing either one invalidates every stored verdict, because both decide what
+this deployment accepts as proof. `trusted_reviewers` stays out of the
+fingerprint, for the same reason the allowlist does. It narrows who is trusted,
+rather than changing what is checked. Editing it must therefore not force a
+rescan of the whole crate ecosystem.
+
+**Two sync tickers, on two intervals.** The crates.io advisory mirror re-syncs
+every `advisory_sync_interval`, from `advisory_source_url`. The cargo-vet audit
+store re-syncs every `cargo_vet_sync_interval`, which defaults to one hour. Both
+exist for the same reason as the PyPI advisory mirror. A check that runs on every
+request must not turn an upstream outage into a proxy outage.
+
+The two tickers fail differently. A failed OSV sync keeps the whole existing
+mirror untouched. A failed cargo-vet sync keeps only that source's last published
+audits, and it still refreshes the other sources. A down Mozilla endpoint must not
+stop Google's audits or the org's own from updating. On the intended startup order
+both stores sync before the listener binds, so a cold start includes two
+downloads.
+
+**What a developer's machine needs.** One source replacement, in
+`~/.cargo/config.toml` or in the repository's own `.cargo/config.toml`:
+
+```toml
+[source.crates-io]
+replace-with = "scanner"
+
+[source.scanner]
+registry = "sparse+https://cargo.scanner.example.internal/"
+```
+
+Use this deployment's `public_url` as the sparse root. Cargo then resolves every
+crate through the proxy and believes it is talking to crates.io. Cargo's own
+`[http] timeout` defaults to 30 seconds, and the cascade has to finish inside it,
+the same way `scan_budget` has to stay under pip's 15 seconds. A developer who
+lowers that timeout below the work the cascade needs sees resolution failures
+that are not refusals.
+
+**Where the gate sits is different from PyPI.** CVE filtering and AI review run
+at the sparse-index response, which is what `cargo add` exercises. Org plugins
+run at the `.crate` download, which normally happens at the `cargo build` or
+`cargo check` that follows. That split has a consequence worth knowing. A version
+that appears in the index response is *admitted*, and not fully scanned. It
+cleared CVE and either AI review or a cargo-vet audit. Only a version that was
+also downloaded has had the plugins run against it.
+
+The split also decides how a refusal reaches a person. Cargo's sparse-index
+protocol gives an index-time refusal no place to put a reason phrase. A blocked
+version is therefore simply absent from a successful response, and cargo reports
+its own "no matching version". A plugin refusal happens on a real download, so it
+arrives as a status line and a `/why` link, the same way a PyPI refusal does.
+
+**`GET /refusals` is the compensating channel.** It is an unauthenticated HTML
+page on this deployment's `public_url`. It lists the most recent blocks for this
+deployment's own ecosystem, newest first, up to the last 100. Each row carries
+the crate, the version, the refusal code, the detail, and a link to that
+refusal's `/why/<id>`. It exists because the index-time case is otherwise silent.
+A developer whose resolution failed has no other place to learn that the version
+was blocked rather than broken. Plugin refusals appear on the page too, for the
+convenience of one place to look, but they are not the case it exists to solve.
+A database error renders a 500 and never an empty table, because "nothing was
+refused" and "the refusals could not be read" are different answers.
+
+**What is wired today.** The config table, its fingerprint contribution, the
+sparse-index client, the cargo-vet parser, store and sync, the cascade decision
+core, and `/refusals` exist and are tested. The cargo bootstrap path, the index
+and download handlers, and the two periodic tickers are not wired into the binary
+yet. Until they are, a `[cargo_registry]` table changes the policy fingerprint
+and nothing at request time, and the process still boots the PyPI path.
+
+## The crate version the proxy cannot see
+
+Cargo's sparse-index request carries no version. The bytes are identical for
+`cargo add foo`, for `cargo add foo@1.2.3`, and for a transitive dependency that
+nobody named on a command line. So the proxy picks the review candidate itself:
+the newest version that is CVE-clean, not yanked, and not already cached.
+
+That rule is what makes an unconstrained `cargo add foo` fast after the first
+touch, and it is also the known limitation. An explicit pin can name a version
+that was never the newest unscanned candidate. That version is absent from the
+forwarded list, so `cargo add foo@1.2.3` fails to resolve. The pin is not bad.
+The proxy had no mechanism to reach it. A version becomes reviewable only by
+being, at some point, the next candidate in the newest-first walk.
+
+The failure has the same shape as a CVE block. The version is missing from an
+otherwise successful response, and cargo reports that no matching version exists.
+An operator or a developer should do this, in order:
+
+1. Open `/refusals` on the proxy. This rules out a genuine refusal with a reason
+   behind it, which needs a different answer.
+2. Re-run the same `cargo add`. Each request continues the review walk from where
+   the cache left it. The versions ahead of the pin are then resolved, one request
+   at a time. When a candidate fails review, the walk moves to the next-newest
+   version. When the cascade exhausts its budget instead, it answers with the
+   retryable "still working" response and continues in the background, so wait and
+   re-run.
+3. If the pin is still absent after the walk reaches it, or the walk reviewed it
+   and the review failed, manually review the crate. Then add a `[[allowlist]]`
+   entry for that package and version. The allowlist lifts the verdict, and it
+   never lifts the hash check: the bytes still have to match the checksum the
+   index declared.
+
+Step 2 costs nothing and fixes the common case. Step 3 is an explicit human
+decision, recorded in the config, and that is the right place for it. Both steps
+describe the intended behaviour of the cargo path. The section above records
+which parts of it are wired today. An allowlist override reaches cargo only once
+the cargo bootstrap path is connected, and until then this limitation has no
+workaround on the proxy side.
+
 ## Known defects, not yet fixed
 
 Recorded honestly so nobody rediscovers them the hard way.

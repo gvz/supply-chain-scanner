@@ -17,6 +17,7 @@
 //! `AppState`.
 
 pub mod artifact;
+pub mod cargo_index;
 pub mod refusal;
 pub mod refusals;
 pub mod reviews;

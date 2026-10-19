@@ -9,6 +9,7 @@
 //! persisted.
 
 pub mod matching;
+pub mod matching_semver;
 pub mod osv;
 
 /// One advisory as it applies to a single affected package: everything

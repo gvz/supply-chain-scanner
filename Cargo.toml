@@ -46,6 +46,7 @@ cvss = "3"
 serde_json = "1"
 tempfile = "3"
 pep440_rs = "0.7"
+semver = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "tower-log"] }
 hyper = { version = "1", features = ["http1"] }
 async-trait = "0.1"

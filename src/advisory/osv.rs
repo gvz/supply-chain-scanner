@@ -22,7 +22,7 @@ use url::Url;
 
 use super::{Advisory, VersionRange};
 use crate::db::advisory::AdvisoryStore;
-use crate::ecosystem::pypi::index::normalize_name;
+use crate::ecosystem::pypi::index::normalize_name as pypi_normalize;
 
 /// The ecosystem name OSV-mirrored PyPI advisories are stored under,
 /// matching what [`crate::db::advisory::AdvisoryStore`] keys rows by.
@@ -114,6 +114,24 @@ struct OsvEvent {
 /// `Some(f32::NAN)`), so the result stays correct even if a future OSV
 /// shape ever made severity vary per entry.
 pub fn parse_osv(json: &str) -> anyhow::Result<Vec<Advisory>> {
+    parse_osv_with_normalizer(json, pypi_normalize)
+}
+
+/// [`parse_osv`], with the package-name normalizer supplied by the caller
+/// instead of hardcoded to PEP 503.
+///
+/// Each ecosystem keys its advisories by its own name-collision rule, and
+/// they differ: crates.io treats `serde_json` and `serde-json` as the same
+/// crate but leaves dots alone, while PEP 503 also collapses dots. The
+/// caller passes the normalizer for the ecosystem whose feed it is
+/// parsing (e.g. [`crate::ecosystem::cargo::normalize_name`] for
+/// crates.io), so the stored key matches what that ecosystem's lookups
+/// will use. Everything else — merging repeated affected entries,
+/// withdrawing, severity — is identical to [`parse_osv`].
+pub fn parse_osv_with_normalizer(
+    json: &str,
+    normalize: impl Fn(&str) -> String,
+) -> anyhow::Result<Vec<Advisory>> {
     let doc: OsvDoc = serde_json::from_str(json).context("parsing OSV JSON document")?;
 
     // A withdrawn advisory produces nothing. This is not a nicety: the
@@ -146,7 +164,7 @@ pub fn parse_osv(json: &str) -> anyhow::Result<Vec<Advisory>> {
     let mut index_by_package: HashMap<String, usize> = HashMap::new();
 
     for affected in &doc.affected {
-        let package = normalize_name(&affected.package.name);
+        let package = normalize(&affected.package.name);
         let ranges: Vec<VersionRange> = affected
             .ranges
             .iter()
@@ -343,16 +361,34 @@ impl OsvSync {
     /// `Err` without ever touching the store, so the previous mirror is
     /// left exactly as it was.
     pub async fn sync_pypi(&self) -> anyhow::Result<usize> {
+        self.sync(PYPI_ECOSYSTEM, pypi_normalize).await
+    }
+
+    /// Downloads `source_url`, parses every entry with `normalize` applied
+    /// to each package name, and atomically replaces the `ecosystem`
+    /// store's advisories with the freshly parsed set.
+    ///
+    /// This is the ecosystem-pluggable form of [`OsvSync::sync_pypi`]:
+    /// `source_url` must point at that ecosystem's own OSV `all.zip`, and
+    /// `normalize` at its name-collision rule, so the stored key matches
+    /// what the ecosystem's lookups use. The atomicity contract is the
+    /// same as `sync_pypi`'s — nothing reaches the store until every
+    /// document has parsed.
+    pub async fn sync(
+        &self,
+        ecosystem: &str,
+        normalize: impl Fn(&str) -> String + Copy,
+    ) -> anyhow::Result<usize> {
         let download = download_to_temp_file(&self.http, &self.source_url)
             .await
             .context("downloading OSV advisory feed")?;
 
-        let advisories = parse_zip_advisories(download.path())
+        let advisories = parse_zip_advisories(download.path(), normalize)
             .context("parsing downloaded OSV advisory feed")?;
 
         self.store
-            .replace_all(PYPI_ECOSYSTEM, &advisories)
-            .context("replacing the PyPI advisory mirror")
+            .replace_all(ecosystem, &advisories)
+            .with_context(|| format!("replacing the {ecosystem} advisory mirror"))
     }
 }
 
@@ -397,10 +433,14 @@ async fn download_to_temp_file(
 }
 
 /// Reads every entry of the zip at `path` as a UTF-8 OSV JSON document and
-/// parses it with [`parse_osv`], collecting every advisory produced. A zip
+/// parses it with [`parse_osv_with_normalizer`] under `normalize`,
+/// collecting every advisory produced. A zip
 /// that fails to open, or any entry that fails to read or parse, is an
 /// error — never a silently partial result.
-fn parse_zip_advisories(path: &Path) -> anyhow::Result<Vec<Advisory>> {
+fn parse_zip_advisories(
+    path: &Path,
+    normalize: impl Fn(&str) -> String + Copy,
+) -> anyhow::Result<Vec<Advisory>> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("opening downloaded advisory feed at {}", path.display()))?;
     let mut archive = zip::ZipArchive::new(file).context("reading advisory feed as a zip")?;
@@ -423,7 +463,7 @@ fn parse_zip_advisories(path: &Path) -> anyhow::Result<Vec<Advisory>> {
             .read_to_string(&mut contents)
             .with_context(|| format!("reading contents of zip entry {name:?}"))?;
 
-        let parsed = parse_osv(&contents)
+        let parsed = parse_osv_with_normalizer(&contents, normalize)
             .with_context(|| format!("parsing OSV document in zip entry {name:?}"))?;
         advisories.extend(parsed);
     }

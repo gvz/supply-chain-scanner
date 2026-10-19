@@ -38,6 +38,7 @@
 //! so a developer's retry lands on a stored decision instead of
 //! restarting the scan from zero.
 
+pub mod cargo;
 pub mod cargo_cascade;
 pub mod coordinator;
 

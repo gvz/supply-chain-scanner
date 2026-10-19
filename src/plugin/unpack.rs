@@ -110,9 +110,9 @@ fn escape(message: impl Into<String>) -> anyhow::Error {
 /// Extracts `archive` into `dest`, creating `dest` if it does not exist.
 ///
 /// The archive format is chosen from `archive`'s file name: `.whl`, `.zip`
-/// and `.egg` are read as zip, `.tar.gz` and `.tgz` as gzipped tar.
-/// Anything else is an error rather than a guess — an unrecognized artifact
-/// that "extracted" to nothing would sail past every plugin.
+/// and `.egg` are read as zip, `.tar.gz`, `.tgz` and `.crate` as gzipped
+/// tar. Anything else is an error rather than a guess — an unrecognized
+/// artifact that "extracted" to nothing would sail past every plugin.
 ///
 /// On any error the contents of `dest` are removed, so a caller can never
 /// hand a plugin a half-extracted package. `dest` must therefore be a
@@ -174,10 +174,15 @@ impl ArchiveKind {
 
         if name.ends_with(".whl") || name.ends_with(".zip") || name.ends_with(".egg") {
             Ok(Self::Zip)
-        } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".crate") {
+            // A published `.crate` is a gzipped tar of the crate's
+            // sources, so the PyPI sdist reader handles it unchanged.
             Ok(Self::TarGz)
         } else {
-            bail!("unsupported archive format for {name}; expected a wheel/zip or a .tar.gz sdist")
+            bail!(
+                "unsupported archive format for {name}; expected a wheel/zip, \
+                 a .tar.gz sdist, or a .crate"
+            )
         }
     }
 }
@@ -490,4 +495,49 @@ fn clear_dir(dir: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("removing {}", path.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    use super::unpack;
+
+    /// Writes a gzipped tar holding one file into `path`, in the shape a
+    /// published `.crate` has.
+    fn write_crate(path: &std::path::Path) {
+        let file = fs::File::create(path).expect("create crate fixture");
+        let mut builder = tar::Builder::new(GzEncoder::new(file, Compression::fast()));
+        let body = b"fn main() {}\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "demo-1.0.0/src/main.rs", &body[..])
+            .expect("append crate entry");
+        builder.finish().expect("finish crate fixture");
+    }
+
+    #[test]
+    fn a_crate_archive_is_unpacked_as_a_gzipped_tar() {
+        // A `.crate` is a gzipped tar, so the sdist reader must accept it
+        // without a `.tar.gz` suffix to recognize. Task 5's cascade hands
+        // `unpack` exactly this file name.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let crate_path = dir.path().join("demo-1.0.0.crate");
+        write_crate(&crate_path);
+
+        let dest = dir.path().join("out");
+        unpack(&crate_path, &dest).expect("a .crate must unpack");
+
+        let extracted = dest.join("demo-1.0.0/src/main.rs");
+        assert_eq!(
+            fs::read_to_string(&extracted).expect("read the extracted file"),
+            "fn main() {}\n"
+        );
+    }
 }

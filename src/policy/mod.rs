@@ -11,9 +11,11 @@
 //! The allowlist is deliberately excluded from the fingerprint. It is an
 //! override applied at request time, not an input that changes what a
 //! scan examines, so adding an allowlist entry must never invalidate
-//! verdicts already stored under the current policy. The same reasoning
-//! excludes `bind` and `cache_ttl`: they are operational knobs, not scan
-//! inputs. The one implementation of that request-time override is
+//! verdicts already stored under the current policy. `[cargo_registry]`'s
+//! `trusted_reviewers` is excluded for the same reason: it narrows who is
+//! trusted, not what is checked. The same reasoning excludes `bind` and
+//! `cache_ttl`: they are operational knobs, not scan inputs. The one
+//! implementation of that request-time override is
 //! [`crate::scan::is_allowlisted`], which reads the live config snapshot;
 //! this module deliberately offers no second copy of that comparison.
 
@@ -54,6 +56,18 @@ const FIELD_SEP: &[u8] = &[0u8];
 /// config on a binary built before the reviewer existed. Upgrading this
 /// proxy never invalidates a stored verdict by the mere presence of the
 /// new code.
+///
+/// A config with `[cargo_registry]` set appends, in order: the marker
+/// `cargo_registry`, the required cargo-vet criterion, then — in config
+/// list order — each cargo-vet source's name and URL. The criterion and
+/// the source list decide what a cargo deployment accepts as proof that a
+/// version is safe, so both change what gets checked. `trusted_reviewers`
+/// stays out for the same reason the allowlist does: narrowing or
+/// widening who is trusted is an operational judgment call applied at
+/// request time, not a change to what is examined, so editing that list
+/// must never invalidate a verdict already stored. A config with no
+/// `[cargo_registry]` table appends nothing, by the same reasoning as
+/// `[ai_review]` above.
 pub fn policy_fingerprint(cfg: &Config) -> anyhow::Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(serialize_cve_line(&cfg.cve).as_bytes());
@@ -100,6 +114,22 @@ pub fn policy_fingerprint(cfg: &Config) -> anyhow::Result<String> {
         } else {
             b"false".as_slice()
         });
+    }
+
+    if let Some(registry) = cfg.cargo_registry.as_ref() {
+        hasher.update(FIELD_SEP);
+        hasher.update(b"cargo_registry");
+        hasher.update(FIELD_SEP);
+        hasher.update(registry.required_criterion.as_bytes());
+
+        // `trusted_reviewers` is deliberately absent: see this function's
+        // doc comment.
+        for source in &registry.cargo_vet_sources {
+            hasher.update(FIELD_SEP);
+            hasher.update(source.name.as_bytes());
+            hasher.update(FIELD_SEP);
+            hasher.update(source.url.as_str().as_bytes());
+        }
     }
 
     Ok(hex::encode(hasher.finalize()))

@@ -79,6 +79,7 @@ fn base_config() -> Config {
             block_on: BlockOn::Malicious,
             block_opaque_executables: false,
         }),
+        cargo_registry: None,
     }
 }
 

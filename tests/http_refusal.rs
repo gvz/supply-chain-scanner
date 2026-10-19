@@ -70,6 +70,7 @@ fn base_config() -> Config {
         plugins: Vec::new(),
         max_concurrent_scans: None,
         ai_review: None,
+        cargo_registry: None,
     }
 }
 

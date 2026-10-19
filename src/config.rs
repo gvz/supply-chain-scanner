@@ -74,6 +74,15 @@ pub struct Config {
     /// and an unconfigured deployment behaves as it does today.
     #[serde(default)]
     pub ai_review: Option<AiReviewConfig>,
+    /// The cargo/crates.io deployment's own settings, read from the
+    /// optional `[cargo_registry]` table. Absent means this process runs
+    /// the PyPI deployment, exactly as it does today.
+    ///
+    /// One config file carries either this table or the PyPI settings,
+    /// never both meaningfully: the two ecosystems ship as two
+    /// deployments of the same binary.
+    #[serde(default)]
+    pub cargo_registry: Option<CargoRegistryConfig>,
 }
 
 /// How long an artifact download may take.
@@ -254,6 +263,55 @@ pub struct AiReviewConfig {
     pub block_on: BlockOn,
     #[serde(default)]
     pub block_opaque_executables: bool,
+}
+
+fn default_cargo_vet_sync_interval() -> Duration {
+    Duration::from_secs(60 * 60)
+}
+
+fn default_required_criterion() -> String {
+    "safe-to-deploy".to_string()
+}
+
+/// The cargo/crates.io deployment's settings, read from the optional
+/// `[cargo_registry]` table.
+///
+/// Mirrors [`AiReviewConfig`]: every field that can have a sane default
+/// has one, so a minimal table names only the upstream index.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CargoRegistryConfig {
+    /// The sparse index this proxy fetches crate metadata from, normally
+    /// `https://index.crates.io/`.
+    pub upstream_index_url: Url,
+    /// How often the local cargo-vet audit store is refreshed from every
+    /// configured source.
+    #[serde(with = "humantime_serde", default = "default_cargo_vet_sync_interval")]
+    pub cargo_vet_sync_interval: Duration,
+    /// The trusted cargo-vet audit sets to fetch. Optional — defaults to
+    /// empty, which leaves the fast path with no proof to consult.
+    #[serde(default)]
+    pub cargo_vet_sources: Vec<CargoVetSource>,
+    /// The cargo-vet criterion an audit must carry to stand in for AI
+    /// review. Defaults to `"safe-to-deploy"`, the stricter of the two
+    /// standard criteria, and is fully overridable: an org that sets
+    /// `"safe-to-run"` gets the looser bar.
+    #[serde(default = "default_required_criterion")]
+    pub required_criterion: String,
+    /// The specific auditors whose entry counts, when non-empty. Empty
+    /// means any entry from a trusted source counts, by whoever audited
+    /// it. Optional — defaults to empty.
+    #[serde(default)]
+    pub trusted_reviewers: Vec<String>,
+}
+
+/// One trusted cargo-vet audit set: a name for logs and errors, and the
+/// URL its `audits.toml` is fetched from.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CargoVetSource {
+    pub name: String,
+    pub url: Url,
 }
 
 /// Which model verdicts block the artifact.

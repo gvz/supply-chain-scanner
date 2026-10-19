@@ -37,6 +37,16 @@ const WHEEL_DATA_SUFFIX: &str = ".data";
 /// onto the developer's `PATH` as executables.
 const WHEEL_SCRIPTS_DIR: &str = "scripts";
 
+/// The paths, relative to the unpacked crate root, that execute when a
+/// developer builds or runs the crate: the build script runs before the
+/// crate compiles, and the library root and binary root run when a
+/// dependent crate or the developer calls into them.
+const CARGO_INSTALL_FILE_NAMES: &[&str] = &[
+    "build.rs", //
+    "src/lib.rs",
+    "src/main.rs",
+];
+
 /// The `__init__.py` file name. Only the top-level copy counts as
 /// install surface: importing the package runs it, but sub-package
 /// `__init__.py` files run only when the importer also imports that
@@ -100,6 +110,33 @@ impl InstallSurface for PyPiInstallSurface {
     }
 }
 
+/// The Rust rules. `relative_path` must be relative to the unpacked
+/// crate root; a path that is absolute or escapes the root answers
+/// `false`, because it names no location in the crate.
+///
+/// A proc-macro entry point beyond `src/lib.rs` is not detected here:
+/// that check needs the contents of `Cargo.toml`, which this path-only
+/// trait cannot see.
+pub struct CargoInstallSurface;
+
+impl InstallSurface for CargoInstallSurface {
+    fn is_install_surface(&self, relative_path: &Path) -> bool {
+        // Only normal components name locations inside the crate.
+        // Reject `..`, absolute paths, and prefix separators alike.
+        let mut components = Vec::new();
+        for component in relative_path.components() {
+            match component {
+                Component::Normal(name) => components.push(name.to_string_lossy().into_owned()),
+                Component::CurDir => continue,
+                _ => return false,
+            }
+        }
+
+        let joined = components.join("/");
+        CARGO_INSTALL_FILE_NAMES.contains(&joined.as_str())
+    }
+}
+
 /// Whether `components` names install surface under the wheel shape:
 /// a root-level entry point or `.pth` file, a top-level `__init__.py`,
 /// or a file under `<name>-<version>.data/scripts/`.
@@ -147,7 +184,8 @@ fn looks_like_sdist_root(name: &str) -> bool {
 /// allocation or initialization at scan time.
 pub fn install_surface_for(ecosystem_id: &str) -> Option<&'static dyn InstallSurface> {
     static PYPI: PyPiInstallSurface = PyPiInstallSurface;
-    static SURFACES: &[(&str, &dyn InstallSurface)] = &[("pypi", &PYPI)];
+    static CARGO: CargoInstallSurface = CargoInstallSurface;
+    static SURFACES: &[(&str, &dyn InstallSurface)] = &[("pypi", &PYPI), ("cargo", &CARGO)];
 
     SURFACES
         .iter()
@@ -219,6 +257,39 @@ mod tests {
     #[test]
     fn install_surface_for_returns_none_for_an_unknown_ecosystem() {
         assert!(install_surface_for("npm").is_none());
+    }
+
+    #[test]
+    fn cargo_install_surface_matches_a_root_build_script() {
+        assert!(CargoInstallSurface.is_install_surface(Path::new("build.rs")));
+    }
+
+    #[test]
+    fn cargo_install_surface_matches_the_root_lib_and_main_entry_points() {
+        assert!(CargoInstallSurface.is_install_surface(Path::new("src/lib.rs")));
+        assert!(CargoInstallSurface.is_install_surface(Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn cargo_install_surface_does_not_match_an_ordinary_module() {
+        assert!(!CargoInstallSurface.is_install_surface(Path::new("src/parser.rs")));
+    }
+
+    #[test]
+    fn cargo_install_surface_rejects_paths_that_escape_the_root() {
+        assert!(!CargoInstallSurface.is_install_surface(Path::new("../../etc/passwd")));
+    }
+
+    #[test]
+    fn install_surface_for_resolves_cargo() {
+        let surface = install_surface_for("cargo");
+        assert!(
+            surface.is_some(),
+            "cargo did not resolve to an install surface"
+        );
+        assert!(surface
+            .expect("cargo surface")
+            .is_install_surface(Path::new("build.rs")));
     }
 
     #[test]

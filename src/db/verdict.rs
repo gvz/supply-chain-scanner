@@ -86,6 +86,13 @@ impl VerdictStore {
     /// any fingerprint), it is updated in place and its original `why_id`
     /// is preserved; otherwise a fresh row is inserted with a newly
     /// generated `why_id`. Returns the `why_id` either way.
+    ///
+    /// An update also resets `plugin_checked` to 0. A rewritten verdict is
+    /// a new scan outcome, and the plugin set that passed against the old
+    /// outcome has not been shown to pass against this one — so the plugin
+    /// gate must run again on the next download rather than inherit a stale
+    /// `1`. [`VerdictStore::mark_plugin_checked`] is the only way to set the
+    /// flag back to 1.
     pub fn put(
         &self,
         key: &ArtifactKey,
@@ -114,7 +121,8 @@ impl VerdictStore {
                      reason_code = excluded.reason_code,
                      reason_detail = excluded.reason_detail,
                      fingerprint = excluded.fingerprint,
-                     scanned_at = excluded.scanned_at
+                     scanned_at = excluded.scanned_at,
+                     plugin_checked = 0
                  RETURNING why_id",
                 rusqlite::params![
                     candidate_why_id,
@@ -134,6 +142,63 @@ impl VerdictStore {
             .context("upserting verdict")?;
 
         Ok(why_id)
+    }
+
+    /// Marks the stored verdict for `key` under `fingerprint` as having
+    /// passed the org's plugin set. This is the second phase of the cargo
+    /// path: a `Clean` row from the index cascade is "index-admitted", and
+    /// a later download that runs the plugins to completion calls this to
+    /// record "fully scanned".
+    ///
+    /// It matches on the same identity [`VerdictStore::get`] uses, so a
+    /// mark made under one policy fingerprint is invisible under another —
+    /// a policy change forces the plugins to run again, exactly as it
+    /// forces a rescan. If no row matches, this is a no-op: there is no
+    /// verdict to mark, and the caller that wants one must [`store it
+    /// first`](VerdictStore::put).
+    pub fn mark_plugin_checked(&self, key: &ArtifactKey, fingerprint: &str) -> anyhow::Result<()> {
+        let conn = self.db.conn()?;
+        conn.execute(
+            "UPDATE verdicts SET plugin_checked = 1
+             WHERE ecosystem = ?1 AND package = ?2 AND version = ?3
+               AND filename = ?4 AND sha256 = ?5 AND fingerprint = ?6",
+            rusqlite::params![
+                key.ecosystem,
+                key.package,
+                key.version,
+                key.filename,
+                key.sha256,
+                fingerprint
+            ],
+        )
+        .context("marking verdict plugin-checked")?;
+        Ok(())
+    }
+
+    /// Reports whether the stored verdict for `key` under `fingerprint`
+    /// has already passed the org's plugin set. Returns `false` when no
+    /// row matches, so a caller that has never seen this artifact — or
+    /// sees it under a policy it was not marked under — runs the plugins.
+    pub fn is_plugin_checked(&self, key: &ArtifactKey, fingerprint: &str) -> anyhow::Result<bool> {
+        let conn = self.db.conn()?;
+        let checked: Option<bool> = conn
+            .query_row(
+                "SELECT plugin_checked FROM verdicts
+                 WHERE ecosystem = ?1 AND package = ?2 AND version = ?3
+                   AND filename = ?4 AND sha256 = ?5 AND fingerprint = ?6",
+                rusqlite::params![
+                    key.ecosystem,
+                    key.package,
+                    key.version,
+                    key.filename,
+                    key.sha256,
+                    fingerprint
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("querying plugin_checked by artifact key and fingerprint")?;
+        Ok(checked.unwrap_or(false))
     }
 
     /// Resolves a `why_id` (as printed in a `/why/<id>` URL) back to the

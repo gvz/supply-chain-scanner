@@ -153,6 +153,18 @@ pub const MIGRATIONS: &[&str] = &[
     CREATE INDEX idx_reviews_artifact_fingerprint
         ON reviews(ecosystem, package, version, filename, sha256, fingerprint)
     "#,
+    // 5: verdicts.plugin_checked — the "index-admitted vs. fully-scanned"
+    // split. A `Clean` verdict can mean two different things: "the cascade
+    // admitted this artifact to the index" and "the org's plugins also ran
+    // against its bytes". The cargo path records the first and later marks
+    // the second, so it needs both states on one row. `get` and `put`
+    // ignore this column entirely, and every existing row defaults to 0.
+    // That default is correct for the PyPI path too: there the plugin gate
+    // already ran before any `Clean` row was written, so the column only
+    // ever carries new meaning for cargo's two-phase verdicts.
+    r#"
+    ALTER TABLE verdicts ADD COLUMN plugin_checked INTEGER NOT NULL DEFAULT 0
+    "#,
 ];
 
 /// Applies every migration in [`MIGRATIONS`] that hasn't already run

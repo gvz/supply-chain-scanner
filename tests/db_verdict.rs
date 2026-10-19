@@ -1,8 +1,8 @@
 //! Integration tests for `supply_chain_scanner::db` (SQLite store, migrations,
 //! per-artifact verdict store).
 
-use supply_chain_scanner::db::verdict::VerdictStore;
 use supply_chain_scanner::db::Db;
+use supply_chain_scanner::db::verdict::VerdictStore;
 use supply_chain_scanner::model::{ArtifactKey, RefusalReason, Verdict};
 
 const FINGERPRINT_A: &str = "fingerprint-a";
@@ -282,4 +282,122 @@ fn open_is_idempotent_and_migrations_rerun_cleanly() {
         .expect("get should succeed")
         .expect("verdict written before reopening must survive");
     assert_eq!(stored.verdict, Verdict::Clean);
+}
+
+#[test]
+fn a_freshly_stored_clean_verdict_is_not_yet_plugin_checked() {
+    let (_dir, db) = open_db();
+    let store = VerdictStore::new(db);
+    let k = key(
+        "example_package-1.2.3-py3-none-any.whl",
+        "5".repeat(64).as_str(),
+    );
+
+    store
+        .put(&k, &Verdict::Clean, FINGERPRINT_A)
+        .expect("put clean verdict");
+
+    assert!(
+        !store
+            .is_plugin_checked(&k, FINGERPRINT_A)
+            .expect("is_plugin_checked should succeed")
+    );
+}
+
+#[test]
+fn mark_plugin_checked_flips_it_true() {
+    let (_dir, db) = open_db();
+    let store = VerdictStore::new(db);
+    let k = key(
+        "example_package-1.2.3-py3-none-any.whl",
+        "6".repeat(64).as_str(),
+    );
+
+    store
+        .put(&k, &Verdict::Clean, FINGERPRINT_A)
+        .expect("put clean verdict");
+    store
+        .mark_plugin_checked(&k, FINGERPRINT_A)
+        .expect("mark plugin checked");
+
+    assert!(
+        store
+            .is_plugin_checked(&k, FINGERPRINT_A)
+            .expect("is_plugin_checked should succeed")
+    );
+}
+
+#[test]
+fn is_plugin_checked_is_false_for_a_fingerprint_with_no_stored_verdict_at_all() {
+    let (_dir, db) = open_db();
+    let store = VerdictStore::new(db);
+    let k = key(
+        "example_package-1.2.3-py3-none-any.whl",
+        "7".repeat(64).as_str(),
+    );
+
+    assert!(
+        !store
+            .is_plugin_checked(&k, "never-scanned-fp")
+            .expect("is_plugin_checked should succeed")
+    );
+}
+
+#[test]
+fn is_plugin_checked_is_false_under_a_fingerprint_the_artifact_was_not_marked_under() {
+    let (_dir, db) = open_db();
+    let store = VerdictStore::new(db);
+    let k = key(
+        "example_package-1.2.3-py3-none-any.whl",
+        "8".repeat(64).as_str(),
+    );
+
+    store
+        .put(&k, &Verdict::Clean, FINGERPRINT_A)
+        .expect("put clean verdict");
+    store
+        .mark_plugin_checked(&k, FINGERPRINT_A)
+        .expect("mark plugin checked");
+
+    assert!(
+        !store
+            .is_plugin_checked(&k, FINGERPRINT_B)
+            .expect("is_plugin_checked should succeed"),
+        "a plugin-checked mark must not carry over to a different policy fingerprint"
+    );
+}
+
+#[test]
+fn put_resets_plugin_checked_so_a_rewritten_verdict_re_runs_the_plugin_gate() {
+    let (_dir, db) = open_db();
+    let store = VerdictStore::new(db);
+    let k = key(
+        "example_package-1.2.3-py3-none-any.whl",
+        "9".repeat(64).as_str(),
+    );
+
+    store
+        .put(&k, &Verdict::Clean, FINGERPRINT_A)
+        .expect("put clean verdict");
+    store
+        .mark_plugin_checked(&k, FINGERPRINT_A)
+        .expect("mark plugin checked");
+    assert!(
+        store
+            .is_plugin_checked(&k, FINGERPRINT_A)
+            .expect("is_plugin_checked should succeed")
+    );
+
+    // Rewriting the verdict in place must clear the plugin-checked mark:
+    // the plugins that passed before have not passed for this new verdict.
+    store
+        .put(&k, &Verdict::Clean, FINGERPRINT_A)
+        .expect("rewrite clean verdict");
+
+    assert!(
+        !store
+            .is_plugin_checked(&k, FINGERPRINT_A)
+            .expect("is_plugin_checked should succeed"),
+        "put must reset plugin_checked to 0 so the plugin gate runs again"
+    );
 }

@@ -90,6 +90,25 @@ impl CargoVetStore {
         Ok(stored)
     }
 
+    /// Reports whether the store holds no audit row at all, across every
+    /// source.
+    ///
+    /// [`super::advisory::AdvisoryStore::is_empty`] answers the same
+    /// question per ecosystem; this mirror has no ecosystem column, so the
+    /// check is over the whole table. Startup uses it to decide whether an
+    /// initial sync is needed: an empty store means the cargo-vet fast path
+    /// currently has no proof to consult, so the proxy syncs once before it
+    /// serves anything.
+    pub fn is_empty(&self) -> anyhow::Result<bool> {
+        let conn = self.db.conn()?;
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cargo_vet_audits", [], |row| {
+                row.get(0)
+            })
+            .context("counting cargo-vet audits")?;
+        Ok(count == 0)
+    }
+
     /// Reports whether some stored audit covers `package` at `version`
     /// against `required_criterion`.
     ///

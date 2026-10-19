@@ -1,0 +1,608 @@
+//! End-to-end integration tests for
+//! `supply_chain_scanner::http::cargo_bootstrap`: the fail-closed startup
+//! sequence of a cargo/crates.io deployment.
+//!
+//! These are the tests that prove the pieces of the cargo plan actually
+//! compose into a working deployment, not just that each works alone. Each
+//! one calls the real `bootstrap_cargo`, serves the router it returns on an
+//! ephemeral loopback port, and drives it with a real HTTP client in front
+//! of a `wiremock` stand-in for the crates.io sparse index, the `.crate`
+//! `dl` endpoint, the OSV feed, the cargo-vet audit source and the model
+//! provider.
+//!
+//! # The sandbox seam
+//!
+//! `bootstrap_cargo` builds its sandbox with `default_sandbox_factory`,
+//! which fails closed when `bwrap` is missing and, on a host where it is
+//! present but unusable (as in many CI containers), would fail at run
+//! time. These tests therefore call
+//! `bootstrap_cargo_with_sandbox_factory` with a stub `SandboxRunner`,
+//! exactly as `tests/plugin.rs` and `tests/ai_review.rs` do for their own
+//! seams. Everything else — the database, the policy, the two cargo
+//! upstream clients, the OSV sync, the cargo-vet sync, the scanner, the
+//! router — is the production wiring, unchanged.
+//!
+//! The one stub does double duty. A plugin invocation is recognized by its
+//! binary path (the fake plugin file this test writes); everything else is
+//! the AI reviewer's collector, which the stub forwards to this repo's
+//! real `collect` subcommand so the reviewer's coverage figures come from a
+//! real walk of the unpacked crate.
+
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use sha2::{Digest, Sha256};
+use tokio::net::TcpListener;
+use url::Url;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+use zip::ZipWriter;
+
+use supply_chain_scanner::config::{
+    AiReviewConfig, BlockOn, CargoRegistryConfig, CargoVetSource, Config, CveLine, PluginConfig,
+    UnknownSeverity,
+};
+use supply_chain_scanner::db::cargo_vet::CargoVetStore;
+use supply_chain_scanner::db::verdict::VerdictStore;
+use supply_chain_scanner::ecosystem::cargo::index::index_path_for;
+use supply_chain_scanner::http::cargo_bootstrap::{
+    bootstrap_cargo, bootstrap_cargo_with_sandbox_factory, CargoWired,
+};
+use supply_chain_scanner::model::{ArtifactKey, RefusalReason, Verdict};
+use supply_chain_scanner::plugin::{
+    SandboxOutcome, SandboxRunner, SandboxSpec, SANDBOX_PACKAGE_DIR,
+};
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A `.crate`'s bytes: a gzipped tar of a small, ordinary Rust crate,
+/// wrapped in the `<name>-<version>/` directory cargo publishes.
+fn crate_bytes(name: &str, vers: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let mut builder = tar::Builder::new(GzEncoder::new(&mut buf, Compression::fast()));
+        let root = format!("{name}-{vers}");
+        for (rel, body) in [
+            (
+                "Cargo.toml".to_string(),
+                format!("[package]\nname = \"{name}\"\nversion = \"{vers}\"\n"),
+            ),
+            (
+                "src/lib.rs".to_string(),
+                "pub fn add(a: i32, b: i32) -> i32 { a + b }\n".to_string(),
+            ),
+        ] {
+            let body = body.into_bytes();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("{root}/{rel}"), &body[..])
+                .expect("append crate entry");
+        }
+        builder.finish().expect("finish crate fixture");
+    }
+    buf
+}
+
+/// An empty OSV feed zip: enough for the initial advisory sync to succeed
+/// with nothing to ingest, so no test touches the real network.
+fn empty_osv_zip() -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let cursor = std::io::Cursor::new(&mut buf);
+        let writer = ZipWriter::new(cursor);
+        writer.finish().expect("finish empty zip");
+    }
+    buf
+}
+
+/// The chat-completions reply carrying a clean model verdict, shaped the
+/// way `tests/ai_review.rs` builds its own fixtures.
+fn clean_model_reply() -> String {
+    let verdict = serde_json::json!({
+        "verdict": "clean",
+        "summary": "ordinary crate sources",
+        "findings": [],
+    })
+    .to_string();
+    let content = serde_json::to_string(&verdict).expect("escape the verdict");
+    format!(
+        r#"{{"id":"resp_1","choices":[{{"index":0,"message":{{"role":"assistant","content":{content}}},"finish_reason":"stop"}}]}}"#
+    )
+}
+
+/// Mounts the sparse index's `config.json`, one crate's index file, and one
+/// download for `vers`, all pointing back at `server`. Mirrors
+/// `tests/http_cargo_download.rs`'s `mount` helper.
+async fn mount_registry(server: &MockServer, name: &str, vers: &str, bytes: &[u8]) {
+    Mock::given(method("GET"))
+        .and(path("/config.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "{{\"dl\":\"{}/crates/{{crate}}/{{version}}/download\"}}",
+            server.uri()
+        )))
+        .mount(server)
+        .await;
+
+    let cksum = sha256_hex(bytes);
+    Mock::given(method("GET"))
+        .and(path(format!("/{}", index_path_for(name))))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "{{\"name\":\"{name}\",\"vers\":\"{vers}\",\"cksum\":\"{cksum}\",\"yanked\":false,\"deps\":[]}}\n"
+        )))
+        .mount(server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path(format!("/crates/{name}/{vers}/download")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+        .mount(server)
+        .await;
+}
+
+async fn mount_empty_osv_feed(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/all.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(empty_osv_zip()))
+        .mount(server)
+        .await;
+}
+
+async fn mount_clean_model(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(clean_model_reply()))
+        .mount(server)
+        .await;
+}
+
+// ---------------------------------------------------------------------------
+// The sandbox stub
+// ---------------------------------------------------------------------------
+
+/// A `SandboxRunner` that never invokes `bwrap`.
+///
+/// A plugin run is recognized by `spec.binary` equalling the fake plugin
+/// path, and answers with a clean exit. Any other spec is the AI reviewer's
+/// collector: the stub runs this repo's real collector binary on the host,
+/// substituting the sandbox mount point for the host package tree, exactly
+/// as `tests/ai_review.rs`'s `StubSandbox::Serve` does. That keeps the
+/// reviewer's coverage figures real without confinement.
+struct StubSandbox {
+    plugin_binary: PathBuf,
+    plugin_runs: AtomicUsize,
+}
+
+impl StubSandbox {
+    fn new(plugin_binary: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            plugin_binary,
+            plugin_runs: AtomicUsize::new(0),
+        })
+    }
+
+    fn plugin_runs(&self) -> usize {
+        self.plugin_runs.load(Ordering::SeqCst)
+    }
+}
+
+impl SandboxRunner for StubSandbox {
+    fn run(&self, spec: &SandboxSpec) -> anyhow::Result<SandboxOutcome> {
+        if spec.binary == self.plugin_binary {
+            self.plugin_runs.fetch_add(1, Ordering::SeqCst);
+            return Ok(SandboxOutcome {
+                exit_code: Some(0),
+                output: String::new(),
+                timed_out: false,
+                signal: None,
+            });
+        }
+
+        let host = spec.package_dir.to_string_lossy().to_string();
+        let args: Vec<String> = spec
+            .args
+            .iter()
+            .map(|arg| {
+                if arg == SANDBOX_PACKAGE_DIR {
+                    host.clone()
+                } else {
+                    arg.clone()
+                }
+            })
+            .collect();
+        let output =
+            std::process::Command::new(PathBuf::from(env!("CARGO_BIN_EXE_supply-chain-scanner")))
+                .args(&args)
+                .output()
+                .map_err(|e| anyhow::anyhow!("the stub could not spawn the collector: {e}"))?;
+        Ok(SandboxOutcome {
+            exit_code: output.status.code(),
+            output: String::from_utf8_lossy(&output.stdout).to_string(),
+            timed_out: false,
+            signal: None,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Config and server wiring
+// ---------------------------------------------------------------------------
+
+/// A minimal, fully valid `Config` for a cargo deployment pointed at
+/// `server` for everything: the sparse index, the `.crate` download, the
+/// OSV feed, and (when enabled) the model provider.
+///
+/// `upstream_url` is required on `Config` whether or not `[cargo_registry]`
+/// is present, and a cargo deployment never reads it; it is set to the same
+/// stand-in so nothing in this file can reach the real PyPI.
+fn cargo_config(
+    server: &MockServer,
+    public_url: Url,
+    db_path: PathBuf,
+    cache_dir: PathBuf,
+) -> Config {
+    let base = Url::parse(&format!("{}/", server.uri())).expect("valid upstream index url");
+    Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        db_path,
+        cache_dir,
+        upstream_url: Url::parse(&server.uri()).expect("valid upstream url"),
+        public_url,
+        scan_budget: Duration::from_secs(10),
+        cache_ttl: Duration::from_secs(60 * 60),
+        advisory_sync_interval: Duration::from_secs(60 * 60),
+        advisory_source_url: Url::parse(&format!("{}/all.zip", server.uri()))
+            .expect("valid advisory url"),
+        cve: CveLine {
+            min_severity: 7.0,
+            require_fix_available: false,
+            unknown_severity: UnknownSeverity::Allow,
+        },
+        download: Default::default(),
+        allowlist: Vec::new(),
+        plugins: Vec::new(),
+        max_concurrent_scans: None,
+        ai_review: None,
+        cargo_registry: Some(CargoRegistryConfig {
+            upstream_index_url: base,
+            cargo_vet_sync_interval: Duration::from_secs(60 * 60),
+            cargo_vet_sources: Vec::new(),
+            required_criterion: "safe-to-deploy".to_string(),
+            trusted_reviewers: Vec::new(),
+        }),
+    }
+}
+
+fn plugin_config(binary: PathBuf) -> PluginConfig {
+    PluginConfig {
+        name: "yara".to_string(),
+        binary,
+        timeout: Duration::from_secs(5),
+    }
+}
+
+fn ai_review_config(server: &MockServer) -> AiReviewConfig {
+    let mut base = Url::parse(&server.uri()).expect("valid provider url");
+    base.set_path("/v1/");
+    AiReviewConfig {
+        base_url: base,
+        model: "test-model".to_string(),
+        api_key_env: None,
+        timeout: Duration::from_secs(5),
+        max_payload_bytes: 262_144,
+        max_output_tokens: 256,
+        coverage_threshold: 0.8,
+        block_on: BlockOn::Malicious,
+        block_opaque_executables: false,
+    }
+}
+
+/// Writes a fake plugin binary into `dir` and returns its path. It is never
+/// executed: the stub sandbox answers for it. `Policy::build` only hashes
+/// the file, so its contents are irrelevant.
+fn fake_plugin_binary(dir: &Path) -> PathBuf {
+    let binary = dir.join("yara");
+    std::fs::write(&binary, b"pretend plugin binary").expect("write plugin binary");
+    binary
+}
+
+struct Served {
+    _db_dir: tempfile::TempDir,
+    _cache_dir: tempfile::TempDir,
+    _plugin_dir: tempfile::TempDir,
+    base_url: Url,
+    wired: CargoWired,
+    sandbox: Arc<StubSandbox>,
+    _server: tokio::task::JoinHandle<()>,
+}
+
+/// Binds an ephemeral listener, builds the config against it (so
+/// `public_url` matches the port actually served), runs the real
+/// `bootstrap_cargo_with_sandbox_factory`, and spawns the router.
+async fn start(
+    server: &MockServer,
+    configure: impl FnOnce(&mut Config, PathBuf),
+) -> anyhow::Result<Served> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr: SocketAddr = listener.local_addr()?;
+    let base_url = Url::parse(&format!("http://127.0.0.1:{}/", addr.port()))?;
+
+    let db_dir = tempfile::tempdir().expect("create db temp dir");
+    let cache_dir = tempfile::tempdir().expect("create cache temp dir");
+    let plugin_dir = tempfile::tempdir().expect("create plugin temp dir");
+    let plugin_binary = fake_plugin_binary(plugin_dir.path());
+
+    let mut cfg = cargo_config(
+        server,
+        base_url.clone(),
+        db_dir.path().join("scanner.db"),
+        cache_dir.path().join("cache"),
+    );
+    configure(&mut cfg, plugin_binary.clone());
+
+    let sandbox = StubSandbox::new(plugin_binary);
+    let factory: supply_chain_scanner::http::SandboxFactory = {
+        let sandbox = Arc::clone(&sandbox);
+        Arc::new(move |_: &Config| Ok(sandbox.clone() as Arc<dyn SandboxRunner>))
+    };
+
+    let wired = bootstrap_cargo_with_sandbox_factory(cfg, factory).await?;
+    let router = wired.router.clone();
+    let served = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    Ok(Served {
+        _db_dir: db_dir,
+        _cache_dir: cache_dir,
+        _plugin_dir: plugin_dir,
+        base_url,
+        wired,
+        sandbox,
+        _server: served,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The plan's two tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn bootstrap_cargo_serves_a_crate_through_the_full_cascade() {
+    let server = MockServer::start().await;
+    let bytes = crate_bytes("demo-crate", "1.0.0");
+    mount_registry(&server, "demo-crate", "1.0.0", &bytes).await;
+    mount_empty_osv_feed(&server).await;
+    mount_clean_model(&server).await;
+
+    let served = start(&server, |cfg, plugin_binary| {
+        // A plugin that exits 0, and a reviewer that replies clean: the
+        // two checks a never-seen version must pass before it is
+        // forwarded.
+        cfg.plugins = vec![plugin_config(plugin_binary)];
+        cfg.ai_review = Some(ai_review_config(&server));
+    })
+    .await
+    .expect("bootstrap a cargo deployment");
+
+    // 1. The index gate. A never-seen crate is downloaded, verified,
+    //    unpacked, reviewed clean, and then forwarded.
+    let index_url = format!("{}{}", served.base_url, index_path_for("demo-crate"));
+    let index_response = reqwest::get(&index_url)
+        .await
+        .expect("GET the crate's index file");
+    assert_eq!(
+        index_response.status(),
+        reqwest::StatusCode::OK,
+        "the cascade must forward a crate whose only version reviewed clean"
+    );
+    let index_body = index_response.text().await.expect("read the index body");
+    assert!(
+        index_body.contains("\"vers\":\"1.0.0\""),
+        "the forwarded version must appear in the served index file: {index_body}"
+    );
+    let model_calls = server
+        .received_requests()
+        .await
+        .expect("read the stand-in's request log")
+        .iter()
+        .filter(|request| request.url.path() == "/v1/chat/completions")
+        .count();
+    assert_eq!(
+        model_calls, 1,
+        "the version had no stored verdict, so the cascade must have asked the \
+         reviewer exactly once before forwarding it"
+    );
+
+    // 2. The download gate. The index-side review stored a clean verdict,
+    //    but not a plugin-checked one, so the plugins run here — once.
+    let download_url = format!("{}crates/demo-crate/1.0.0/download", served.base_url);
+    let download_response = reqwest::get(&download_url)
+        .await
+        .expect("GET the .crate download");
+    assert_eq!(
+        download_response.status(),
+        reqwest::StatusCode::OK,
+        "a clean, plugin-passing artifact must be served"
+    );
+    let served_bytes = download_response
+        .bytes()
+        .await
+        .expect("read the crate bytes");
+    assert_eq!(
+        served_bytes.as_ref(),
+        bytes.as_slice(),
+        "the bytes served must be the verified upstream bytes"
+    );
+    assert_eq!(
+        served.sandbox.plugin_runs(),
+        1,
+        "the plugin gate must run exactly once for this artifact"
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_cargo_runs_the_cargo_vet_sync_before_serving_anything() {
+    let server = MockServer::start().await;
+    mount_empty_osv_feed(&server).await;
+
+    const AUDITS_TOML: &str = r#"
+[[audits.demo-crate]]
+version = "1.0.0"
+who = "Jane Auditor <jane@example.com>"
+criteria = "safe-to-deploy"
+"#;
+    Mock::given(method("GET"))
+        .and(path("/audits.toml"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(AUDITS_TOML))
+        .mount(&server)
+        .await;
+
+    let audits_url =
+        Url::parse(&format!("{}/audits.toml", server.uri())).expect("valid audits url");
+
+    let served = start(&server, |cfg, _plugin_binary| {
+        if let Some(cargo) = cfg.cargo_registry.as_mut() {
+            cargo.cargo_vet_sources = vec![CargoVetSource {
+                name: "test-audits".to_string(),
+                url: audits_url,
+            }];
+        }
+    })
+    .await
+    .expect("bootstrap a cargo deployment");
+
+    // The observable state, not an internal counter: startup synced the
+    // configured source into the store before returning, so the fast path
+    // already has a proof to consult for this exact crate and version.
+    let store = CargoVetStore::new(served.wired.db.clone());
+    assert!(
+        !store.is_empty().expect("read the cargo-vet store"),
+        "the initial cargo-vet sync must have stored at least one audit"
+    );
+    assert!(
+        store
+            .covers("demo-crate", "1.0.0", "safe-to-deploy", &[])
+            .expect("query cargo-vet coverage"),
+        "the synced audit must cover the version and criterion it names"
+    );
+
+    // And it happened exactly once during startup, from the configured
+    // source: no ticker is running in this test.
+    let hits = served
+        .wired
+        .db
+        .clone()
+        .conn()
+        .and_then(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM cargo_vet_audits", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(anyhow::Error::from)
+        })
+        .expect("count stored audits");
+    assert_eq!(hits, 1, "exactly one full audit must be stored");
+    let requested = server
+        .received_requests()
+        .await
+        .expect("read the stand-in's request log")
+        .iter()
+        .filter(|request| request.url.path() == "/audits.toml")
+        .count();
+    assert_eq!(
+        requested, 1,
+        "the audit source must be fetched exactly once"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The shared /refusals page on the cargo router
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_cargo_router_serves_refusals_from_its_own_state() {
+    let server = MockServer::start().await;
+    mount_empty_osv_feed(&server).await;
+
+    let served = start(&server, |_cfg, _plugin_binary| {})
+        .await
+        .expect("bootstrap a cargo deployment");
+
+    // Plant a blocked verdict the way the download gate would store one.
+    let verdicts = VerdictStore::new(served.wired.db.clone());
+    verdicts
+        .put(
+            &ArtifactKey {
+                ecosystem: "cargo".to_string(),
+                package: "demo-crate".to_string(),
+                version: "1.0.0".to_string(),
+                filename: "demo-crate-1.0.0.crate".to_string(),
+                sha256: "a".repeat(64),
+            },
+            &Verdict::Blocked(RefusalReason {
+                code: "plugin:fail".to_string(),
+                detail: "the plugin refused the crate".to_string(),
+            }),
+            &served.wired.state.cargo_scanner.fingerprint(),
+        )
+        .expect("store a blocked verdict");
+
+    let response = reqwest::get(format!("{}refusals", served.base_url))
+        .await
+        .expect("GET /refusals");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.text().await.expect("read the refusals body");
+    assert!(
+        body.contains("demo-crate"),
+        "the blocked crate must be listed: {body}"
+    );
+    assert!(
+        body.contains("/why/"),
+        "each row must link to its explanation: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The dispatch rule's own guard
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn bootstrap_cargo_refuses_a_config_with_no_cargo_registry_table() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let mut cfg = cargo_config(
+        &server,
+        Url::parse("http://127.0.0.1:9/").expect("valid url"),
+        dir.path().join("scanner.db"),
+        dir.path().join("cache"),
+    );
+    cfg.cargo_registry = None;
+
+    let err = bootstrap_cargo(cfg)
+        .await
+        .err()
+        .expect("a config with no [cargo_registry] must not boot a cargo deployment");
+    assert!(
+        err.to_string().contains("[cargo_registry]"),
+        "the error must name the missing table: {err:#}"
+    );
+}

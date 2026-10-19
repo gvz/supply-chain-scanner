@@ -116,8 +116,8 @@ pub struct CargoAppState {
 }
 
 /// Builds the cargo deployment's router: `/config.json`, the `.crate`
-/// download route, and the catch-all sparse-index route. Task 11 mounts
-/// this.
+/// download route, `/refusals`, and the catch-all sparse-index route.
+/// Task 11 mounts this.
 ///
 /// The download route is a static-prefix route registered on the same
 /// router as the `/{*path}` catch-all. `matchit` resolves a static segment
@@ -126,20 +126,37 @@ pub struct CargoAppState {
 /// [`cargo_index_handler`]. `tests/http_cargo_download.rs` pins this: it
 /// downloads an artifact, fetches an index path, and posts a traversal
 /// path through the same router and checks that each handler answered.
+/// `/refusals` resolves the same way, as a static segment.
 ///
-/// `/refusals` is deliberately absent. [`super::refusals::refusals_handler`]
-/// takes `State<AppState>`, and this router carries [`CargoAppState`].
-/// Task 11 must resolve that mismatch rather than this module widening
-/// either state struct.
+/// `/refusals` is served by [`cargo_refusals_handler`], the cargo router's
+/// own thin extractor. [`super::refusals::refusals_handler`] takes
+/// `State<AppState>`, and this router carries [`CargoAppState`]; the HTML
+/// and the query live in one place, in [`super::refusals`], and only the
+/// extractor differs. See that module's docs.
 pub fn cargo_router(state: CargoAppState) -> Router {
     Router::new()
         .route("/config.json", get(cargo_config_handler))
+        .route("/refusals", get(cargo_refusals_handler))
         .route(
             "/crates/{crate}/{version}/download",
             get(cargo_download_handler),
         )
         .route("/{*path}", get(cargo_index_handler))
         .with_state(state)
+}
+
+/// The ecosystem id every cargo artifact key carries, and therefore the
+/// id [`super::refusals`] queries for on this deployment. It is
+/// [`crate::scan::cargo`]'s own constant value; repeated here because
+/// that constant is private and this is the one place the HTTP layer has
+/// to name the ecosystem itself.
+const CARGO_ECOSYSTEM: &str = "cargo";
+
+/// `GET /refusals` on a cargo deployment: the same listing
+/// [`super::refusals::refusals_handler`] serves on the PyPI path, read
+/// out of [`CargoAppState`].
+pub async fn cargo_refusals_handler(State(state): State<CargoAppState>) -> Response {
+    super::refusals::refusals_for(state.verdicts, CARGO_ECOSYSTEM.to_string()).await
 }
 
 /// `GET /config.json`: the registry configuration cargo reads first.

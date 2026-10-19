@@ -9,7 +9,9 @@
 //!
 //! The cargo deployment has its own surface, mounted by its own router:
 //! the sparse index (`cargo_index`) and the `.crate` download with its
-//! plugin gate (`cargo_download`).
+//! plugin gate (`cargo_download`). Its startup sequence is, for the same
+//! reason, its own function: [`bootstrap_cargo`] in `cargo_bootstrap`,
+//! which produces a [`CargoWired`] instead of a [`Wired`].
 //!
 //! The simple-index and artifact handlers take `Arc<dyn
 //! crate::ecosystem::Ecosystem>` rather than a concrete PyPI type, so this
@@ -21,6 +23,7 @@
 //! `AppState`.
 
 pub mod artifact;
+pub mod cargo_bootstrap;
 pub mod cargo_download;
 pub mod cargo_index;
 pub mod refusal;
@@ -54,6 +57,8 @@ use crate::ecosystem::Ecosystem;
 use crate::plugin::{BubblewrapSandbox, PluginRunner, SandboxOutcome, SandboxRunner, SandboxSpec};
 use crate::policy::Policy;
 use crate::scan::Scanner;
+
+pub use cargo_bootstrap::{bootstrap_cargo, bootstrap_cargo_with_sandbox_factory, CargoWired};
 
 /// Shared state handed to every HTTP handler.
 ///
@@ -309,9 +314,15 @@ pub async fn bootstrap(config: Config) -> anyhow::Result<Wired> {
 ///
 /// Takes the sandbox the caller already built, not the config's: the
 /// reviewer runs the collector under the same sandbox configuration the
-/// plugins get, and the caller (`bootstrap`, a reload) has already
-/// failed closed on it when the configuration requires a real one.
-fn build_ai_reviewer(
+/// plugins get, and the caller (`bootstrap`, a reload,
+/// [`cargo_bootstrap::bootstrap_cargo`]) has already failed closed on it
+/// when the configuration requires a real one.
+///
+/// `pub(crate)` rather than private because the cargo bootstrap reuses it
+/// verbatim: the reviewer is ecosystem-agnostic, and a cargo deployment
+/// must not be able to acquire a reviewer built by a second copy of this
+/// function that a later change could leave behind.
+pub(crate) fn build_ai_reviewer(
     cfg: &AiReviewConfig,
     sandbox: Arc<dyn SandboxRunner>,
     db: Db,

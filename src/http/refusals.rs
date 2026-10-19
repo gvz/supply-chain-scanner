@@ -19,13 +19,35 @@
 //! a deliberate copy of the private one in [`super::why`]: it escapes the
 //! same five characters, and the two pages must not share a helper that
 //! one of them could widen without the other noticing.
+//!
+//! # One renderer, two extractors
+//!
+//! Both deployments serve this page, and they carry different state
+//! types: [`super::AppState`] on the PyPI path,
+//! [`super::cargo_index::CargoAppState`] on the cargo one. Rather than
+//! duplicate the HTML, or widen either state struct to satisfy a shared
+//! signature, the work is split at the one place the two genuinely
+//! differ: the extractor.
+//!
+//! - [`refusals_handler`] takes `State<AppState>` and passes
+//!   `state.verdicts` plus `state.ecosystem.id()`.
+//! - [`super::cargo_index::cargo_refusals_handler`] takes
+//!   `State<CargoAppState>` and passes `state.verdicts` plus the cargo
+//!   ecosystem id.
+//!
+//! Both then call [`refusals_for`], which queries the store, and
+//! [`render_refusals`], which renders the table. There is exactly one
+//! copy of the query and one copy of the HTML, so the two pages cannot
+//! drift apart.
+
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Response;
 
-use crate::db::verdict::BlockedVerdict;
+use crate::db::verdict::{BlockedVerdict, VerdictStore};
 
 use super::AppState;
 
@@ -43,20 +65,34 @@ const RECENT_REFUSALS_LIMIT: usize = 100;
 /// showed an empty table for a database error would tell an operator
 /// their proxy had blocked nothing when it may have blocked plenty.
 pub async fn refusals_handler(State(state): State<AppState>) -> Response {
-    let verdicts = state.verdicts;
-    let ecosystem = state.ecosystem.id().to_string();
+    refusals_for(state.verdicts, state.ecosystem.id().to_string()).await
+}
+
+/// The shared query-and-render body of every `/refusals` handler: reads
+/// the last [`RECENT_REFUSALS_LIMIT`] blocks for `ecosystem` on the
+/// blocking pool, then renders them. A lookup failure is a 500, per
+/// [`refusals_handler`]'s docs.
+///
+/// `pub(crate)` because the cargo router's own handler calls it. See this
+/// module's docs for why the split is here and not inside the renderer.
+pub(crate) async fn refusals_for(verdicts: Arc<VerdictStore>, ecosystem: String) -> Response {
     let listed = tokio::task::spawn_blocking(move || {
         verdicts.recent_blocked(&ecosystem, RECENT_REFUSALS_LIMIT)
     })
     .await;
 
     match listed {
-        Ok(Ok(blocked)) => render_refusals_page(&blocked),
+        Ok(Ok(blocked)) => render_refusals(&blocked),
         Ok(Err(_)) | Err(_) => lookup_failed_response(),
     }
 }
 
-fn render_refusals_page(blocked: &[BlockedVerdict]) -> Response {
+/// Renders the listing table for already-loaded rows.
+///
+/// `pub(crate)` so a test or another handler can render a fixed row set
+/// without a store round trip; both HTTP handlers reach it through
+/// [`refusals_for`].
+pub(crate) fn render_refusals(blocked: &[BlockedVerdict]) -> Response {
     let rows = blocked
         .iter()
         .map(|verdict| {

@@ -1,8 +1,21 @@
 //! Supply chain scanner binary: a thin wrapper around the library's own
-//! fail-closed startup sequence ([`supply_chain_scanner::http::bootstrap`]),
-//! plus the operational concerns that only make sense for a real running
-//! process — the periodic advisory-sync and cache-eviction tickers, the
-//! `SIGHUP` config-reload handler, and binding the actual listener.
+//! fail-closed startup sequences ([`supply_chain_scanner::http::bootstrap`]
+//! for a PyPI deployment, [`supply_chain_scanner::http::bootstrap_cargo`]
+//! for a cargo one), plus the operational concerns that only make sense
+//! for a real running process — the periodic advisory-sync,
+//! cargo-vet-sync and cache-eviction tickers, the `SIGHUP` config-reload
+//! handler on the PyPI path, and binding the actual listener.
+//!
+//! # Two deployments, one binary
+//!
+//! `run` dispatches on `config.cargo_registry.is_some()`. A config file
+//! with a `[cargo_registry]` table is a cargo deployment: a sparse index,
+//! a crate-vet fast path, and a `.crate` download; it gets the cargo
+//! bootstrap, the cargo advisory ticker for `"crates.io"`, a cargo-vet
+//! ticker, and the cache eviction ticker. A config file without it is the
+//! PyPI deployment, unchanged: the PyPI bootstrap, its advisory ticker,
+//! its cache eviction ticker, and the `SIGHUP` reload handler. No process
+//! serves both, per the design spec.
 //!
 //! Served HTTP/1.1 only: `axum` and `hyper` are both built here with only
 //! the `http1` Cargo feature enabled (see `Cargo.toml`), so this process
@@ -23,7 +36,8 @@ use supply_chain_scanner::ai::collect::collect;
 use supply_chain_scanner::artifact_cache::ArtifactCache;
 use supply_chain_scanner::config::Config;
 use supply_chain_scanner::ecosystem::install_surface::install_surface_for;
-use supply_chain_scanner::http::{bootstrap, watch_for_reload};
+use supply_chain_scanner::http::cargo_bootstrap::CARGO_ADVISORY_ECOSYSTEM;
+use supply_chain_scanner::http::{bootstrap, bootstrap_cargo, watch_for_reload};
 
 /// An HTTP proxy that scans PyPI artifacts before serving them.
 #[derive(Debug, Parser)]
@@ -115,6 +129,13 @@ fn run_collector(
     Ok(())
 }
 
+/// Starts one deployment, whichever the configuration selects, and serves
+/// it until the process ends.
+///
+/// The dispatch is one test — `config.cargo_registry.is_some()` — and it
+/// is the only place the two deployments diverge in this function. The
+/// PyPI branch below is byte-for-byte the startup this binary has always
+/// performed.
 async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
     let bind = config.bind;
     let cache_dir = config.cache_dir.clone();
@@ -122,46 +143,89 @@ async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
     let db_path = config.db_path.clone();
     let advisory_sync_interval = config.advisory_sync_interval;
     let advisory_source_url = config.advisory_source_url.clone();
+    let cargo = config.cargo_registry.clone();
 
     tracing::info!(?bind, config = %config_path.display(), "starting up");
 
-    let wired = bootstrap(config).await.context("startup failed")?;
-    tracing::info!("startup sequence completed; every configured check is available");
+    match cargo {
+        Some(cargo_config) => {
+            tracing::info!(
+                upstream_index = %cargo_config.upstream_index_url,
+                cargo_vet_sync_interval = ?cargo_config.cargo_vet_sync_interval,
+                cargo_vet_sources = cargo_config.cargo_vet_sources.len(),
+                "starting a cargo deployment ([cargo_registry] is present)"
+            );
+            let wired = bootstrap_cargo(config).await.context("startup failed")?;
+            tracing::info!("startup sequence completed; every configured check is available");
 
-    spawn_advisory_sync_ticker(db_path.clone(), advisory_source_url, advisory_sync_interval);
-    spawn_cache_eviction_ticker(db_path, cache_dir, cache_ttl);
+            spawn_cargo_advisory_sync_ticker(
+                db_path.clone(),
+                advisory_source_url,
+                advisory_sync_interval,
+            );
+            spawn_cargo_vet_sync_ticker(db_path.clone(), cargo_config.clone());
+            spawn_cache_eviction_ticker(db_path, cache_dir, cache_ttl);
 
-    // Say up front which fields a later SIGHUP can and cannot change, so
-    // an operator learns it from the log rather than from a reload that
-    // appeared to succeed.
-    tracing::info!(
-        reloadable = "cve, plugins, allowlist, public_url, scan_budget, ai_review",
-        restart_only = "bind, db_path, cache_dir, upstream_url, advisory_source_url, \
-                        advisory_sync_interval, cache_ttl, download, max_concurrent_scans",
-        "SIGHUP reloads the fields under `reloadable` (rebuilding the policy, the \
-         fingerprint, the plugin sandbox and, when present, the ai reviewer); a \
-         SIGHUP whose file changes any field under `restart_only` is rejected in \
-         full and names the field"
-    );
+            // The cargo path has no `Reloader` and installs no SIGHUP
+            // handler. Say so once, at startup, rather than let an
+            // operator send a signal that changes nothing.
+            tracing::warn!(
+                config = %config_path.display(),
+                "SIGHUP configuration reload is a PyPI-path feature and is not \
+                 implemented for a cargo deployment; a change to this file needs a \
+                 restart to take effect"
+            );
 
-    let reloader = Arc::clone(&wired.reloader);
-    tokio::spawn(async move {
-        if let Err(err) = watch_for_reload(reloader, config_path).await {
-            tracing::error!(error = %err, "SIGHUP reload handler exited");
+            serve(bind, wired.router).await
         }
-    });
+        None => {
+            let wired = bootstrap(config).await.context("startup failed")?;
+            tracing::info!("startup sequence completed; every configured check is available");
 
+            spawn_advisory_sync_ticker(
+                db_path.clone(),
+                advisory_source_url,
+                advisory_sync_interval,
+            );
+            spawn_cache_eviction_ticker(db_path, cache_dir, cache_ttl);
+
+            // Say up front which fields a later SIGHUP can and cannot
+            // change, so an operator learns it from the log rather than
+            // from a reload that appeared to succeed.
+            tracing::info!(
+                reloadable = "cve, plugins, allowlist, public_url, scan_budget, ai_review",
+                restart_only = "bind, db_path, cache_dir, upstream_url, advisory_source_url, \
+                                advisory_sync_interval, cache_ttl, download, max_concurrent_scans",
+                "SIGHUP reloads the fields under `reloadable` (rebuilding the policy, the \
+                 fingerprint, the plugin sandbox and, when present, the ai reviewer); a \
+                 SIGHUP whose file changes any field under `restart_only` is rejected in \
+                 full and names the field"
+            );
+
+            let reloader = Arc::clone(&wired.reloader);
+            tokio::spawn(async move {
+                if let Err(err) = watch_for_reload(reloader, config_path).await {
+                    tracing::error!(error = %err, "SIGHUP reload handler exited");
+                }
+            });
+
+            serve(bind, wired.router).await
+        }
+    }
+}
+
+/// Binds `bind` and serves `router` until the process ends.
+///
+/// `axum::serve` here only ever negotiates HTTP/1.1: neither `axum` nor
+/// `hyper` were built with their `http2` Cargo feature, so the h2 crate is
+/// not even compiled into this binary.
+async fn serve(bind: std::net::SocketAddr, router: axum::Router) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding listener on {bind}"))?;
     tracing::info!(%bind, "listening");
 
-    // `axum::serve` here only ever negotiates HTTP/1.1: neither `axum`
-    // nor `hyper` were built with their `http2` Cargo feature, so the h2
-    // crate is not even compiled into this binary.
-    axum::serve(listener, wired.router)
-        .await
-        .context("serving HTTP")
+    axum::serve(listener, router).await.context("serving HTTP")
 }
 
 /// Periodically re-syncs the OSV advisory mirror, reusing one database
@@ -202,6 +266,110 @@ fn spawn_advisory_sync_ticker(db_path: PathBuf, source_url: url::Url, interval: 
                 Err(err) => tracing::warn!(
                     error = %err,
                     "periodic advisory sync failed; keeping the existing mirror"
+                ),
+            }
+        }
+    });
+}
+
+/// Periodically re-syncs the crates.io OSV advisory mirror, the cargo
+/// deployment's counterpart to [`spawn_advisory_sync_ticker`].
+///
+/// Same shape, same failure contract: one database pool and one HTTP
+/// client for the life of the ticker, a failed sync logged and retried
+/// next tick, and the existing mirror left untouched in the meantime (see
+/// [`supply_chain_scanner::advisory::osv::OsvSync::sync`]). The ecosystem
+/// id and the name normalizer are the only differences, and they are the
+/// two arguments `sync` is given.
+fn spawn_cargo_advisory_sync_ticker(db_path: PathBuf, source_url: url::Url, interval: Duration) {
+    tokio::spawn(async move {
+        let db = match supply_chain_scanner::db::Db::open(&db_path)
+            .context("opening database for the cargo advisory sync ticker")
+        {
+            Ok(db) => db,
+            Err(err) => {
+                tracing::error!(error = %err, "cargo advisory sync ticker could not open the database; it will not run");
+                return;
+            }
+        };
+        let http = match reqwest::Client::builder()
+            .build()
+            .context("building the cargo advisory sync HTTP client")
+        {
+            Ok(http) => http,
+            Err(err) => {
+                tracing::error!(error = %err, "cargo advisory sync ticker could not build an HTTP client; it will not run");
+                return;
+            }
+        };
+        let store = supply_chain_scanner::db::advisory::AdvisoryStore::new(db);
+        let sync = supply_chain_scanner::advisory::osv::OsvSync::new(store, http, source_url);
+
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await; // the first tick fires immediately; bootstrap already synced once.
+        loop {
+            ticker.tick().await;
+            match sync
+                .sync(
+                    CARGO_ADVISORY_ECOSYSTEM,
+                    supply_chain_scanner::ecosystem::cargo::normalize_name,
+                )
+                .await
+            {
+                Ok(count) => tracing::info!(count, "crates.io advisory mirror synced"),
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "periodic crates.io advisory sync failed; keeping the existing mirror"
+                ),
+            }
+        }
+    });
+}
+
+/// Periodically re-fetches every configured cargo-vet audit source, the
+/// cargo deployment's own ticker.
+///
+/// [`CargoVetSync::sync_all`] already logs and skips a single source's
+/// failure and only returns `Err` when every source failed; that error is
+/// logged here and retried next tick, exactly like a failed advisory sync.
+/// The previous rows for each source stay in place meanwhile, because
+/// `replace_source` is the only writer and a failed fetch never reaches
+/// it.
+fn spawn_cargo_vet_sync_ticker(
+    db_path: PathBuf,
+    cargo: supply_chain_scanner::config::CargoRegistryConfig,
+) {
+    tokio::spawn(async move {
+        let db = match supply_chain_scanner::db::Db::open(&db_path)
+            .context("opening database for the cargo-vet sync ticker")
+        {
+            Ok(db) => db,
+            Err(err) => {
+                tracing::error!(error = %err, "cargo-vet sync ticker could not open the database; it will not run");
+                return;
+            }
+        };
+        let store = Arc::new(supply_chain_scanner::db::cargo_vet::CargoVetStore::new(db));
+        let sync = match supply_chain_scanner::cargovet::CargoVetSync::new(
+            store,
+            cargo.cargo_vet_sources.clone(),
+        ) {
+            Ok(sync) => sync,
+            Err(err) => {
+                tracing::error!(error = %err, "cargo-vet sync ticker could not build a sync; it will not run");
+                return;
+            }
+        };
+
+        let mut ticker = tokio::time::interval(cargo.cargo_vet_sync_interval);
+        ticker.tick().await; // the first tick fires immediately; bootstrap already synced once.
+        loop {
+            ticker.tick().await;
+            match sync.sync_all().await {
+                Ok(count) => tracing::info!(count, "cargo-vet audit mirror synced"),
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "periodic cargo-vet sync failed; keeping the existing audits"
                 ),
             }
         }

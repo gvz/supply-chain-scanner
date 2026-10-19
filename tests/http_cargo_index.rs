@@ -21,6 +21,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use supply_chain_scanner::ai::provider::{ChatProvider, ProviderError};
 use supply_chain_scanner::ai::AiReviewer;
+use supply_chain_scanner::artifact_cache::ArtifactCache;
 use supply_chain_scanner::cargovet::parse::AuditEntry;
 use supply_chain_scanner::config::{
     AiReviewConfig, BlockOn, Config, ConfigHandle, CveLine, UnknownSeverity,
@@ -33,6 +34,7 @@ use supply_chain_scanner::db::Db;
 use supply_chain_scanner::ecosystem::cargo::index::index_path_for;
 use supply_chain_scanner::ecosystem::cargo::upstream::CargoUpstream;
 use supply_chain_scanner::http::cargo_index::{cargo_router, CargoAppState};
+use supply_chain_scanner::plugin::PluginRunner;
 use supply_chain_scanner::policy::Policy;
 use supply_chain_scanner::scan::cargo::CargoScanner;
 use supply_chain_scanner::scan::coordinator::ScanCoordinator;
@@ -162,6 +164,7 @@ fn index_path(name: &str) -> String {
 struct Harness {
     _db_dir: tempfile::TempDir,
     _review_dir: tempfile::TempDir,
+    _cache_dir: tempfile::TempDir,
     server: MockServer,
     addr: std::net::SocketAddr,
     _listener: tokio::task::JoinHandle<()>,
@@ -213,7 +216,12 @@ impl Harness {
 
         let base = Url::parse(&format!("{}/", server.uri())).expect("valid index base url");
         let upstream =
+            CargoUpstream::with_limits(base.clone(), &Default::default()).expect("cargo upstream");
+        // A second client for the download route's state. These tests only
+        // exercise the index surface, so it is never dialed.
+        let download_upstream =
             CargoUpstream::with_limits(base, &Default::default()).expect("cargo upstream");
+        let cache_dir = tempfile::tempdir().expect("create artifact cache temp dir");
 
         let ai_reviewer = if with_reviewer {
             cfg.ai_review = Some(ai_review_cfg());
@@ -245,6 +253,13 @@ impl Harness {
         let app = cargo_router(CargoAppState {
             cargo_scanner: Arc::new(scanner),
             config: config_handle,
+            upstream: Arc::new(download_upstream),
+            verdicts: Arc::new(VerdictStore::new(db.clone())),
+            plugins: Arc::new(PluginRunner::new(Arc::new(NeverCalledSandbox))),
+            artifact_cache: Arc::new(
+                ArtifactCache::new(db.clone(), cache_dir.path().join("artifacts"))
+                    .expect("create artifact cache"),
+            ),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -258,6 +273,7 @@ impl Harness {
             Harness {
                 _db_dir: db_dir,
                 _review_dir: review_dir,
+                _cache_dir: cache_dir,
                 server,
                 addr,
                 _listener: served,

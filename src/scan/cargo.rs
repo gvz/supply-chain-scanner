@@ -735,7 +735,11 @@ impl CargoScanner {
 /// is the normalized crate name. Version is the index entry's `vers`.
 /// Filename is `"{name}-{vers}.crate"`, with the name as upstream
 /// published it. Sha256 is the entry's `cksum` in lowercase.
-fn artifact_key(normalized: &str, entry: &CargoIndexEntry) -> ArtifactKey {
+///
+/// [`crate::http::cargo_download`] calls this same function, so the
+/// verdict the index cascade stores is the verdict the download gate
+/// reads. There is one definition of the scheme, not two.
+pub(crate) fn artifact_key(normalized: &str, entry: &CargoIndexEntry) -> ArtifactKey {
     ArtifactKey {
         ecosystem: ECOSYSTEM.to_string(),
         package: normalized.to_string(),

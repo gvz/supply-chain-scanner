@@ -7,6 +7,10 @@
 //! the reason-phrase refusal responses (`refusal`) every blocked or
 //! unverifiable request falls back to.
 //!
+//! The cargo deployment has its own surface, mounted by its own router:
+//! the sparse index (`cargo_index`) and the `.crate` download with its
+//! plugin gate (`cargo_download`).
+//!
 //! The simple-index and artifact handlers take `Arc<dyn
 //! crate::ecosystem::Ecosystem>` rather than a concrete PyPI type, so this
 //! module does not change when a second ecosystem backend arrives. The
@@ -17,6 +21,7 @@
 //! `AppState`.
 
 pub mod artifact;
+pub mod cargo_download;
 pub mod cargo_index;
 pub mod refusal;
 pub mod refusals;

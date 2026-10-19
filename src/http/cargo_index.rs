@@ -63,25 +63,69 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
 
+use crate::artifact_cache::ArtifactCache;
 use crate::config::ConfigHandle;
+use crate::db::verdict::VerdictStore;
 use crate::ecosystem::cargo::index::{index_path_for, validate_name, CargoIndexEntry};
+use crate::ecosystem::cargo::upstream::CargoUpstream;
+use crate::plugin::PluginRunner;
 use crate::scan::cargo::{CargoIndexDecision, CargoScanner};
 
 use super::bad_request_response;
+use super::cargo_download::cargo_download_handler;
 use super::refusal::in_progress_response;
 
-/// Shared state for every handler in this module.
+/// Shared state for every handler in this module and for
+/// [`super::cargo_download`].
 ///
-/// Cheap to clone: both fields are `Arc`s, as axum's `State` extractor
+/// Cheap to clone: every field is an `Arc`, as axum's `State` extractor
 /// requires. See the module docs for why this is not [`super::AppState`].
+///
+/// Each field is here because a handler in this router reads it:
+///
+/// - `cargo_scanner` — the cascade behind the index gate
+///   ([`cargo_index_handler`]). Its `fingerprint()` is also the policy
+///   fingerprint the download gate stores and looks up verdicts under, so
+///   the verdict the index path writes is the verdict the download path
+///   reads.
+/// - `config` — `public_url` for the `dl` template and for every
+///   `/why/<id>` link, and `plugins` for the download gate's plugin list.
+///   Read through [`ConfigHandle::current`] so a reload takes effect.
+/// - `upstream` — the cargo sparse index and `.crate` client. The index
+///   handler reaches upstream through `cargo_scanner`; the download
+///   handler needs the index entry's `cksum` and the `.crate` bytes
+///   directly, and `CargoScanner` exposes neither.
+/// - `verdicts` — the durable verdict store the download gate reads and
+///   writes.
+/// - `plugins` — the runner that executes the organization's plugin
+///   binaries over the unpacked `.crate`.
+/// - `artifact_cache` — the content-addressed cache the download gate
+///   serves already-verified bytes from.
 #[derive(Clone)]
 pub struct CargoAppState {
     pub cargo_scanner: Arc<CargoScanner>,
     pub config: Arc<ConfigHandle>,
+    /// The cargo upstream client: index entries and `.crate` downloads.
+    pub upstream: Arc<CargoUpstream>,
+    /// The durable per-artifact verdict store.
+    pub verdicts: Arc<VerdictStore>,
+    /// The runner for the organization's plugin binaries.
+    pub plugins: Arc<PluginRunner>,
+    /// The on-disk cache of verified artifact bytes.
+    pub artifact_cache: Arc<ArtifactCache>,
 }
 
-/// Builds the cargo deployment's router: `/config.json` and the
-/// catch-all sparse-index route. Task 11 mounts this.
+/// Builds the cargo deployment's router: `/config.json`, the `.crate`
+/// download route, and the catch-all sparse-index route. Task 11 mounts
+/// this.
+///
+/// The download route is a static-prefix route registered on the same
+/// router as the `/{*path}` catch-all. `matchit` resolves a static segment
+/// before a wildcard, so `/crates/{crate}/{version}/download` reaches
+/// [`cargo_download_handler`] and every other path still reaches
+/// [`cargo_index_handler`]. `tests/http_cargo_download.rs` pins this: it
+/// downloads an artifact, fetches an index path, and posts a traversal
+/// path through the same router and checks that each handler answered.
 ///
 /// `/refusals` is deliberately absent. [`super::refusals::refusals_handler`]
 /// takes `State<AppState>`, and this router carries [`CargoAppState`].
@@ -90,6 +134,10 @@ pub struct CargoAppState {
 pub fn cargo_router(state: CargoAppState) -> Router {
     Router::new()
         .route("/config.json", get(cargo_config_handler))
+        .route(
+            "/crates/{crate}/{version}/download",
+            get(cargo_download_handler),
+        )
         .route("/{*path}", get(cargo_index_handler))
         .with_state(state)
 }

@@ -5,6 +5,7 @@
 
 pub mod advisory;
 pub mod cache;
+pub mod cargo_vet;
 pub mod index_cache;
 pub mod migrations;
 pub mod review;

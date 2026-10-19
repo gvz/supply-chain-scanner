@@ -165,6 +165,36 @@ pub const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE verdicts ADD COLUMN plugin_checked INTEGER NOT NULL DEFAULT 0
     "#,
+    // 6: cargo_vet_audits — the local mirror of the trusted cargo-vet
+    // audit sets (the cargo path's `CargoVetStore`). One row per full audit
+    // per source, keyed by the source's configured name and the crates.io
+    // normalized crate name. `replace_source` deletes one source's rows and
+    // reinserts its freshly parsed set inside a single transaction, so the
+    // sources stay independent of each other.
+    //
+    // Only *full* audits reach this table. A delta audit names a step
+    // between two versions. Resolving a chain of delta audits back to a
+    // full audit is out of this plan's scope. `replace_source` drops those
+    // entries rather than storing rows nothing queries.
+    //
+    // The primary key is `(source, package, version, who_json)`, not just
+    // `(source, package, version)`. One crate version can carry several full
+    // audits from different auditors, for example one per criterion or a
+    // re-audit by a second reviewer. Each one must survive as its own row,
+    // because `covers` filters on the auditor. The JSON columns hold string
+    // arrays, so one row keeps all of its criteria at once.
+    r#"
+    CREATE TABLE cargo_vet_audits (
+        source         TEXT NOT NULL,
+        package        TEXT NOT NULL,
+        version        TEXT NOT NULL,
+        who_json       TEXT NOT NULL,
+        criteria_json  TEXT NOT NULL,
+        PRIMARY KEY (source, package, version, who_json)
+    );
+    CREATE INDEX idx_cargo_vet_audits_lookup
+        ON cargo_vet_audits(source, package, version);
+    "#,
 ];
 
 /// Applies every migration in [`MIGRATIONS`] that hasn't already run

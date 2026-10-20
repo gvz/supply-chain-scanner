@@ -67,6 +67,7 @@ use crate::artifact_cache::ArtifactCache;
 use crate::config::ConfigHandle;
 use crate::db::verdict::VerdictStore;
 use crate::ecosystem::cargo::index::{index_path_for, validate_name, CargoIndexEntry};
+use crate::ecosystem::cargo::index_name;
 use crate::ecosystem::cargo::upstream::CargoUpstream;
 use crate::plugin::PluginRunner;
 use crate::scan::cargo::{CargoIndexDecision, CargoScanner};
@@ -213,7 +214,12 @@ pub async fn cargo_index_handler(
         Err(err) => return bad_request_response(&format!("invalid crate name: {err}")),
     };
 
-    let canonical = index_path_for(&name);
+    // The canonical path keeps the crate's published spelling, lowercased,
+    // with its underscores intact. crates.io serves `se/rd/serde_json`, and
+    // cargo asks for exactly that, so a hyphenated canonical path here
+    // would reject every legitimate request for a crate whose name carries
+    // an underscore.
+    let canonical = index_path_for(&index_name(&name));
     if path != canonical {
         return bad_request_response(&format!(
             "invalid crate index path: {name:?} is served at {canonical:?}"

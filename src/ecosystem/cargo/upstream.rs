@@ -31,7 +31,7 @@ use url::Url;
 
 use crate::config::DownloadLimits;
 use crate::ecosystem::cargo::index::{self, CargoIndexEntry};
-use crate::ecosystem::cargo::normalize_name;
+use crate::ecosystem::cargo::index_name;
 
 /// Upper bound on establishing the TCP/TLS connection to upstream.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -127,21 +127,22 @@ impl CargoUpstream {
 
     /// Fetches and parses the sparse-index file for `name`.
     ///
-    /// The name is normalized first, so `serde_json` and `serde-json` reach
-    /// the same file. A 404 is [`UpstreamError::NotFound`]. Any other
-    /// failure is [`UpstreamError::Unavailable`] or
-    /// [`UpstreamError::Other`], never an empty list.
+    /// The name is lowercased first, with `_` kept, because that is the
+    /// spelling crates.io publishes and serves the index file under. A
+    /// `404` is [`UpstreamError::NotFound`]. Any other failure is
+    /// [`UpstreamError::Unavailable`] or [`UpstreamError::Other`], never an
+    /// empty list.
     pub async fn index_entries(&self, name: &str) -> Result<Vec<CargoIndexEntry>, UpstreamError> {
-        let normalized = normalize_name(name);
+        let indexed = index_name(name);
         let url = self
             .index_base
-            .join(&index::index_path_for(&normalized))
-            .with_context(|| format!("building sparse index URL for {normalized:?}"))
+            .join(&index::index_path_for(&indexed))
+            .with_context(|| format!("building sparse index URL for {indexed:?}"))
             .map_err(UpstreamError::Other)?;
 
         let response = self.index_client.get(url).send().await.map_err(|err| {
             UpstreamError::Unavailable(format!(
-                "request to the sparse index failed for {normalized:?}: {err}"
+                "request to the sparse index failed for {indexed:?}: {err}"
             ))
         })?;
 
@@ -151,18 +152,18 @@ impl CargoUpstream {
         }
         if !status.is_success() {
             return Err(UpstreamError::Unavailable(format!(
-                "sparse index returned status {status} for {normalized:?}"
+                "sparse index returned status {status} for {indexed:?}"
             )));
         }
 
         let body = response.text().await.map_err(|err| {
             UpstreamError::Unavailable(format!(
-                "reading the sparse index body for {normalized:?} failed: {err}"
+                "reading the sparse index body for {indexed:?} failed: {err}"
             ))
         })?;
 
         index::parse_index_lines(&body)
-            .with_context(|| format!("parsing the sparse index file for {normalized:?}"))
+            .with_context(|| format!("parsing the sparse index file for {indexed:?}"))
             .map_err(UpstreamError::Other)
     }
 
@@ -319,17 +320,42 @@ impl CargoUpstream {
     /// Expands the `dl` template for `name` and `version` and parses the
     /// result as a URL.
     ///
-    /// `{crate}` is the name as the caller gave it, not the normalized
-    /// form. Task 5 passes the `name` field from the index entry, which is
-    /// the name upstream published, and the download endpoint serves files
-    /// under that name. `{prefix}` uses the normalized name, because it
-    /// comes from the index path.
+    /// `{crate}` is the name as upstream published it, which is the name
+    /// in the index entry the caller matched. That name keeps its
+    /// underscores, and the download endpoint serves the file under it.
+    /// `{prefix}` is computed from [`index_name`], not [`normalize_name`],
+    /// for the same reason: the prefix is a slice of the published name.
+    ///
+    /// A template with none of the three markers gets
+    /// `/{crate}/{version}/download` appended, which is the Cargo Book's
+    /// rule. crates.io's own `dl` is a bare `https://static.crates.io/crates`
+    /// with no markers at all, so without this the download would request
+    /// the bare base URL and be refused.
     async fn download_url(&self, name: &str, version: &str) -> Result<Url, UpstreamError> {
         let template = self.dl_template().await?;
-        let expanded = template
+        let has_marker = template.contains("{crate}")
+            || template.contains("{version}")
+            || template.contains("{prefix}")
+            || template.contains("{lowerprefix}")
+            || template.contains("{sha256-checksum}");
+
+        let base = if has_marker {
+            template.to_string()
+        } else {
+            // The Cargo Book's rule for a template with no markers. Trim
+            // a trailing slash first so the appended path never doubles
+            // a separator.
+            format!(
+                "{}/{name}/{version}/download",
+                template.trim_end_matches('/')
+            )
+        };
+
+        let expanded = base
             .replace("{crate}", name)
             .replace("{version}", version)
-            .replace("{prefix}", &index::prefix_for(&normalize_name(name)));
+            .replace("{prefix}", &index::prefix_for(&index_name(name)))
+            .replace("{lowerprefix}", &index::prefix_for(&index_name(name)));
 
         Url::parse(&expanded)
             .with_context(|| format!("parsing the expanded dl URL {expanded:?}"))

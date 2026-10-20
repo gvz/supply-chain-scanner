@@ -563,6 +563,24 @@ async fn an_in_progress_cascade_is_a_429() {
 // The route reaches the cascade
 // ---------------------------------------------------------------------------
 
+/// Cargo asks for the crate under its published spelling, so a name that
+/// carries an underscore arrives at `nu/m_/num_cpus`-shaped paths. The
+/// canonical-path check must accept that spelling and reach the cascade.
+/// Refusing it here would make every such crate unresolvable through the
+/// proxy, which is the whole population of crates that publish with `_`.
+#[tokio::test]
+async fn an_underscore_name_is_served_at_its_published_index_path() {
+    let harness = Harness::with_vet_covered("num_cpus", &["1.16.0"]).await;
+
+    let (status, _content_type, body) = harness.get("/nu/m_/num_cpus").await;
+
+    assert_eq!(status, 200, "an underscore crate path must not be a 400");
+    assert!(
+        body.contains("1.16.0"),
+        "the forwarded entry must reach the client: {body:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_valid_name_round_trips_through_the_index_route_into_decide_index() {
     let harness = Harness::with_vet_covered("demo-crate", &["1.0.0"]).await;

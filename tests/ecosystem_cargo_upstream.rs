@@ -78,13 +78,14 @@ async fn index_entries_maps_a_404_to_upstream_error_not_found() {
     );
 }
 
+/// The index path keeps the crate's underscores. crates.io publishes
+/// `serde_json` at `se/rd/serde_json` and answers 404 for
+/// `se/rd/serde-json`, so lowercasing must not collapse `_` to `-` here.
 #[tokio::test]
-async fn index_entries_normalizes_the_requested_name() {
+async fn index_entries_lowercases_the_name_and_keeps_its_underscore() {
     let server = MockServer::start().await;
-    // `serde_json` normalizes to `serde-json`, whose index path is
-    // `se/rd/serde-json`.
     Mock::given(method("GET"))
-        .and(path("/se/rd/serde-json"))
+        .and(path("/se/rd/serde_json"))
         .respond_with(ResponseTemplate::new(200).set_body_string(
             "{\"name\":\"serde_json\",\"vers\":\"1.0.0\",\"cksum\":\"aa\",\"yanked\":false}\n",
         ))
@@ -97,10 +98,35 @@ async fn index_entries_normalizes_the_requested_name() {
     let entries = upstream
         .index_entries("Serde_JSON")
         .await
-        .expect("index_entries should use the normalized name");
+        .expect("index_entries should lowercase the name and keep the underscore");
 
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].vers, "1.0.0");
+}
+
+/// A crate that publishes under an underscore must never be looked up at
+/// its hyphenated twin. The mounted stub serves only the underscore path,
+/// so a hyphenating implementation fails here with NotFound.
+#[tokio::test]
+async fn index_entries_never_hyphenates_a_published_underscore() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/nu/m_/num_cpus"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "{\"name\":\"num_cpus\",\"vers\":\"1.16.0\",\"cksum\":\"aa\",\"yanked\":false}\n",
+        ))
+        .mount(&server)
+        .await;
+
+    let base = Url::parse(&format!("{}/", server.uri())).expect("valid index base url");
+    let upstream = with_default_limits(base);
+
+    let entries = upstream
+        .index_entries("num_cpus")
+        .await
+        .expect("the published underscore must survive into the index path");
+
+    assert_eq!(entries[0].name, "num_cpus");
 }
 
 #[tokio::test]
@@ -151,6 +177,39 @@ async fn download_crate_writes_the_expanded_dl_template_and_returns_its_sha256()
         1,
         "a successful download must leave only dest behind: {leftovers:?}"
     );
+}
+
+/// crates.io's own `config.json` carries a bare `dl` with no markers:
+/// `https://static.crates.io/crates`. The Cargo Book's rule appends
+/// `/{crate}/{version}/download` in that case. Without it the proxy would
+/// request the bare base URL and be refused.
+#[tokio::test]
+async fn download_crate_appends_the_default_path_to_a_marker_less_dl() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/config.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!("{{\"dl\":\"{}/crates\"}}", server.uri())),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/crates/serde_json/1.0.0/download"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"x".to_vec()))
+        .mount(&server)
+        .await;
+
+    let base = Url::parse(&format!("{}/", server.uri())).expect("valid index base url");
+    let upstream = with_default_limits(base);
+
+    let dest_dir = tempfile::tempdir().expect("create dest dir");
+    let dest = dest_dir.path().join("serde_json-1.0.0.crate");
+
+    upstream
+        .download_crate("serde_json", "1.0.0", &dest)
+        .await
+        .expect("a marker-less dl must get the default path appended");
 }
 
 /// The `{prefix}` marker uses the same segments as

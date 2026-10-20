@@ -435,7 +435,6 @@ refused" and "the refusals could not be read" are different answers.
 **Startup dispatch.** The binary checks for a `[cargo_registry]` table. If the
 table is present, the process boots the cargo path. If the table is absent, the
 process boots the PyPI path. No process serves both ecosystems.
-
 The cargo path builds its parts in this order: the database, the policy, the
 plugin sandbox, the plugin runner, the AI reviewer, the artifact cache, the
 upstream client, the advisory mirror, the cargo-vet audit store, the cascade
@@ -451,6 +450,28 @@ stores current.
 deployment feature of the PyPI path only. A cargo deployment logs a warning at
 startup and installs no signal handler. To change the config of a cargo
 deployment, restart the process.
+
+**The allowlist works the same way it does on PyPI.** An entry is consulted
+before every stored verdict, so it lifts a CVE block, an AI-review failure, and a
+plugin block alike. It never lifts the hash check: a download still has to match
+the `cksum` the index declared. An entry matches the crate name in either
+spelling, so `num_cpus` and `num-cpus` in the config both match the same crate.
+
+The index gate and the download gate each consult the allowlist, because they
+are two separate decisions. A version allowlisted after its index response was
+served is re-checked at the next `.crate` download.
+
+**The shared routes answer on a cargo deployment.** `/healthz`, `/why/<id>`, and
+`/api/reviews` are served here exactly as they are on the PyPI path, from the
+same code. Two consequences are worth knowing:
+
+- An operator's existing liveness probe keeps working, because `/healthz` reads
+  no state and both deployments mount the same handler.
+- A plugin refusal's `/why/<id>` link resolves, and so does every `/refusals`
+  row's link. A cargo developer who receives a refusal can read the explanation.
+
+`/api/reviews` sits behind the same `[ai_review]` gate as on PyPI: it answers
+404 when the table is absent, and a JSON listing when it is present.
 
 ## The crate version the proxy cannot see
 
@@ -486,6 +507,10 @@ An operator or a developer should do this, in order:
 
 Step 2 costs nothing and fixes the common case. Step 3 is an explicit human
 decision, recorded in the config, and that is the right place for it.
+
+A cargo deployment has no reload, so an `[[allowlist]]` entry added for step 3
+takes effect at the next restart. Plan for that: a developer who hits the pin
+before the restart still cannot resolve it.
 
 ## Known defects, not yet fixed
 

@@ -298,6 +298,9 @@ impl Harness {
                 ArtifactCache::new(db.clone(), cache_dir.path().join("artifacts"))
                     .expect("create artifact cache"),
             ),
+            reviews: Arc::new(supply_chain_scanner::db::review::ReviewStore::new(
+                db.clone(),
+            )),
         };
 
         let app = cargo_router(state);

@@ -6,14 +6,27 @@
 //! that originated inside the package the scan was blocking — is
 //! HTML-escaped. The page must not become the delivery vehicle for what
 //! the scan caught.
+//!
+//! # One lookup, two extractors
+//!
+//! Both deployments serve this page, and they carry different state
+//! types: [`super::AppState`] on the PyPI path,
+//! [`super::cargo_index::CargoAppState`] on the cargo one. The lookup and
+//! the rendering therefore live in [`why_for`], which takes the two
+//! stores it actually reads. [`why_handler`] and
+//! [`super::cargo_index::cargo_why_handler`] are thin extractors over it,
+//! the same split [`super::refusals`] uses for the same reason. There is
+//! exactly one copy of the lookup and one copy of the HTML.
+
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 
-use crate::db::review::StoredReview;
-use crate::db::verdict::StoredVerdict;
+use crate::db::review::{ReviewStore, StoredReview};
+use crate::db::verdict::{StoredVerdict, VerdictStore};
 use crate::model::{ArtifactKey, RefusalReason, Verdict};
 
 use super::AppState;
@@ -28,7 +41,20 @@ use super::AppState;
 /// back to a generic 500 rather than fabricating or guessing at content
 /// that was never actually read.
 pub async fn why_handler(State(state): State<AppState>, Path(why_id): Path<String>) -> Response {
-    let verdicts = state.verdicts;
+    why_for(state.verdicts, state.reviews, why_id).await
+}
+
+/// The shared lookup-and-render body of every `/why/<id>` handler: resolves
+/// `why_id` through `verdicts`, attaches the review that belongs to the
+/// verdict's own fingerprint, and renders the page.
+///
+/// `pub(crate)` because the cargo router's own handler calls it. See this
+/// module's docs for why the split is here and not inside the renderer.
+pub(crate) async fn why_for(
+    verdicts: Arc<VerdictStore>,
+    reviews: Arc<ReviewStore>,
+    why_id: String,
+) -> Response {
     let lookup_id = why_id.clone();
     let lookup = tokio::task::spawn_blocking(move || verdicts.get_by_why_id(&lookup_id)).await;
 
@@ -42,7 +68,7 @@ pub async fn why_handler(State(state): State<AppState>, Path(why_id): Path<Strin
             // verdict without an AI gate has none — so it renders as no
             // section, and a lookup failure costs the report, not the
             // explanation.
-            let reviews = state.reviews.clone();
+            let reviews = reviews.clone();
             let review_key = key.clone();
             let review_fingerprint = stored.fingerprint.clone();
             let review = tokio::task::spawn_blocking(move || {

@@ -11,10 +11,14 @@
 //!
 //! The decision order for one crate:
 //!
-//! 1. Drop every yanked entry and every entry in `cve_blocked`. A yanked
-//!    version is never a candidate, even when it is the newest one.
-//! 2. A surviving version is *forwardable* if a cargo-vet audit covers it,
-//!    or if AI review passed it.
+//! 1. Drop every yanked entry, and every entry in `cve_blocked` that is
+//!    not in `allowlisted`. A yanked version is never a candidate, even
+//!    when it is the newest one, and an allowlist entry does not revive a
+//!    yanked version either.
+//! 2. A surviving version is *forwardable* if an operator allowlisted it,
+//!    or a cargo-vet audit covers it, or AI review passed it. The
+//!    allowlist comes first, matching the PyPI path's precedence: a human
+//!    sign-off overrides both judgement checks.
 //! 3. If every survivor is forwardable, forward them all.
 //! 4. Otherwise review the newest survivor that is neither forwardable nor
 //!    already review-failed.
@@ -42,6 +46,16 @@ pub struct CascadeInput {
     pub review_status: HashMap<String, ReviewStatus>,
     /// Versions that a qualifying cargo-vet audit covers.
     pub vet_covered: HashSet<String>,
+    /// Versions an operator has allowlisted for this crate.
+    ///
+    /// An allowlist entry is a human sign-off, so it has the same force
+    /// here that [`crate::scan::Scanner::decide_inner`] gives it on the
+    /// PyPI path: it is consulted *before* any stored verdict, so it
+    /// overrides a CVE block and an AI-review failure alike. The one
+    /// check it never overrides is the artifact's hash, which
+    /// [`crate::http::cargo_download`] still verifies against the index
+    /// `cksum`.
+    pub allowlisted: HashSet<String>,
 }
 
 /// The AI-review result for one version.
@@ -67,7 +81,14 @@ pub enum NextStep {
 pub fn plan_cascade(input: &CascadeInput) -> NextStep {
     let mut survivors: Vec<String> = Vec::new();
     for entry in &input.entries {
-        if entry.yanked || input.cve_blocked.contains(&entry.vers) {
+        if entry.yanked {
+            continue;
+        }
+        // The allowlist is consulted before the CVE block, matching the
+        // PyPI path's precedence: an operator who allowlisted this exact
+        // version has overridden every judgement check, not just the
+        // reviewed ones.
+        if input.cve_blocked.contains(&entry.vers) && !input.allowlisted.contains(&entry.vers) {
             continue;
         }
         if !survivors.contains(&entry.vers) {
@@ -77,7 +98,8 @@ pub fn plan_cascade(input: &CascadeInput) -> NextStep {
     sort_newest_first(&mut survivors);
 
     let forwardable = |vers: &String| {
-        input.vet_covered.contains(vers)
+        input.allowlisted.contains(vers)
+            || input.vet_covered.contains(vers)
             || matches!(input.review_status.get(vers), Some(ReviewStatus::Passed))
     };
 
@@ -127,6 +149,7 @@ mod tests {
             cve_blocked: HashSet::new(),
             review_status: HashMap::new(),
             vet_covered: HashSet::new(),
+            allowlisted: HashSet::new(),
         };
         assert_eq!(
             plan_cascade(&input),
@@ -141,6 +164,7 @@ mod tests {
             cve_blocked: HashSet::new(),
             review_status: HashMap::new(),
             vet_covered: HashSet::from(["1.0.0".to_string(), "0.9.0".to_string()]),
+            allowlisted: HashSet::new(),
         };
         assert_eq!(
             plan_cascade(&input),
@@ -156,6 +180,7 @@ mod tests {
             cve_blocked: HashSet::from(["1.0.0".to_string()]),
             review_status: HashMap::new(),
             vet_covered: HashSet::new(),
+            allowlisted: HashSet::new(),
         };
         assert_eq!(
             plan_cascade(&input),
@@ -170,6 +195,7 @@ mod tests {
             cve_blocked: HashSet::new(),
             review_status: HashMap::new(),
             vet_covered: HashSet::new(),
+            allowlisted: HashSet::new(),
         };
         assert_eq!(
             plan_cascade(&input),
@@ -185,6 +211,7 @@ mod tests {
             cve_blocked: HashSet::new(),
             review_status: HashMap::from([("1.0.0".to_string(), ReviewStatus::Failed)]),
             vet_covered: HashSet::new(),
+            allowlisted: HashSet::new(),
         };
         assert_eq!(
             plan_cascade(&input),
@@ -202,6 +229,7 @@ mod tests {
             cve_blocked: HashSet::new(),
             review_status,
             vet_covered: HashSet::new(),
+            allowlisted: HashSet::new(),
         };
         assert_eq!(
             plan_cascade(&input),
@@ -220,6 +248,7 @@ mod tests {
                 ("0.9.0".to_string(), ReviewStatus::Failed),
             ]),
             vet_covered: HashSet::new(),
+            allowlisted: HashSet::new(),
         };
         assert_eq!(plan_cascade(&input), NextStep::Forward(Vec::new()));
     }
@@ -234,6 +263,7 @@ mod tests {
                 ("0.9.0".to_string(), ReviewStatus::Passed),
             ]),
             vet_covered: HashSet::new(),
+            allowlisted: HashSet::new(),
         };
         assert_eq!(
             plan_cascade(&input),
@@ -249,6 +279,7 @@ mod tests {
             cve_blocked: HashSet::from(["1.0.0".to_string(), "0.9.0".to_string()]),
             review_status: HashMap::new(),
             vet_covered: HashSet::new(),
+            allowlisted: HashSet::new(),
         };
         assert_eq!(plan_cascade(&input), NextStep::Forward(Vec::new()));
     }
@@ -260,6 +291,7 @@ mod tests {
             cve_blocked: HashSet::new(),
             review_status: HashMap::new(),
             vet_covered: HashSet::new(),
+            allowlisted: HashSet::new(),
         };
         assert_eq!(plan_cascade(&input), NextStep::Forward(Vec::new()));
     }
@@ -279,6 +311,7 @@ mod tests {
                 "0.10.0".to_string(),
                 "0.2.0".to_string(),
             ]),
+            allowlisted: HashSet::new(),
         };
         assert_eq!(
             plan_cascade(&input),
@@ -297,6 +330,7 @@ mod tests {
             cve_blocked: HashSet::new(),
             review_status: HashMap::new(),
             vet_covered: HashSet::from(["2.0.0-rc.1".to_string(), "2.0.0".to_string()]),
+            allowlisted: HashSet::new(),
         };
         assert_eq!(
             plan_cascade(&input),
@@ -323,6 +357,7 @@ mod tests {
                 "1.0.0".to_string(),
                 "zzz".to_string(),
             ]),
+            allowlisted: HashSet::new(),
         };
         assert_eq!(
             plan_cascade(&input),
@@ -342,6 +377,7 @@ mod tests {
             cve_blocked: HashSet::new(),
             review_status: HashMap::new(),
             vet_covered: HashSet::new(),
+            allowlisted: HashSet::new(),
         };
         assert_eq!(
             plan_cascade(&input),
@@ -356,6 +392,7 @@ mod tests {
             cve_blocked: HashSet::new(),
             review_status: HashMap::new(),
             vet_covered: HashSet::from(["1.0.0".to_string()]),
+            allowlisted: HashSet::new(),
         };
         assert_eq!(
             plan_cascade(&input),
@@ -370,6 +407,7 @@ mod tests {
             cve_blocked: HashSet::from(["1.0.0".to_string()]),
             review_status: HashMap::new(),
             vet_covered: HashSet::new(),
+            allowlisted: HashSet::new(),
         };
         assert_eq!(plan_cascade(&input), NextStep::Forward(Vec::new()));
     }

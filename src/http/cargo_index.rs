@@ -65,6 +65,7 @@ use axum::Router;
 
 use crate::artifact_cache::ArtifactCache;
 use crate::config::ConfigHandle;
+use crate::db::review::ReviewStore;
 use crate::db::verdict::VerdictStore;
 use crate::ecosystem::cargo::index::{index_path_for, validate_name, CargoIndexEntry};
 use crate::ecosystem::cargo::index_name;
@@ -102,6 +103,11 @@ use super::refusal::in_progress_response;
 ///   binaries over the unpacked `.crate`.
 /// - `artifact_cache` — the content-addressed cache the download gate
 ///   serves already-verified bytes from.
+/// - `reviews` — the AI-review audit table, read by `/why/<id>` (the
+///   report behind a refusal) and by `/api/reviews`. The same store the
+///   PyPI path serves; a cargo verdict's review row lives there too,
+///   because [`crate::ai::AiReviewer`] writes it without knowing which
+///   ecosystem asked.
 #[derive(Clone)]
 pub struct CargoAppState {
     pub cargo_scanner: Arc<CargoScanner>,
@@ -114,11 +120,13 @@ pub struct CargoAppState {
     pub plugins: Arc<PluginRunner>,
     /// The on-disk cache of verified artifact bytes.
     pub artifact_cache: Arc<ArtifactCache>,
+    /// The AI-review audit table behind `/why/<id>` and `/api/reviews`.
+    pub reviews: Arc<ReviewStore>,
 }
 
 /// Builds the cargo deployment's router: `/config.json`, the `.crate`
-/// download route, `/refusals`, and the catch-all sparse-index route.
-/// Task 11 mounts this.
+/// download route, `/refusals`, `/why/<id>`, `/api/reviews`, `/healthz`,
+/// and the catch-all sparse-index route. Task 11 mounts this.
 ///
 /// The download route is a static-prefix route registered on the same
 /// router as the `/{*path}` catch-all. `matchit` resolves a static segment
@@ -127,17 +135,27 @@ pub struct CargoAppState {
 /// [`cargo_index_handler`]. `tests/http_cargo_download.rs` pins this: it
 /// downloads an artifact, fetches an index path, and posts a traversal
 /// path through the same router and checks that each handler answered.
-/// `/refusals` resolves the same way, as a static segment.
+/// `/refusals`, `/why/<id>`, `/api/reviews` and `/healthz` resolve the
+/// same way, as static segments.
 ///
-/// `/refusals` is served by [`cargo_refusals_handler`], the cargo router's
-/// own thin extractor. [`super::refusals::refusals_handler`] takes
-/// `State<AppState>`, and this router carries [`CargoAppState`]; the HTML
-/// and the query live in one place, in [`super::refusals`], and only the
-/// extractor differs. See that module's docs.
+/// The three routes this deployment shares with the PyPI path are served
+/// by thin extractors in this module. [`super::refusals::refusals_handler`],
+/// [`super::why::why_handler`] and [`super::reviews::reviews_handler`] take
+/// `State<AppState>`, and this router carries [`CargoAppState`]. The
+/// lookup, the rendering and the gate live in one place in each module,
+/// and only the extractor differs. See each module's docs.
+///
+/// `/why/<id>` matters more here than on the PyPI path, not less. A
+/// plugin refusal arrives as a real status line with a reason phrase, and
+/// that phrase carries a `/why/<id>` link. Without this route the link a
+/// cargo developer is given would be a 404.
 pub fn cargo_router(state: CargoAppState) -> Router {
     Router::new()
         .route("/config.json", get(cargo_config_handler))
         .route("/refusals", get(cargo_refusals_handler))
+        .route("/why/{id}", get(cargo_why_handler))
+        .route("/api/reviews", get(cargo_reviews_handler))
+        .route("/healthz", get(super::healthz))
         .route(
             "/crates/{crate}/{version}/download",
             get(cargo_download_handler),
@@ -158,6 +176,25 @@ const CARGO_ECOSYSTEM: &str = "cargo";
 /// out of [`CargoAppState`].
 pub async fn cargo_refusals_handler(State(state): State<CargoAppState>) -> Response {
     super::refusals::refusals_for(state.verdicts, CARGO_ECOSYSTEM.to_string()).await
+}
+
+/// `GET /why/<id>` on a cargo deployment: the explanation page every
+/// refusal's reason phrase links to, read out of [`CargoAppState`].
+pub async fn cargo_why_handler(
+    State(state): State<CargoAppState>,
+    Path(why_id): Path<String>,
+) -> Response {
+    super::why::why_for(state.verdicts, state.reviews, why_id).await
+}
+
+/// `GET /api/reviews` on a cargo deployment: the same audit listing
+/// [`super::reviews::reviews_handler`] serves on the PyPI path, read out
+/// of [`CargoAppState`].
+pub async fn cargo_reviews_handler(
+    State(state): State<CargoAppState>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Response {
+    super::reviews::reviews_for(state.reviews, state.config, query).await
 }
 
 /// `GET /config.json`: the registry configuration cargo reads first.

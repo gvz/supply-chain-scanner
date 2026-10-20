@@ -55,6 +55,7 @@ use crate::plugin::unpack;
 use crate::policy::{AdvisoryVerdictInput, Policy};
 use crate::scan::cargo_cascade::{plan_cascade, CascadeInput, NextStep, ReviewStatus};
 use crate::scan::coordinator::{self, FinishGuard, ScanCoordinator};
+use crate::scan::is_allowlisted;
 
 /// The ecosystem id this module stores verdicts under. It is `"cargo"`
 /// (the same id [`crate::ecosystem::install_surface`] and the collector
@@ -127,6 +128,10 @@ struct Facts {
     advisories: Vec<Advisory>,
     review_status: HashMap<String, ReviewStatus>,
     vet_covered: HashSet<String>,
+    /// Versions the operator has allowlisted for this crate. Computed once
+    /// per cascade, not per iteration: an allowlist read is a config
+    /// snapshot, and every iteration of one cascade must see the same one.
+    allowlisted: HashSet<String>,
 }
 
 /// Why one candidate's review did not put it in the forwardable set.
@@ -254,8 +259,13 @@ impl CargoScanner {
                 .entry(entry.vers.clone())
                 .or_insert(ReviewStatus::Failed);
         }
-        let input =
-            self.cascade_input(entries, &facts.advisories, review_status, facts.vet_covered);
+        let input = self.cascade_input(
+            entries,
+            &facts.advisories,
+            review_status,
+            facts.vet_covered,
+            facts.allowlisted,
+        );
         match plan_cascade(&input) {
             NextStep::Forward(versions) => {
                 CargoIndexDecision::Entries(entries_for_versions(entries, &versions))
@@ -318,6 +328,7 @@ impl CargoScanner {
                 cve_blocked: cve_blocked.clone(),
                 review_status: std::mem::take(&mut facts.review_status),
                 vet_covered: std::mem::take(&mut facts.vet_covered),
+                allowlisted: facts.allowlisted.clone(),
             };
             let step = plan_cascade(&input);
             // Recover both maps: they are this caller's own data, and the
@@ -398,12 +409,17 @@ impl CargoScanner {
     }
 
     /// Builds the pure cascade input from the fetched facts.
+    ///
+    /// `allowlisted` is passed in rather than recomputed here so one
+    /// cascade reads the config snapshot exactly once, through
+    /// [`CargoScanner::allowlisted_for`] inside [`CargoScanner::facts`].
     fn cascade_input(
         &self,
         entries: &[CargoIndexEntry],
         advisories: &[Advisory],
         review_status: HashMap<String, ReviewStatus>,
         vet_covered: HashSet<String>,
+        allowlisted: HashSet<String>,
     ) -> CascadeInput {
         let mut cve_blocked = HashSet::new();
         for entry in entries {
@@ -419,6 +435,7 @@ impl CargoScanner {
             cve_blocked,
             review_status,
             vet_covered,
+            allowlisted,
         }
     }
 
@@ -450,6 +467,9 @@ impl CargoScanner {
         let entries = entries.to_vec();
         let (criterion, reviewers) = self.vet_requirements();
         let review_disabled = self.ai_reviewer.is_none();
+        // Read the config snapshot once, here, so every iteration of this
+        // cascade and every version in it sees the same allowlist.
+        let allowlisted = self.allowlisted_for(&entries);
 
         tokio::task::spawn_blocking(move || {
             let mut advisories: Vec<Advisory> = Vec::new();
@@ -493,12 +513,40 @@ impl CargoScanner {
                 advisories,
                 review_status,
                 vet_covered,
+                allowlisted,
             })
         })
         .await
         .map_err(|join_error| {
             anyhow::anyhow!("the cargo cascade fact lookup panicked: {join_error}")
         })?
+    }
+
+    /// The versions of the crate that the operator has allowlisted.
+    ///
+    /// This reuses [`crate::scan::is_allowlisted`], the crate's single
+    /// implementation of the allowlist comparison, rather than comparing
+    /// names a second way here. That function normalizes with the PyPI
+    /// rule; this passes each version through it unchanged, so the only
+    /// thing it decides is the package-and-version match the config
+    /// already defines.
+    ///
+    /// The package name is offered in both the normalized form the
+    /// cascade carries and the form crates.io publishes, because
+    /// `is_allowlisted` normalizes whichever it is given. An operator who
+    /// writes `num_cpus` in the config and one who writes `num-cpus` both
+    /// match.
+    fn allowlisted_for(&self, entries: &[CargoIndexEntry]) -> HashSet<String> {
+        let config = self.config.current();
+        let mut allowlisted = HashSet::new();
+        for entry in entries {
+            let matched = is_allowlisted(&config, &entry.name, &entry.vers)
+                || is_allowlisted(&config, &normalize_name(&entry.name), &entry.vers);
+            if matched {
+                allowlisted.insert(entry.vers.clone());
+            }
+        }
+        allowlisted
     }
 
     /// The cargo-vet criterion and reviewer list the fast path uses.

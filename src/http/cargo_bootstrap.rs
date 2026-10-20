@@ -75,6 +75,7 @@ use crate::cargovet::CargoVetSync;
 use crate::config::{Config, ConfigHandle};
 use crate::db::advisory::AdvisoryStore;
 use crate::db::cargo_vet::CargoVetStore;
+use crate::db::review::ReviewStore;
 use crate::db::verdict::VerdictStore;
 use crate::db::Db;
 use crate::ecosystem::cargo::normalize_name;
@@ -228,6 +229,10 @@ pub async fn bootstrap_cargo_with_sandbox_factory(
         verdicts: Arc::new(VerdictStore::new(db.clone())),
         plugins: Arc::new(plugin_runner),
         artifact_cache: Arc::new(artifact_cache),
+        // The AI-review audit table. `/why/<id>` reads the report behind a
+        // refusal out of it, and `/api/reviews` lists it. The reviewer
+        // that writes these rows is built above from this same database.
+        reviews: Arc::new(ReviewStore::new(db.clone())),
     };
 
     let router = cargo_router(state.clone());

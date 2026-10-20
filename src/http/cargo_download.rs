@@ -71,6 +71,7 @@ use crate::ecosystem::cargo::normalize_name;
 use crate::ecosystem::cargo::upstream::UpstreamError;
 use crate::model::{ArtifactKey, RefusalReason, Verdict};
 use crate::plugin::{is_check_failure, unpack};
+use crate::scan::is_allowlisted;
 
 use super::cargo_index::CargoAppState;
 use super::refusal::{refusal_response, unverifiable_response};
@@ -121,6 +122,17 @@ pub async fn cargo_download_handler(
 
     let key = crate::scan::cargo::artifact_key(&normalize_name(&name), entry);
     let fingerprint = state.cargo_scanner.fingerprint();
+
+    // The allowlist is consulted before the stored verdict, matching
+    // `Scanner::decide_inner` on the PyPI path: an operator who
+    // allowlisted this crate and version has overridden the judgement
+    // checks, and that override has to reach the stored block too. It
+    // never overrides the integrity check — the bytes still have to match
+    // the index `cksum`, which `download_and_verify` enforces on every
+    // path this branches to.
+    if is_allowlisted_crate(&state.config.current(), &name, &entry.vers) {
+        return serve_gated(&state, &key, entry, true).await;
+    }
 
     match stored_verdict(&state.verdicts, &key, &fingerprint).await {
         Ok(Some(Verdict::Blocked(reason))) => {
@@ -287,6 +299,16 @@ async fn serve_gated(
             refusal_response(&reason, link.as_deref())
         }
     }
+}
+
+/// Whether the operator has allowlisted `name` at `version`.
+///
+/// Reuses [`is_allowlisted`], the crate's single implementation of the
+/// allowlist comparison, for both spellings a crate name can arrive in:
+/// the published one (`num_cpus`) and the normalized one (`num-cpus`).
+/// An operator's config entry matches whichever they wrote.
+fn is_allowlisted_crate(config: &crate::config::Config, name: &str, version: &str) -> bool {
+    is_allowlisted(config, name, version) || is_allowlisted(config, &normalize_name(name), version)
 }
 
 /// Downloads the `.crate` to `dest` and checks its SHA-256 against the

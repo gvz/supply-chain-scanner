@@ -127,7 +127,14 @@ async fn access_log(
     response
 }
 
-async fn healthz() -> StatusCode {
+/// `GET /healthz`: an unconditional liveness probe.
+///
+/// `pub(crate)` so [`cargo_index::cargo_router`] can register the same
+/// handler. It reads no state at all, so both deployments share it
+/// unchanged rather than each carrying a copy. An operator's probe must
+/// answer on a cargo deployment too, or the deployment looks dead to
+/// whatever is watching it.
+pub(crate) async fn healthz() -> StatusCode {
     StatusCode::OK
 }
 

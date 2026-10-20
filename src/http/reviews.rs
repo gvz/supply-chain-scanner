@@ -21,6 +21,18 @@
 //! the collector version, and the timestamp. It never carries the
 //! provider API key (which is not stored anywhere) and never carries
 //! file payload content (which is not stored either).
+//!
+//! # One listing, two extractors
+//!
+//! Both deployments serve this endpoint, and they carry different state
+//! types: [`super::AppState`] on the PyPI path,
+//! [`super::cargo_index::CargoAppState`] on the cargo one. The gate, the
+//! filter parsing and the rendering therefore live in [`reviews_for`],
+//! which takes the store and the config it actually reads.
+//! [`reviews_handler`] and [`super::cargo_index::cargo_reviews_handler`]
+//! are thin extractors over it, the same split [`super::refusals`] uses.
+
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{RawQuery, State};
@@ -29,7 +41,8 @@ use axum::response::Response;
 use serde::Serialize;
 use url::form_urlencoded;
 
-use crate::db::review::ReviewFilter;
+use crate::config::ConfigHandle;
+use crate::db::review::{ReviewFilter, ReviewStore};
 use crate::model::ArtifactKey;
 
 use super::AppState;
@@ -101,6 +114,18 @@ struct ReviewsJson {
 
 /// `GET /api/reviews`.
 pub async fn reviews_handler(State(state): State<AppState>, RawQuery(query): RawQuery) -> Response {
+    reviews_for(state.reviews, state.config, query).await
+}
+
+/// The shared gate-parse-list body of every `/api/reviews` handler.
+///
+/// `pub(crate)` because the cargo router's own handler calls it. See this
+/// module's docs for why the split is here and not inside the renderer.
+pub(crate) async fn reviews_for(
+    reviews: Arc<ReviewStore>,
+    config: Arc<ConfigHandle>,
+    query: Option<String>,
+) -> Response {
     // The route is always registered -- `ai_review` is reloadable, so a
     // deployment that starts without it can turn it on at runtime, and
     // axum has no way to add a route a running router does not already
@@ -108,7 +133,11 @@ pub async fn reviews_handler(State(state): State<AppState>, RawQuery(query): Raw
     // *behavior* unchanged (a 404, exactly as if the route did not
     // exist) without reaching for the one thing that cannot change: the
     // set of routes themselves.
-    if state.config.current().ai_review.is_none() {
+    //
+    // The cargo deployment has no `Reloader`, but the same gate is
+    // correct there unchanged: its `[ai_review]` table is fixed at
+    // startup, so this reads the boot value every time.
+    if config.current().ai_review.is_none() {
         return not_found();
     }
 
@@ -117,7 +146,7 @@ pub async fn reviews_handler(State(state): State<AppState>, RawQuery(query): Raw
         Err(detail) => return bad_request(&detail),
     };
 
-    let store = state.reviews.clone();
+    let store = reviews.clone();
     let listed = tokio::task::spawn_blocking(move || store.list(&filter)).await;
     let reviews = match listed {
         Ok(Ok(reviews)) => reviews,

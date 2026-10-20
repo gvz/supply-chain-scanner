@@ -606,3 +606,311 @@ async fn bootstrap_cargo_refuses_a_config_with_no_cargo_registry_table() {
         "the error must name the missing table: {err:#}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The routes a cargo deployment shares with the PyPI path
+// ---------------------------------------------------------------------------
+
+/// `/healthz` must answer on a cargo deployment. An operator's liveness
+/// probe does not know which ecosystem it is watching, and a probe that
+/// 404s reads as a dead process.
+#[tokio::test]
+async fn a_cargo_deployment_answers_healthz() {
+    let server = MockServer::start().await;
+    mount_empty_osv_feed(&server).await;
+    let served = start(&server, |_, _| {}).await.expect("bootstrap");
+
+    let response = reqwest::get(format!("{}healthz", served.base_url))
+        .await
+        .expect("GET healthz");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+}
+
+/// `/why/<id>` must resolve on a cargo deployment. A plugin refusal
+/// arrives as a real 403 whose reason phrase carries a `/why/<id>` link,
+/// so without this route the proxy hands a developer a link to a 404.
+#[tokio::test]
+async fn a_cargo_plugin_refusal_why_link_resolves() {
+    let server = MockServer::start().await;
+    let bytes = crate_bytes("demo-crate", "1.0.0");
+    mount_registry(&server, "demo-crate", "1.0.0", &bytes).await;
+    mount_empty_osv_feed(&server).await;
+    mount_clean_model(&server).await;
+
+    let served = start(&server, |cfg, plugin_binary| {
+        cfg.plugins = vec![plugin_config(plugin_binary)];
+        cfg.ai_review = Some(ai_review_config(&server));
+    })
+    .await
+    .expect("bootstrap");
+
+    // Get the version admitted to the index first, then download it.
+    let index_url = format!("{}{}", served.base_url, index_path_for("demo-crate"));
+    let _ = reqwest::get(&index_url).await.expect("prime the cascade");
+    let download_url = format!("{}crates/demo-crate/1.0.0/download", served.base_url);
+    let download = reqwest::get(&download_url).await.expect("download");
+    assert_eq!(download.status(), reqwest::StatusCode::OK);
+
+    // A stored verdict exists for the artifact, so its why-id resolves.
+    let key = ArtifactKey {
+        ecosystem: "cargo".to_string(),
+        package: "demo-crate".to_string(),
+        version: "1.0.0".to_string(),
+        filename: "demo-crate-1.0.0.crate".to_string(),
+        sha256: sha256_hex(&bytes),
+    };
+    let stored = served
+        .wired
+        .state
+        .verdicts
+        .get(&key, &served.wired.state.cargo_scanner.fingerprint())
+        .expect("query the stored verdict")
+        .expect("a downloaded artifact must have a stored verdict");
+
+    let why_url = format!("{}why/{}", served.base_url, stored.why_id);
+    let why = reqwest::get(&why_url).await.expect("GET the why page");
+    assert_eq!(
+        why.status(),
+        reqwest::StatusCode::OK,
+        "a cargo deployment's /why/<id> must not be a 404"
+    );
+    let body = why.text().await.expect("read the why body");
+    assert!(
+        body.contains("demo-crate"),
+        "the page must explain this artifact: {body}"
+    );
+}
+
+/// `/api/reviews` must exist on a cargo deployment, behind the same
+/// `[ai_review]` gate it has on the PyPI path: a 404 when the table is
+/// absent, a JSON listing when it is present.
+#[tokio::test]
+async fn a_cargo_deployment_serves_api_reviews_behind_the_ai_gate() {
+    let server = MockServer::start().await;
+    mount_empty_osv_feed(&server).await;
+
+    // No [ai_review]: the gate must answer 404, exactly as on PyPI.
+    let without = start(&server, |_, _| {}).await.expect("bootstrap");
+    let gated = reqwest::get(format!("{}api/reviews", without.base_url))
+        .await
+        .expect("GET api/reviews");
+    assert_eq!(
+        gated.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "an unconfigured deployment must hide /api/reviews"
+    );
+
+    // With [ai_review]: the listing answers 200 JSON.
+    let configured = start(&server, |cfg, _| {
+        cfg.ai_review = Some(ai_review_config(&server));
+    })
+    .await
+    .expect("bootstrap");
+    let listed = reqwest::get(format!("{}api/reviews", configured.base_url))
+        .await
+        .expect("GET api/reviews");
+    assert_eq!(listed.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = listed.json().await.expect("api/reviews is JSON");
+    assert!(
+        body["reviews"].is_array(),
+        "the listing must carry a reviews array: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The allowlist, and CVE filtering, on the cargo path
+// ---------------------------------------------------------------------------
+
+/// An allowlist entry must let a version through the index gate with no
+/// AI review and no cargo-vet audit. This is the documented workaround
+/// for a version the newest-first walk cannot reach, so it has to work.
+#[tokio::test]
+async fn an_allowlisted_version_is_forwarded_without_any_review() {
+    let server = MockServer::start().await;
+    let bytes = crate_bytes("demo-crate", "1.0.0");
+    mount_registry(&server, "demo-crate", "1.0.0", &bytes).await;
+    mount_empty_osv_feed(&server).await;
+
+    // No reviewer configured: without the allowlist nothing could ever
+    // pass. With it, the version is forwarded.
+    let served = start(&server, |cfg, _| {
+        cfg.allowlist = vec![supply_chain_scanner::config::AllowEntry {
+            package: "demo-crate".to_string(),
+            version: "1.0.0".to_string(),
+        }];
+    })
+    .await
+    .expect("bootstrap");
+
+    let index_url = format!("{}{}", served.base_url, index_path_for("demo-crate"));
+    let body = reqwest::get(&index_url)
+        .await
+        .expect("GET the index file")
+        .text()
+        .await
+        .expect("read the body");
+    assert!(
+        body.contains("\"vers\":\"1.0.0\""),
+        "an allowlisted version must be forwarded: {body:?}"
+    );
+}
+
+/// An allowlist entry must also override a stored `Blocked` verdict at the
+/// download gate, the same precedence the PyPI path gives it. Without
+/// this, a version allowlisted after a plugin blocked it would stay
+/// refused forever.
+#[tokio::test]
+async fn an_allowlisted_version_overrides_a_stored_plugin_block() {
+    let server = MockServer::start().await;
+    let bytes = crate_bytes("demo-crate", "1.0.0");
+    mount_registry(&server, "demo-crate", "1.0.0", &bytes).await;
+    mount_empty_osv_feed(&server).await;
+    mount_clean_model(&server).await;
+
+    let served = start(&server, |cfg, plugin_binary| {
+        cfg.plugins = vec![plugin_config(plugin_binary)];
+        cfg.ai_review = Some(ai_review_config(&server));
+    })
+    .await
+    .expect("bootstrap");
+
+    // Store a block for this artifact, as a plugin refusal would.
+    let key = ArtifactKey {
+        ecosystem: "cargo".to_string(),
+        package: "demo-crate".to_string(),
+        version: "1.0.0".to_string(),
+        filename: "demo-crate-1.0.0.crate".to_string(),
+        sha256: sha256_hex(&bytes),
+    };
+    let fingerprint = served.wired.state.cargo_scanner.fingerprint();
+    served
+        .wired
+        .state
+        .verdicts
+        .put(
+            &key,
+            &Verdict::Blocked(RefusalReason {
+                code: "plugin:yara".to_string(),
+                detail: "blocked by a plugin".to_string(),
+            }),
+            &fingerprint,
+        )
+        .expect("store a blocked verdict");
+
+    let download_url = format!("{}crates/demo-crate/1.0.0/download", served.base_url);
+
+    // Without an allowlist, the stored block refuses the download.
+    let refused = reqwest::get(&download_url).await.expect("download");
+    assert_eq!(
+        refused.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a stored block must refuse a non-allowlisted artifact"
+    );
+
+    // The allowlist lives in the config snapshot `bootstrap_cargo` took,
+    // so assert the gate's decision directly through the same helper the
+    // handler uses. A fresh deployment with the entry set proves the
+    // override; mutating a running one is what SIGHUP would do, and the
+    // cargo path has no reloader.
+    let dirs = tempfile::tempdir().expect("create temp dir");
+    let _ = dirs;
+    let allowed = start(&server, |cfg, plugin_binary| {
+        cfg.plugins = vec![plugin_config(plugin_binary)];
+        cfg.ai_review = Some(ai_review_config(&server));
+        cfg.allowlist = vec![supply_chain_scanner::config::AllowEntry {
+            package: "demo-crate".to_string(),
+            version: "1.0.0".to_string(),
+        }];
+    })
+    .await
+    .expect("bootstrap");
+
+    let allowed_key = ArtifactKey {
+        ecosystem: "cargo".to_string(),
+        package: "demo-crate".to_string(),
+        version: "1.0.0".to_string(),
+        filename: "demo-crate-1.0.0.crate".to_string(),
+        sha256: sha256_hex(&bytes),
+    };
+    allowed
+        .wired
+        .state
+        .verdicts
+        .put(
+            &allowed_key,
+            &Verdict::Blocked(RefusalReason {
+                code: "plugin:yara".to_string(),
+                detail: "blocked by a plugin".to_string(),
+            }),
+            &allowed.wired.state.cargo_scanner.fingerprint(),
+        )
+        .expect("store a blocked verdict");
+
+    let served_bytes = reqwest::get(format!(
+        "{}crates/demo-crate/1.0.0/download",
+        allowed.base_url
+    ))
+    .await
+    .expect("download");
+    assert_eq!(
+        served_bytes.status(),
+        reqwest::StatusCode::OK,
+        "an allowlisted artifact must be served despite its stored block"
+    );
+}
+
+/// The CVE half of the cascade: a version matching a blocking advisory
+/// must be absent from the forwarded index. This is the check that runs
+/// against every published version on every request, and nothing on the
+/// cargo path tested it before.
+#[tokio::test]
+async fn a_cve_blocked_version_is_absent_from_the_forwarded_index() {
+    let server = MockServer::start().await;
+    let bytes = crate_bytes("demo-crate", "1.0.0");
+    mount_registry(&server, "demo-crate", "1.0.0", &bytes).await;
+    mount_empty_osv_feed(&server).await;
+    mount_clean_model(&server).await;
+
+    let served = start(&server, |cfg, _| {
+        cfg.ai_review = Some(ai_review_config(&server));
+        // Block every advisory scoring at least 7.0, which the seeded
+        // advisory below does.
+        cfg.cve.min_severity = 7.0;
+    })
+    .await
+    .expect("bootstrap");
+
+    // Seed the mirror after startup, so the initial (empty) OSV sync is
+    // not what decides this test.
+    supply_chain_scanner::db::advisory::AdvisoryStore::new(served.wired.db.clone())
+        .replace_all(
+            "crates.io",
+            &[supply_chain_scanner::advisory::Advisory {
+                id: "RUSTSEC-TEST".to_string(),
+                package: "demo-crate".to_string(),
+                summary: "a test advisory".to_string(),
+                severity: Some(9.8),
+                versions: vec!["1.0.0".to_string()],
+                ranges: Vec::new(),
+                fixed_versions: Vec::new(),
+            }],
+        )
+        .expect("seed the advisory mirror");
+
+    let index_url = format!("{}{}", served.base_url, index_path_for("demo-crate"));
+    let response = reqwest::get(&index_url).await.expect("GET the index file");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "a crate whose every version is advisory-blocked must still answer 200"
+    );
+    let body = response.text().await.expect("read the body");
+    assert!(
+        !body.contains("1.0.0"),
+        "a CVE-blocked version must not be forwarded: {body:?}"
+    );
+    assert!(
+        body.trim().is_empty(),
+        "the whole version list is blocked, so the body must be empty: {body:?}"
+    );
+}

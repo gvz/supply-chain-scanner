@@ -108,6 +108,16 @@ use super::refusal::in_progress_response;
 ///   PyPI path serves; a cargo verdict's review row lives there too,
 ///   because [`crate::ai::AiReviewer`] writes it without knowing which
 ///   ecosystem asked.
+/// - `plugin_run_coordinator` — deduplicates concurrent first-touch
+///   `.crate` downloads for the same artifact hash, the download gate's
+///   own instance of the same single-flight pattern [`CargoScanner`]
+///   already uses for the AI-review cascade (and the PyPI path uses for
+///   its own full scan and cache-miss re-download). Without it, two
+///   concurrent `cargo build`/`cargo check` calls that both hit a
+///   never-plugin-checked artifact each independently download, unpack,
+///   and run every plugin — exactly the N-times cost
+///   [`crate::scan::coordinator`]'s own module docs describe, just on the
+///   download side of the cargo gate rather than the index side.
 #[derive(Clone)]
 pub struct CargoAppState {
     pub cargo_scanner: Arc<CargoScanner>,
@@ -122,6 +132,9 @@ pub struct CargoAppState {
     pub artifact_cache: Arc<ArtifactCache>,
     /// The AI-review audit table behind `/why/<id>` and `/api/reviews`.
     pub reviews: Arc<ReviewStore>,
+    /// Single-flight dedup for the `.crate` download's plugin run, keyed
+    /// by artifact sha256. See the field's own doc line above.
+    pub plugin_run_coordinator: Arc<crate::scan::coordinator::ScanCoordinator>,
 }
 
 /// Builds the cargo deployment's router: `/config.json`, the `.crate`

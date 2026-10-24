@@ -192,6 +192,10 @@ enum Behaviour {
     Block(String),
     /// The sandbox cannot run the plugin at all.
     CannotRun(String),
+    /// Sleeps, then exits 0. Gives a concurrency test a window in which
+    /// two requests for the same artifact are both genuinely in flight at
+    /// once, rather than one finishing before the other starts.
+    SlowThenClean(Duration),
 }
 
 /// A `SandboxRunner` stub that counts its invocations and answers with a
@@ -231,6 +235,15 @@ impl SandboxRunner for StubSandbox {
                 signal: None,
             }),
             Behaviour::CannotRun(message) => Err(anyhow::anyhow!(message.clone())),
+            Behaviour::SlowThenClean(duration) => {
+                std::thread::sleep(*duration);
+                Ok(SandboxOutcome {
+                    exit_code: Some(0),
+                    output: String::new(),
+                    timed_out: false,
+                    signal: None,
+                })
+            }
         }
     }
 }
@@ -301,6 +314,7 @@ impl Harness {
             reviews: Arc::new(supply_chain_scanner::db::review::ReviewStore::new(
                 db.clone(),
             )),
+            plugin_run_coordinator: Arc::new(ScanCoordinator::new()),
         };
 
         let app = cargo_router(state);
@@ -590,6 +604,58 @@ async fn a_second_download_of_the_same_artifact_does_not_re_run_plugins() {
         1,
         "the second download must be served from the cache, not re-fetched"
     );
+}
+
+#[tokio::test]
+async fn two_concurrent_first_downloads_of_the_same_artifact_only_run_the_plugin_once() {
+    // Without `CargoAppState::plugin_run_coordinator`, two requests that
+    // both arrive before either has stored a verdict would each
+    // independently download, unpack, and run the plugin set. The slow
+    // behaviour gives both requests a real window to be in flight at
+    // once, rather than the first completing (and caching its verdict)
+    // before the second even starts.
+    let v = version("demo-crate", "1.0.0");
+    let harness = Harness::start(
+        "demo-crate",
+        &[&v],
+        Behaviour::SlowThenClean(Duration::from_millis(200)),
+    )
+    .await;
+    let target = download_target("demo-crate", "1.0.0");
+
+    let (first, second) = tokio::join!(harness.get(&target), harness.get(&target));
+
+    assert_eq!(first.0, 200, "the first concurrent download must succeed");
+    assert_eq!(second.0, 200, "the second concurrent download must succeed");
+    assert_eq!(
+        first.3, v.bytes,
+        "the first response must carry the real .crate bytes"
+    );
+    assert_eq!(
+        second.3, v.bytes,
+        "the second response must carry the real .crate bytes too, whether \
+         it owned the plugin run or joined the other request's"
+    );
+    assert_eq!(
+        harness.sandbox.calls(),
+        1,
+        "two concurrent first-touch downloads of the same artifact must run \
+         the plugin set exactly once between them, not once each"
+    );
+    assert_eq!(
+        harness
+            .upstream_hits(&upstream_download_path("demo-crate", "1.0.0"))
+            .await,
+        1,
+        "only the owning request should have fetched the .crate bytes from \
+         upstream; a joiner reuses them from the artifact cache"
+    );
+
+    let stored = harness
+        .stored_verdict(&key("demo-crate", "1.0.0", &v.declared_cksum))
+        .expect("a clean verdict must be stored exactly once");
+    assert_eq!(stored, Verdict::Clean);
+    assert!(harness.plugin_checked(&key("demo-crate", "1.0.0", &v.declared_cksum)));
 }
 
 #[tokio::test]

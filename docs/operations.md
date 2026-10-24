@@ -538,6 +538,14 @@ Recorded honestly so nobody rediscovers them the hard way.
   single-digit milliseconds.
 - `Policy::build` checks that a plugin binary is *readable*, not executable, so a
   non-executable plugin passes startup and then refuses everything.
+- **A cargo-vet-covered version leaves no distinguishing record.** The cascade
+  never downloads or stores anything for a version admitted purely by a
+  qualifying cargo-vet audit, so neither `/why/<id>` nor `/api/reviews` can say
+  "covered by Mozilla's audit" the way they say "AI-reviewed, clean" for a
+  version the reviewer actually examined. An operator sees the version resolve
+  and sees no review row for it; nothing surfaces today to say why. The design
+  spec flags this as an open question rather than a decision, and this is the
+  honest state until it gets one.
 - The `Ecosystem` trait is a half-realized seam: the HTTP layer goes through it,
   but the scanner still holds a concrete `Upstream` and calls `unpack` directly.
   Adding npm or cargo means finishing that first.

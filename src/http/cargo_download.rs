@@ -35,6 +35,14 @@
 //! plugins have seen this artifact; only the flag does. See
 //! [`crate::db::verdict`].
 //!
+//! # One plugin run per artifact, even under concurrency
+//!
+//! A first-touch download is deduplicated by
+//! [`CargoAppState::plugin_run_coordinator`], keyed by `key.sha256`:
+//! concurrent requests for the same not-yet-plugin-checked artifact share
+//! one download-unpack-plugin run rather than each paying for their own.
+//! See [`serve_with_plugin_dedup`].
+//!
 //! # What is checked, and what is not
 //!
 //! The crate name is untrusted and goes through
@@ -71,6 +79,7 @@ use crate::ecosystem::cargo::normalize_name;
 use crate::ecosystem::cargo::upstream::UpstreamError;
 use crate::model::{ArtifactKey, RefusalReason, Verdict};
 use crate::plugin::{is_check_failure, unpack};
+use crate::scan::coordinator::{self, FinishGuard};
 use crate::scan::is_allowlisted;
 
 use super::cargo_index::CargoAppState;
@@ -173,57 +182,135 @@ async fn serve_gated(
     entry: &CargoIndexEntry,
     run_plugins: bool,
 ) -> Response {
-    let fingerprint = state.cargo_scanner.fingerprint();
-
     if !run_plugins {
-        match cache_get(state, key).await {
-            Ok(Some(path)) => match tokio::fs::read(&path).await {
-                Ok(bytes) => return crate_response(bytes),
+        return serve_verified_bytes(state, key, entry).await;
+    }
+    serve_with_plugin_dedup(state, key, entry).await
+}
+
+/// Serves already-admitted bytes for `key`: a cache hit read straight
+/// back, or a fresh download re-verified against the index `cksum` when
+/// the cache entry is gone. Used both by the plugin-checked fast path and
+/// by a caller that just learned, via [`serve_with_plugin_dedup`]'s
+/// coordinator, that another request's plugin run already passed.
+async fn serve_verified_bytes(
+    state: &CargoAppState,
+    key: &ArtifactKey,
+    entry: &CargoIndexEntry,
+) -> Response {
+    match cache_get(state, key).await {
+        Ok(Some(path)) => match tokio::fs::read(&path).await {
+            Ok(bytes) => crate_response(bytes),
+            Err(err) => unverifiable_response(&internal_reason(&format!(
+                "reading the cached artifact: {err}"
+            ))),
+        },
+        Ok(None) => {
+            // The cache entry is gone. Re-download and re-verify, but no
+            // plugin needs to see bytes an earlier run already admitted
+            // for this exact hash.
+            let temp = match tempfile::tempdir() {
+                Ok(dir) => dir,
                 Err(err) => {
                     return unverifiable_response(&internal_reason(&format!(
-                        "reading the cached artifact: {err}"
+                        "creating a temporary download directory: {err}"
                     )))
                 }
-            },
-            Ok(None) => {
-                // The cache entry is gone. Re-download and re-verify, but
-                // no plugin needs to see bytes an earlier run already
-                // admitted for this exact hash.
-                let temp = match tempfile::tempdir() {
-                    Ok(dir) => dir,
-                    Err(err) => {
-                        return unverifiable_response(&internal_reason(&format!(
-                            "creating a temporary download directory: {err}"
-                        )))
-                    }
-                };
-                let dest = temp.path().join(&key.filename);
-                return match download_and_verify(state, entry, key, &dest).await {
-                    Ok(local) => serve_cached(state, key, &local).await,
-                    Err(response) => response,
-                };
-            }
-            Err(err) => {
-                return unverifiable_response(&internal_reason(&format!(
-                    "reading the artifact cache: {err:#}"
-                )))
+            };
+            let dest = temp.path().join(&key.filename);
+            match download_and_verify(state, entry, key, &dest).await {
+                Ok(local) => serve_cached(state, key, &local).await,
+                Err(response) => response,
             }
         }
+        Err(err) => unverifiable_response(&internal_reason(&format!(
+            "reading the artifact cache: {err:#}"
+        ))),
     }
+}
 
-    // The full path: download, verify, unpack, run the plugins.
+/// Runs the full plugin gate for `key`/`entry` for exactly one caller at a
+/// time, deduplicated by `key.sha256` through
+/// [`CargoAppState::plugin_run_coordinator`].
+///
+/// Without this, two concurrent first-touch requests for the same
+/// never-plugin-checked artifact (two `cargo build`s in a CI matrix, two
+/// developers) would each independently download, unpack, and run every
+/// configured plugin — the same N-times cost
+/// [`crate::scan::coordinator`]'s own docs describe for the analogous PyPI
+/// case, which this gate had been missing. The owner runs
+/// [`run_plugin_gate`] and broadcasts its verdict, if one was durably
+/// stored, to every joiner; a joiner that learns the outcome was `Clean`
+/// still calls [`serve_verified_bytes`] itself rather than reusing the
+/// owner's response directly, since the owner's bytes were read into a
+/// response the joiner never held — this re-verification is cheap (a
+/// cache hit) and mirrors how the PyPI path's own joined-verdict handling
+/// (`Scanner::decision_from_joined_verdict`) always re-fetches rather than
+/// shares a `Response` across callers.
+async fn serve_with_plugin_dedup(
+    state: &CargoAppState,
+    key: &ArtifactKey,
+    entry: &CargoIndexEntry,
+) -> Response {
+    match state.plugin_run_coordinator.start_or_join(&key.sha256) {
+        Ok(tx) => {
+            // Constructed first, exactly as `Scanner::scan_with_budget`'s
+            // owner does: its `Drop` must run after the gate finishes and
+            // its outcome is sent, on every exit path including a future
+            // one added by a change to `run_plugin_gate`, so a panic
+            // there can never leave this sha256 permanently stuck for
+            // every later request.
+            let _finish_guard = FinishGuard::new(
+                Arc::clone(&state.plugin_run_coordinator),
+                key.sha256.clone(),
+            );
+            let (response, verdict) = run_plugin_gate(state, key, entry).await;
+            let _ = tx.send(verdict);
+            response
+        }
+        Err(rx) => match coordinator::wait_for_verdict(rx).await {
+            Some(Verdict::Clean) => serve_verified_bytes(state, key, entry).await,
+            Some(Verdict::Blocked(reason)) => {
+                let fingerprint = state.cargo_scanner.fingerprint();
+                let link = stored_why_id(&state.verdicts, key, &fingerprint)
+                    .await
+                    .and_then(|id| why_url(&state.config.current(), &id));
+                refusal_response(&reason, link.as_deref())
+            }
+            None => unverifiable_response(&scan_incomplete_reason()),
+        },
+    }
+}
+
+/// Downloads, verifies, unpacks, and runs every configured plugin over
+/// `key`/`entry` once. Returns the response to send to the caller that
+/// owns this run, alongside the verdict to broadcast to any joiners —
+/// `Some` only when that verdict was actually stored durably (mirroring
+/// `crate::scan::verdict_for_dedup`'s own rule: a joiner must only ever
+/// reuse a verdict this run actually persisted, never one a storage
+/// failure or a check failure left unrecorded).
+async fn run_plugin_gate(
+    state: &CargoAppState,
+    key: &ArtifactKey,
+    entry: &CargoIndexEntry,
+) -> (Response, Option<Verdict>) {
+    let fingerprint = state.cargo_scanner.fingerprint();
+
     let temp = match tempfile::tempdir() {
         Ok(dir) => dir,
         Err(err) => {
-            return unverifiable_response(&internal_reason(&format!(
-                "creating a temporary download directory: {err}"
-            )))
+            return (
+                unverifiable_response(&internal_reason(&format!(
+                    "creating a temporary download directory: {err}"
+                ))),
+                None,
+            )
         }
     };
     let dest = temp.path().join(&key.filename);
     let local = match download_and_verify(state, entry, key, &dest).await {
         Ok(local) => local,
-        Err(response) => return response,
+        Err(response) => return (response, None),
     };
 
     let unpacked = temp.path().join("unpacked");
@@ -232,14 +319,20 @@ async fn serve_gated(
     match tokio::task::spawn_blocking(move || unpack(&unpack_source, &unpack_dest)).await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
-            return unverifiable_response(&internal_reason(&format!(
-                "unpacking the downloaded .crate: {err:#}"
-            )))
+            return (
+                unverifiable_response(&internal_reason(&format!(
+                    "unpacking the downloaded .crate: {err:#}"
+                ))),
+                None,
+            )
         }
         Err(join_error) => {
-            return unverifiable_response(&internal_reason(&format!(
-                "the unpack task did not complete: {join_error}"
-            )))
+            return (
+                unverifiable_response(&internal_reason(&format!(
+                    "the unpack task did not complete: {join_error}"
+                ))),
+                None,
+            )
         }
     }
 
@@ -250,35 +343,46 @@ async fn serve_gated(
             // it plugin-checked, then cache and serve the bytes.
             if let Err(err) = store_verdict(state, key, &Verdict::Clean, &fingerprint).await {
                 // A verdict that cannot be stored is not a verdict. Serve
-                // nothing rather than bytes whose record does not exist.
-                return unverifiable_response(&internal_reason(&format!(
-                    "storing the clean verdict: {err:#}"
-                )));
+                // nothing rather than bytes whose record does not exist,
+                // and broadcast nothing: a joiner must re-attempt rather
+                // than believe a clean outcome that was never recorded.
+                return (
+                    unverifiable_response(&internal_reason(&format!(
+                        "storing the clean verdict: {err:#}"
+                    ))),
+                    None,
+                );
             }
             if let Err(err) = mark_plugin_checked(state, key, &fingerprint).await {
-                return unverifiable_response(&internal_reason(&format!(
-                    "marking the verdict plugin-checked: {err:#}"
-                )));
+                return (
+                    unverifiable_response(&internal_reason(&format!(
+                        "marking the verdict plugin-checked: {err:#}"
+                    ))),
+                    None,
+                );
             }
-            serve_cached(state, key, &local).await
+            let response = serve_cached(state, key, &local).await;
+            (response, Some(Verdict::Clean))
         }
         Some(reason) => {
             if is_check_failure(&reason) {
                 // The plugin never reached a verdict. Nothing is stored,
-                // so a retry runs the plugins again rather than serving a
-                // durable block about an artifact nothing examined.
+                // so a retry — including a joiner that was waiting on
+                // this very run — attempts the plugins again rather than
+                // being handed a durable block about an artifact nothing
+                // examined.
                 tracing::warn!(
                     package = %key.package,
                     version = %key.version,
                     code = %reason.code,
                     "a cargo plugin could not run; answering unverifiable and storing nothing"
                 );
-                return unverifiable_response(&reason);
+                return (unverifiable_response(&reason), None);
             }
             let stored =
                 store_verdict(state, key, &Verdict::Blocked(reason.clone()), &fingerprint).await;
-            let why_id = match stored {
-                Ok(why_id) => Some(why_id),
+            let (why_id, broadcast) = match stored {
+                Ok(why_id) => (Some(why_id), Some(Verdict::Blocked(reason.clone()))),
                 Err(err) => {
                     tracing::warn!(
                         package = %key.package,
@@ -286,7 +390,7 @@ async fn serve_gated(
                         error = %format!("{err:#}"),
                         "a cargo plugin block could not be stored; refusing without a /why link"
                     );
-                    None
+                    (None, None)
                 }
             };
             let link = why_id.and_then(|id| why_url(&state.config.current(), &id));
@@ -296,8 +400,19 @@ async fn serve_gated(
                 code = %reason.code,
                 "a cargo plugin blocked this artifact"
             );
-            refusal_response(&reason, link.as_deref())
+            (refusal_response(&reason, link.as_deref()), broadcast)
         }
+    }
+}
+
+/// The refusal used when a joiner learns the owning plugin run ended
+/// without ever producing a verdict (a download failure, an unpack
+/// failure, a plugin check failure, a storage failure) — mirrors
+/// `crate::scan`'s own `scan_incomplete_reason`.
+fn scan_incomplete_reason() -> RefusalReason {
+    RefusalReason {
+        code: "unverifiable:scan-incomplete".to_string(),
+        detail: "the plugin run for this artifact did not complete".to_string(),
     }
 }
 

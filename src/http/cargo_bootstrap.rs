@@ -233,6 +233,14 @@ pub async fn bootstrap_cargo_with_sandbox_factory(
         // refusal out of it, and `/api/reviews` lists it. The reviewer
         // that writes these rows is built above from this same database.
         reviews: Arc::new(ReviewStore::new(db.clone())),
+        // A coordinator of its own, separate from the one `CargoScanner`
+        // holds internally for the AI-review cascade: that one
+        // deduplicates by (package, candidate version) at index time,
+        // this one deduplicates `.crate` downloads by artifact sha256 at
+        // download time, exactly as the PyPI path keeps its full-scan
+        // and fetch coordinators separate (`Scanner::coordinator` vs.
+        // `Scanner::fetch_coordinator`).
+        plugin_run_coordinator: Arc::new(ScanCoordinator::new()),
     };
 
     let router = cargo_router(state.clone());

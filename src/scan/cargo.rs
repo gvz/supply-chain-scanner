@@ -536,6 +536,16 @@ impl CargoScanner {
     /// `is_allowlisted` normalizes whichever it is given. An operator who
     /// writes `num_cpus` in the config and one who writes `num-cpus` both
     /// match.
+    ///
+    /// `is_allowlisted`'s PyPI rule collapses *runs* of `-`/`_`/`.`
+    /// (PEP 503), where `crate::ecosystem::cargo::normalize_name` only
+    /// ever substitutes a single `_` for `-`. The two agree for every
+    /// ordinary crate name. A crate name with a repeated separator
+    /// (`foo__bar`, which crates.io's own charset rule permits) could in
+    /// principle compare differently here than it does against the CVE
+    /// and cargo-vet lookups elsewhere in this same cascade. Accepted as
+    /// a known edge case rather than a second normalizer: pathological
+    /// names are the only input that reaches it.
     fn allowlisted_for(&self, entries: &[CargoIndexEntry]) -> HashSet<String> {
         let config = self.config.current();
         let mut allowlisted = HashSet::new();

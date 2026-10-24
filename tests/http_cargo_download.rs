@@ -62,6 +62,7 @@ fn base_config(plugin_binary: PathBuf) -> Config {
             require_fix_available: false,
             unknown_severity: UnknownSeverity::Allow,
         },
+        min_release_age_days: None,
         download: Default::default(),
         allowlist: Vec::new(),
         plugins: vec![PluginConfig {

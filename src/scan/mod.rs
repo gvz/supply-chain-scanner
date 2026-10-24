@@ -48,6 +48,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
+use chrono::Utc;
 use tokio::sync::Semaphore;
 
 use crate::advisory::matching::first_blocking;
@@ -552,6 +553,18 @@ impl Scanner {
         rules: &ScanRules,
         fingerprint: &str,
     ) -> Decision {
+        if let Some(reason) = self.too_new(key, entry, &rules.policy).await {
+            return Decision::Refuse {
+                reason,
+                // Deliberately not stored: see `too_new`'s doc comment.
+                // A durable `Blocked` verdict here would keep refusing
+                // this artifact forever, even once it has aged past the
+                // threshold — ages only grow, but a stored verdict never
+                // ages with it.
+                why_id: None,
+            };
+        }
+
         let advisories = match self.advisory_lookup(&key.ecosystem, &key.package).await {
             Ok(advisories) => advisories,
             Err(_) => {
@@ -940,6 +953,58 @@ impl Scanner {
             .context("store verdict task panicked")?
     }
 
+    /// Checks `entry` against `Policy::min_release_age_days`, when the
+    /// gate is configured.
+    ///
+    /// Returns `Some(reason)` only when upstream reported a definite
+    /// publish time for this exact filename and that time is younger
+    /// than the threshold. Every other outcome — the gate is off, the
+    /// fetch failed, or upstream reported no publish time at all for
+    /// this file — returns `None` and lets the rest of the scan proceed:
+    /// this is a best-effort hygiene control layered on top of the CVE
+    /// and AI-review gates, not a replacement for either, so an outage
+    /// here degrades to "age is not checked this time" rather than to a
+    /// refusal.
+    async fn too_new(
+        &self,
+        key: &ArtifactKey,
+        entry: &IndexEntry,
+        policy: &Policy,
+    ) -> Option<RefusalReason> {
+        let min_days = policy.min_release_age_days()?;
+
+        let times = match self.upstream.release_times(&key.package).await {
+            Ok(times) => times,
+            Err(err) => {
+                tracing::warn!(
+                    package = %key.package,
+                    error = %err,
+                    "could not fetch release times for the release-age gate; \
+                     skipping it for this scan"
+                );
+                return None;
+            }
+        };
+
+        let Some(released) = times.get(&entry.filename) else {
+            tracing::debug!(
+                package = %key.package,
+                filename = %key.filename,
+                "upstream reported no publish time for this file; \
+                 skipping the release-age gate for it"
+            );
+            return None;
+        };
+
+        let age = Utc::now().signed_duration_since(*released);
+        let min_age = chrono::Duration::days(min_days as i64);
+        if age >= min_age {
+            return None;
+        }
+
+        Some(too_new_reason(min_days, age))
+    }
+
     async fn advisory_lookup(
         &self,
         ecosystem: &str,
@@ -1121,6 +1186,16 @@ fn no_hash_reason() -> RefusalReason {
     RefusalReason {
         code: "unverifiable:no-hash".to_string(),
         detail: "the package index did not declare a hash for this artifact".to_string(),
+    }
+}
+
+fn too_new_reason(min_days: u64, age: chrono::Duration) -> RefusalReason {
+    RefusalReason {
+        code: "too-new".to_string(),
+        detail: format!(
+            "this file was published {} day(s) ago; the org requires at least {min_days}",
+            age.num_days().max(0)
+        ),
     }
 }
 
@@ -1319,6 +1394,7 @@ mod tests {
                 require_fix_available: false,
                 unknown_severity: UnknownSeverity::Allow,
             },
+            min_release_age_days: None,
             download: Default::default(),
             allowlist: Vec::new(),
             plugins: Vec::new(),

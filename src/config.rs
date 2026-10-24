@@ -44,6 +44,23 @@ pub struct Config {
     #[serde(default = "default_advisory_source_url")]
     pub advisory_source_url: Url,
     pub cve: CveLine,
+    /// The youngest a published file may be and still be forwarded, in
+    /// days since it was uploaded. `None` (the default) turns this gate
+    /// off entirely, so an unconfigured deployment behaves as it does
+    /// today. This is the PyPI deployment's setting; a `[cargo_registry]`
+    /// deployment sets `CargoRegistryConfig::min_release_age_days`
+    /// instead, so the two ecosystems can run different thresholds (or
+    /// one with the gate off and the other with it on).
+    ///
+    /// This is a best-effort hygiene control, not a security gate like
+    /// `cve` or AI review: when upstream does not report a file's publish
+    /// time at all (an index that predates PEP 700, or a lookup that
+    /// fails), the gate does not block — it logs and defers to the other
+    /// checks, which is why an age it cannot determine is never treated
+    /// as "too new" the way a confirmed CVE is always treated as
+    /// blocking.
+    #[serde(default)]
+    pub min_release_age_days: Option<u64>,
     /// Timeouts for downloading an artifact's bytes. Optional — see
     /// [`DownloadLimits::default`].
     #[serde(default)]
@@ -303,6 +320,14 @@ pub struct CargoRegistryConfig {
     /// it. Optional — defaults to empty.
     #[serde(default)]
     pub trusted_reviewers: Vec<String>,
+    /// The cargo deployment's own version of [`Config::min_release_age_days`]:
+    /// the youngest a crate version may be and still be forwarded, in days
+    /// since crates.io published it. `None` turns the gate off for this
+    /// deployment, independently of whatever the PyPI deployment's own
+    /// setting is. Same best-effort semantics: a version whose publish
+    /// time cannot be determined is never blocked on age grounds alone.
+    #[serde(default)]
+    pub min_release_age_days: Option<u64>,
 }
 
 /// One trusted cargo-vet audit set: a name for logs and errors, and the

@@ -408,3 +408,67 @@ async fn download_crate_respects_the_configured_stall_timeout() {
         "a failed download must not leave its temp file behind: {leftovers:?}"
     );
 }
+
+#[tokio::test]
+async fn release_times_reads_created_at_from_the_registry_api() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/config.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "{{\"dl\":\"{}/crates\",\"api\":\"{}\"}}",
+            server.uri(),
+            server.uri()
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/crates/demo"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"versions":[{"num":"1.0.0","created_at":"2024-01-15T10:00:00Z"},{"num":"1.1.0","created_at":"2024-06-01T00:00:00Z"}]}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let base = Url::parse(&format!("{}/", server.uri())).expect("valid index base url");
+    let upstream = with_default_limits(base);
+
+    let times = upstream
+        .release_times("demo")
+        .await
+        .expect("release_times should succeed");
+
+    assert_eq!(
+        times.get("1.0.0").expect("1.0.0 present").to_rfc3339(),
+        "2024-01-15T10:00:00+00:00"
+    );
+    assert_eq!(
+        times.get("1.1.0").expect("1.1.0 present").to_rfc3339(),
+        "2024-06-01T00:00:00+00:00"
+    );
+}
+
+/// A registry that serves only the sparse index (no `api` field in
+/// `config.json`) has nowhere to ask for release times.
+#[tokio::test]
+async fn release_times_is_not_found_when_config_json_has_no_api_field() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/config.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!("{{\"dl\":\"{}/crates\"}}", server.uri())),
+        )
+        .mount(&server)
+        .await;
+
+    let base = Url::parse(&format!("{}/", server.uri())).expect("valid index base url");
+    let upstream = with_default_limits(base);
+
+    let result = upstream.release_times("demo").await;
+
+    assert!(
+        matches!(result, Err(UpstreamError::NotFound)),
+        "with no api field there is nowhere to ask, which must read as not found, \
+         not as an outage"
+    );
+}

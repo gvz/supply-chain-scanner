@@ -35,7 +35,10 @@ use crate::config::{Config, CveLine, UnknownSeverity};
 const FIELD_SEP: &[u8] = &[0u8];
 
 /// Computes the policy fingerprint for `cfg`: a lowercase hex SHA-256
-/// digest over the serialized [`CveLine`], then — in config list order —
+/// digest over the serialized [`CveLine`], then, when set,
+/// `min_release_age_days` (the gate changes what a scan admits, so
+/// tightening or loosening it must invalidate stored verdicts the same
+/// way editing `cve` does), then — in config list order —
 /// each plugin's name and the SHA-256 of its binary's current file
 /// contents, then, when `[ai_review]` is present, the reviewer's
 /// identity (see below).
@@ -71,6 +74,13 @@ const FIELD_SEP: &[u8] = &[0u8];
 pub fn policy_fingerprint(cfg: &Config) -> anyhow::Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(serialize_cve_line(&cfg.cve).as_bytes());
+
+    if let Some(days) = cfg.min_release_age_days {
+        hasher.update(FIELD_SEP);
+        hasher.update(b"min_release_age_days");
+        hasher.update(FIELD_SEP);
+        hasher.update(days.to_string().as_bytes());
+    }
 
     for plugin in &cfg.plugins {
         hasher.update(FIELD_SEP);
@@ -121,6 +131,13 @@ pub fn policy_fingerprint(cfg: &Config) -> anyhow::Result<String> {
         hasher.update(b"cargo_registry");
         hasher.update(FIELD_SEP);
         hasher.update(registry.required_criterion.as_bytes());
+
+        if let Some(days) = registry.min_release_age_days {
+            hasher.update(FIELD_SEP);
+            hasher.update(b"min_release_age_days");
+            hasher.update(FIELD_SEP);
+            hasher.update(days.to_string().as_bytes());
+        }
 
         // `trusted_reviewers` is deliberately absent: see this function's
         // doc comment.
@@ -209,6 +226,13 @@ impl Policy {
         }
 
         true
+    }
+
+    /// The PyPI deployment's minimum release age, in days. `None` means
+    /// the gate is off. See [`Config::min_release_age_days`]'s doc
+    /// comment for the cargo deployment's independent equivalent.
+    pub fn min_release_age_days(&self) -> Option<u64> {
+        self.cfg.min_release_age_days
     }
 }
 

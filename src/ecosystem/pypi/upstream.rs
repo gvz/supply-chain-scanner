@@ -30,13 +30,16 @@
 //! stores its verdict, so the developer's retry lands on a stored
 //! decision (see [`crate::scan`]).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context};
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use rand::Rng;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
@@ -81,6 +84,26 @@ pub enum UpstreamError {
     NotFound,
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+/// The PEP 700 JSON simple-index document, as served when a request
+/// carries `Accept: application/vnd.pypi.simple.v1+json`. Only `files` is
+/// declared; serde drops the rest.
+#[derive(Debug, Deserialize)]
+struct SimpleIndexJson {
+    #[serde(default)]
+    files: Vec<SimpleIndexFile>,
+}
+
+/// One file entry of [`SimpleIndexJson`]. `upload_time` is absent on an
+/// index that predates PEP 700 (or that never recorded it), which is why
+/// [`Upstream::release_times`] returns a map that simply omits such a
+/// file rather than an error.
+#[derive(Debug, Deserialize)]
+struct SimpleIndexFile {
+    filename: String,
+    #[serde(rename = "upload-time")]
+    upload_time: Option<DateTime<Utc>>,
 }
 
 /// HTTP client for upstream PyPI, backed by a stale-tolerant index cache.
@@ -222,6 +245,70 @@ impl Upstream {
             }
             None => Err(UpstreamError::Unavailable(reason)),
         }
+    }
+
+    /// Fetches each of `package`'s files' publish times, keyed by
+    /// filename, from the PEP 700 JSON simple index.
+    ///
+    /// This is a separate request from [`Upstream::simple_page`], not a
+    /// different parse of the same body: asking for the JSON
+    /// representation only when a caller actually wants publish times
+    /// keeps the HTML path (every other request this proxy serves)
+    /// completely unaffected.
+    ///
+    /// A file this proxy's upstream does not report an `upload-time` for
+    /// — any index older than PEP 700 — is simply absent from the
+    /// returned map rather than an error; the gate this feeds is
+    /// best-effort for exactly that reason (see
+    /// [`crate::config::Config::min_release_age_days`]).
+    pub async fn release_times(
+        &self,
+        package: &str,
+    ) -> Result<HashMap<String, DateTime<Utc>>, UpstreamError> {
+        let normalized = index::normalize_name(package);
+        let url = self
+            .base
+            .join(&format!("{normalized}/"))
+            .with_context(|| format!("building simple index URL for {normalized:?}"))?;
+
+        let response = self
+            .index_client
+            .get(url.clone())
+            .header("Accept", "application/vnd.pypi.simple.v1+json")
+            .send()
+            .await
+            .map_err(|err| {
+                UpstreamError::Unavailable(format!(
+                    "request for the JSON simple index failed for {normalized:?}: {err}"
+                ))
+            })?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(UpstreamError::NotFound);
+        }
+        if !response.status().is_success() {
+            return Err(UpstreamError::Unavailable(format!(
+                "JSON simple index returned status {} for {normalized:?}",
+                response.status()
+            )));
+        }
+
+        let body = response.text().await.map_err(|err| {
+            UpstreamError::Unavailable(format!(
+                "reading the JSON simple index body for {normalized:?} failed: {err}"
+            ))
+        })?;
+
+        let parsed: SimpleIndexJson = serde_json::from_str(&body)
+            .with_context(|| format!("parsing the JSON simple index for {normalized:?}"))?;
+
+        let mut times = HashMap::new();
+        for file in parsed.files {
+            if let Some(upload_time) = file.upload_time {
+                times.insert(file.filename, upload_time);
+            }
+        }
+        Ok(times)
     }
 
     /// Downloads `entry`'s artifact to `dest`, streaming the response body

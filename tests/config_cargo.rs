@@ -235,6 +235,42 @@ fn changing_the_trusted_reviewers_leaves_the_fingerprint_alone() {
 }
 
 #[test]
+fn cargo_registry_min_release_age_days_defaults_to_none() {
+    let config = load(&toml_with_cargo_registry(CARGO_REGISTRY_BASE));
+    let registry = config.cargo_registry.as_ref().expect("table loaded");
+
+    assert_eq!(
+        registry.min_release_age_days, None,
+        "an unset min_release_age_days must leave the release-age gate off"
+    );
+}
+
+#[test]
+fn cargo_registry_accepts_an_explicit_min_release_age_days() {
+    let config = load(&toml_with_cargo_registry(&format!(
+        "{CARGO_REGISTRY_BASE}\nmin_release_age_days = 14"
+    )));
+    let registry = config.cargo_registry.as_ref().expect("table loaded");
+
+    assert_eq!(registry.min_release_age_days, Some(14));
+}
+
+#[test]
+fn changing_cargo_registry_min_release_age_days_changes_the_fingerprint() {
+    let off = load(&toml_with_cargo_registry(CARGO_REGISTRY_BASE));
+    let on = load(&toml_with_cargo_registry(&format!(
+        "{CARGO_REGISTRY_BASE}\nmin_release_age_days = 14"
+    )));
+
+    assert_ne!(
+        policy_fingerprint(&off).expect("fingerprint with the gate off"),
+        policy_fingerprint(&on).expect("fingerprint with the gate on"),
+        "turning the release-age gate on or off changes what a cargo scan \
+         admits, so it must change the fingerprint"
+    );
+}
+
+#[test]
 fn changing_a_cargo_vet_source_url_changes_the_fingerprint() {
     let source = |url: &str| {
         toml_with_cargo_registry(&format!(

@@ -309,6 +309,28 @@ outage must not become a proxy outage.
 - Staleness is bounded by `advisory_sync_interval`: an advisory filed upstream is
   invisible until the next sync.
 
+## A minimum release age
+
+`min_release_age_days` (top-level, for the PyPI deployment; `cargo_registry.
+min_release_age_days` for a cargo deployment) refuses a file younger than the
+configured number of days since it was published. Unset (the default) turns
+the gate off entirely.
+
+It is independent of CVE filtering and AI review/cargo-vet, and it is
+best-effort rather than fail-closed: see "What a reload invalidates" under
+"Running a cargo/crates.io deployment" above for exactly what that means and
+why. On the PyPI side, the publish time comes from the PEP 700 JSON simple
+index (`Accept: application/vnd.pypi.simple.v1+json` against the same
+`upstream_url` already configured) — an index that predates PEP 700 never
+supplies it, and that file is simply never checked against this gate.
+
+The gate is checked once, before CVE filtering, for a version with no stored
+verdict. It is never re-checked for a version that already has one: age only
+grows, so a version old enough to pass once is old enough forever after. This
+also means a refusal from this gate is never stored as a verdict — storing it
+would otherwise refuse the artifact permanently, even after it aged past the
+threshold.
+
 ## Logging
 
 Every refusal is logged at `warn!` with code, package, version, filename and
@@ -350,6 +372,7 @@ exactly as `index-url` works for pip.
 | `cargo_vet_sources` | empty | The trusted cargo-vet audit sets to fetch. Each entry is a `name` for logs and errors and the `url` of that source's `audits.toml`. Empty leaves the fast path with no proof to consult. |
 | `required_criterion` | `safe-to-deploy` | The criterion an audit must carry to stand in for AI review. Set `safe-to-run` for the looser bar. |
 | `trusted_reviewers` | empty | The specific auditors whose entry counts, when the list is not empty. Empty means any entry from a trusted source counts, by whoever audited it. |
+| `min_release_age_days` | unset (off) | The youngest a crate version may be and still be forwarded, in days since crates.io published it. Independent of the PyPI deployment's own top-level `min_release_age_days`. |
 
 The table is additive. The base fields stay required in a cargo deployment —
 `bind`, `db_path`, `cache_dir`, `upstream_url`, `public_url`, `scan_budget` and
@@ -374,7 +397,20 @@ Editing either one invalidates every stored verdict, because both decide what
 this deployment accepts as proof. `trusted_reviewers` stays out of the
 fingerprint, for the same reason the allowlist does. It narrows who is trusted,
 rather than changing what is checked. Editing it must therefore not force a
-rescan of the whole crate ecosystem.
+rescan of the whole crate ecosystem. `min_release_age_days` is part of the
+fingerprint too, for the same reason `required_criterion` is: changing the
+threshold changes what the cascade admits.
+
+**The release-age gate is best-effort, not fail-closed.** Unlike CVE filtering
+and AI review, a version the cascade cannot determine a publish time for — the
+registry API has no `api` base in `config.json`, or the lookup fails outright —
+is not treated as too new. The cascade logs a warning and skips the gate for
+that one request rather than refusing every version, because this is a
+secondary hygiene control layered on top of the CVE and AI-review/cargo-vet
+gates, which keep their existing fail-closed behavior unaffected. The same
+rule applies to the PyPI deployment's own `min_release_age_days`, sourced from
+the PEP 700 JSON simple index: an upstream that predates PEP 700 never reports
+an `upload-time`, and that is not reason enough to block everything.
 
 **Two sync tickers, on two intervals.** The crates.io advisory mirror re-syncs
 every `advisory_sync_interval`, from `advisory_source_url`. The cargo-vet audit

@@ -17,10 +17,12 @@
 //!   [`crate::config::DownloadLimits::max_duration`] bounds the whole call
 //!   from outside.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, Context};
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use rand::Rng;
 use serde::Deserialize;
@@ -57,13 +59,37 @@ pub enum UpstreamError {
 
 /// The parts of the sparse index's `config.json` this client uses.
 ///
-/// `api` and the other fields are ignored: serde drops fields a struct
-/// does not declare.
-#[derive(Debug, Deserialize)]
+/// Other fields are ignored: serde drops fields a struct does not
+/// declare.
+#[derive(Debug, Clone, Deserialize)]
 struct ConfigJson {
     /// The `.crate` download URL template. It may contain the markers
     /// `{crate}`, `{version}`, and `{prefix}`.
     dl: String,
+    /// The registry API's base URL, e.g. `https://crates.io`. Absent on
+    /// a registry that only serves the sparse index and never
+    /// implements the registry API — [`CargoUpstream::release_times`] is
+    /// then simply unavailable for that registry.
+    #[serde(default)]
+    api: Option<String>,
+}
+
+/// The registry API's `GET /api/v1/crates/{name}` response, as used by
+/// [`CargoUpstream::release_times`]. Other fields (`crate`, `keywords`,
+/// ...) are ignored.
+#[derive(Debug, Deserialize)]
+struct CrateDetails {
+    #[serde(default)]
+    versions: Vec<CrateVersionDetails>,
+}
+
+/// One entry of [`CrateDetails::versions`].
+#[derive(Debug, Deserialize)]
+struct CrateVersionDetails {
+    /// The version string, e.g. `"1.0.0"` — matches a sparse-index
+    /// entry's `vers` field.
+    num: String,
+    created_at: DateTime<Utc>,
 }
 
 /// HTTP client for the cargo sparse index and the `.crate` download
@@ -86,13 +112,12 @@ pub struct CargoUpstream {
     /// Hard cap, in bytes, on one `.crate` file. See
     /// [`DownloadLimits::max_artifact_bytes`].
     max_artifact_bytes: u64,
-    /// The `dl` template from `config.json`, fetched on first use and
-    /// kept.
+    /// `config.json`, fetched on first use and kept.
     ///
     /// A failed fetch leaves this empty, so the next call tries again.
     /// [`tokio::sync::OnceCell::get_or_try_init`] stores a value only when
     /// the future returns `Ok`, which gives that behavior for free.
-    dl_template: tokio::sync::OnceCell<String>,
+    registry_config: tokio::sync::OnceCell<ConfigJson>,
 }
 
 impl CargoUpstream {
@@ -121,7 +146,7 @@ impl CargoUpstream {
             index_base,
             download_max_duration: download_limits.max_duration,
             max_artifact_bytes: download_limits.max_artifact_bytes,
-            dl_template: tokio::sync::OnceCell::new(),
+            registry_config: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -167,14 +192,12 @@ impl CargoUpstream {
             .map_err(UpstreamError::Other)
     }
 
-    /// Returns the `dl` template from upstream's `config.json`, fetching it
-    /// on first use.
+    /// Returns upstream's `config.json`, fetching it on first use.
     ///
-    /// The template is kept only when the fetch succeeds and the body has
-    /// a `dl` field. A failed fetch is not recorded, so the next call
-    /// starts a new fetch.
-    async fn dl_template(&self) -> Result<&str, UpstreamError> {
-        self.dl_template
+    /// Kept only when the fetch succeeds and the body parses. A failed
+    /// fetch is not recorded, so the next call starts a new fetch.
+    async fn registry_config(&self) -> Result<&ConfigJson, UpstreamError> {
+        self.registry_config
             .get_or_try_init(|| async {
                 let url = self.acquire_config_url()?;
                 let response = self
@@ -203,10 +226,15 @@ impl CargoUpstream {
                 })?;
                 let config: ConfigJson = serde_json::from_str(&body)
                     .with_context(|| format!("parsing cargo registry config.json from {url}"))?;
-                Ok(config.dl)
+                Ok(config)
             })
             .await
-            .map(String::as_str)
+    }
+
+    /// Returns the `dl` template from upstream's `config.json`, fetching
+    /// it on first use.
+    async fn dl_template(&self) -> Result<&str, UpstreamError> {
+        self.registry_config().await.map(|c| c.dl.as_str())
     }
 
     /// Builds the URL of `config.json` under the sparse index root.
@@ -215,6 +243,65 @@ impl CargoUpstream {
             .join("config.json")
             .context("building the cargo registry config.json URL")
             .map_err(UpstreamError::Other)
+    }
+
+    /// Fetches each of `name`'s published versions' creation times from
+    /// the registry API (`config.json`'s `api` field), keyed by version
+    /// string.
+    ///
+    /// `api` is absent for a registry that serves only the sparse index,
+    /// which is [`UpstreamError::NotFound`] here: there is nowhere to
+    /// ask. [`crate::scan::cargo::CargoScanner`] treats that the same as
+    /// any other failure to fetch release times — the release-age gate
+    /// is skipped for this request, not a reason to refuse every
+    /// version (see [`crate::config::CargoRegistryConfig::min_release_age_days`]).
+    pub async fn release_times(
+        &self,
+        name: &str,
+    ) -> Result<HashMap<String, DateTime<Utc>>, UpstreamError> {
+        let api_base = self
+            .registry_config()
+            .await?
+            .api
+            .clone()
+            .ok_or(UpstreamError::NotFound)?;
+
+        let url = format!("{}/api/v1/crates/{name}", api_base.trim_end_matches('/'));
+        let url = Url::parse(&url)
+            .with_context(|| format!("building the registry API URL for {name:?}"))
+            .map_err(UpstreamError::Other)?;
+
+        let response = self.index_client.get(url).send().await.map_err(|err| {
+            UpstreamError::Unavailable(format!(
+                "request to the registry API failed for {name:?}: {err}"
+            ))
+        })?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(UpstreamError::NotFound);
+        }
+        if !status.is_success() {
+            return Err(UpstreamError::Unavailable(format!(
+                "registry API returned status {status} for {name:?}"
+            )));
+        }
+
+        let body = response.text().await.map_err(|err| {
+            UpstreamError::Unavailable(format!(
+                "reading the registry API body for {name:?} failed: {err}"
+            ))
+        })?;
+
+        let parsed: CrateDetails = serde_json::from_str(&body)
+            .with_context(|| format!("parsing the registry API response for {name:?}"))
+            .map_err(UpstreamError::Other)?;
+
+        Ok(parsed
+            .versions
+            .into_iter()
+            .map(|v| (v.num, v.created_at))
+            .collect())
     }
 
     /// Downloads `name` at `version` to `dest` and returns the lowercase

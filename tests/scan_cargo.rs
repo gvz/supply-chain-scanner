@@ -25,7 +25,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use supply_chain_scanner::ai::provider::{ChatProvider, ProviderError};
 use supply_chain_scanner::ai::AiReviewer;
 use supply_chain_scanner::config::{
-    AiReviewConfig, BlockOn, Config, ConfigHandle, CveLine, UnknownSeverity,
+    AiReviewConfig, BlockOn, CargoRegistryConfig, Config, ConfigHandle, CveLine, UnknownSeverity,
 };
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::db::cargo_vet::CargoVetStore;
@@ -72,6 +72,7 @@ fn base_config(scan_budget: Duration) -> Config {
             require_fix_available: false,
             unknown_severity: UnknownSeverity::Allow,
         },
+        min_release_age_days: None,
         download: Default::default(),
         allowlist: Vec::new(),
         plugins: Vec::new(),
@@ -180,6 +181,43 @@ async fn mount_downloads(server: &MockServer, name: &str, versions: &[Version]) 
 /// or more characters, so the prefix is `xy/zw`.
 fn index_path(name: &str) -> String {
     format!("/{}/{}/{}", &name[0..2], &name[2..4], name)
+}
+
+/// Mounts the registry API's `GET /api/v1/crates/{name}` response for the
+/// release-age gate, with `created_at` taken verbatim from `ages`
+/// (version string -> RFC 3339 timestamp).
+async fn mount_release_times(server: &MockServer, name: &str, ages: &[(&str, String)]) {
+    let versions: String = ages
+        .iter()
+        .map(|(vers, created_at)| format!("{{\"num\":\"{vers}\",\"created_at\":\"{created_at}\"}}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/crates/{name}")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{{\"versions\":[{versions}]}}")),
+        )
+        .mount(server)
+        .await;
+}
+
+/// `base_config` plus a `[cargo_registry]` table with
+/// `min_release_age_days` set, pointed at `server`.
+fn config_with_min_release_age(
+    scan_budget: Duration,
+    server: &MockServer,
+    min_release_age_days: u64,
+) -> Config {
+    let mut cfg = base_config(scan_budget);
+    cfg.cargo_registry = Some(CargoRegistryConfig {
+        upstream_index_url: Url::parse(&format!("{}/", server.uri())).expect("valid url"),
+        cargo_vet_sync_interval: Duration::from_secs(60 * 60),
+        cargo_vet_sources: Vec::new(),
+        required_criterion: "safe-to-deploy".to_string(),
+        trusted_reviewers: Vec::new(),
+        min_release_age_days: Some(min_release_age_days),
+    });
+    cfg
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +488,49 @@ async fn a_never_before_seen_crate_with_one_clean_version_is_forwarded() {
         harness.stored_verdict("demo", "1.0.0", &demo[0].cksum),
         Some(Verdict::Clean),
         "the review verdict must be stored under the cascade's artifact key"
+    );
+}
+
+#[tokio::test]
+async fn a_version_published_too_recently_is_skipped_in_favor_of_an_older_one() {
+    let server = MockServer::start().await;
+    let demo = vec![version("demo", "1.0.0"), version("demo", "0.9.0")];
+    mount_index(&server, "demo", &demo).await;
+    mount_downloads(&server, "demo", &demo).await;
+    mount_release_times(
+        &server,
+        "demo",
+        &[
+            ("1.0.0", chrono::Utc::now().to_rfc3339()),
+            (
+                "0.9.0",
+                (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339(),
+            ),
+        ],
+    )
+    .await;
+
+    let harness = build_harness(
+        config_with_min_release_age(Duration::from_secs(10), &server, 7),
+        &server,
+        clean_scripts(),
+        Reply::Clean,
+        Duration::from_secs(10),
+        Duration::ZERO,
+    );
+
+    let decision = harness.scanner.decide_index("demo").await;
+
+    assert_eq!(
+        versions_of(&decision),
+        vec!["0.9.0".to_string()],
+        "the version published today must be skipped under a 7-day release-age \
+         gate, forwarding only the one published 30 days ago"
+    );
+    assert_eq!(
+        harness.stored_verdict("demo", "1.0.0", &demo[0].cksum),
+        None,
+        "a version the release-age gate removed must never be reviewed or stored"
     );
 }
 

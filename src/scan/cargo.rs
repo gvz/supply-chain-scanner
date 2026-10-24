@@ -128,6 +128,10 @@ struct Facts {
     advisories: Vec<Advisory>,
     review_status: HashMap<String, ReviewStatus>,
     vet_covered: HashSet<String>,
+    /// Versions the release-age gate removed this round. Always empty
+    /// when `CargoRegistryConfig::min_release_age_days` is unset, and
+    /// best-effort when it is set: see [`CargoScanner::too_new_versions`].
+    too_new: HashSet<String>,
     /// Versions the operator has allowlisted for this crate. Computed once
     /// per cascade, not per iteration: an allowlist read is a config
     /// snapshot, and every iteration of one cascade must see the same one.
@@ -264,6 +268,7 @@ impl CargoScanner {
             &facts.advisories,
             review_status,
             facts.vet_covered,
+            facts.too_new,
             facts.allowlisted,
         );
         match plan_cascade(&input) {
@@ -326,6 +331,7 @@ impl CargoScanner {
             let input = CascadeInput {
                 entries: entries.to_vec(),
                 cve_blocked: cve_blocked.clone(),
+                too_new: facts.too_new.clone(),
                 review_status: std::mem::take(&mut facts.review_status),
                 vet_covered: std::mem::take(&mut facts.vet_covered),
                 allowlisted: facts.allowlisted.clone(),
@@ -419,6 +425,7 @@ impl CargoScanner {
         advisories: &[Advisory],
         review_status: HashMap<String, ReviewStatus>,
         vet_covered: HashSet<String>,
+        too_new: HashSet<String>,
         allowlisted: HashSet<String>,
     ) -> CascadeInput {
         let mut cve_blocked = HashSet::new();
@@ -433,6 +440,7 @@ impl CargoScanner {
         CascadeInput {
             entries: entries.to_vec(),
             cve_blocked,
+            too_new,
             review_status,
             vet_covered,
             allowlisted,
@@ -470,6 +478,9 @@ impl CargoScanner {
         // Read the config snapshot once, here, so every iteration of this
         // cascade and every version in it sees the same allowlist.
         let allowlisted = self.allowlisted_for(&entries);
+        // Network I/O, so it happens here rather than inside the
+        // blocking-pool closure below.
+        let too_new = self.too_new_versions(&normalized, &entries).await;
 
         tokio::task::spawn_blocking(move || {
             let mut advisories: Vec<Advisory> = Vec::new();
@@ -513,6 +524,7 @@ impl CargoScanner {
                 advisories,
                 review_status,
                 vet_covered,
+                too_new,
                 allowlisted,
             })
         })
@@ -520,6 +532,59 @@ impl CargoScanner {
         .map_err(|join_error| {
             anyhow::anyhow!("the cargo cascade fact lookup panicked: {join_error}")
         })?
+    }
+
+    /// The versions of `entries` published too recently under
+    /// `CargoRegistryConfig::min_release_age_days`.
+    ///
+    /// Best-effort, not fail-closed like the CVE filter: when the gate is
+    /// unset, when the registry API is unreachable, or when it reports
+    /// no `api` base at all (a sparse-index-only registry), this returns
+    /// an empty set and logs rather than treating the outage as a
+    /// reason to forward nothing. The release-age gate is a secondary
+    /// hygiene control layered on top of the CVE and AI-review/cargo-vet
+    /// gates, which stay fail-closed exactly as before; an outage here
+    /// only means age stops being checked for this one request.
+    async fn too_new_versions(
+        &self,
+        normalized: &str,
+        entries: &[CargoIndexEntry],
+    ) -> HashSet<String> {
+        let Some(min_days) = self
+            .config
+            .current()
+            .cargo_registry
+            .as_ref()
+            .and_then(|cargo| cargo.min_release_age_days)
+        else {
+            return HashSet::new();
+        };
+
+        let times = match self.upstream.release_times(normalized).await {
+            Ok(times) => times,
+            Err(err) => {
+                tracing::warn!(
+                    package = normalized,
+                    error = %err,
+                    "could not fetch release times for the release-age gate; \
+                     skipping it for this request"
+                );
+                return HashSet::new();
+            }
+        };
+
+        let min_age = chrono::Duration::days(min_days as i64);
+        let now = chrono::Utc::now();
+        entries
+            .iter()
+            .filter(|entry| match times.get(&entry.vers) {
+                Some(released) => now.signed_duration_since(*released) < min_age,
+                // No reported creation time for this version: cannot
+                // tell, so it is not flagged.
+                None => false,
+            })
+            .map(|entry| entry.vers.clone())
+            .collect()
     }
 
     /// The versions of the crate that the operator has allowlisted.

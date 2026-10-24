@@ -51,6 +51,16 @@ require_fix_available = false
 # of ordinary packages on day one.
 unknown_severity = "allow"
 
+# The youngest a published file may be and still be forwarded, in days
+# since it was uploaded. Optional — omit it (or leave it unset) to turn
+# this gate off. Best-effort, not a security gate like [cve] or AI review:
+# when upstream does not report a file's publish time at all, the gate does
+# not block — it logs and lets the rest of the scan proceed. A
+# [cargo_registry] deployment sets its own, independent
+# cargo_registry.min_release_age_days instead, so PyPI and cargo can run
+# different thresholds (or one on and the other off).
+# min_release_age_days = 7
+
 # Specific package+version entries the org has reviewed and decided to
 # permit regardless of stored verdict. A hash mismatch still refuses even
 # an allowlisted entry. Optional — defaults to empty.

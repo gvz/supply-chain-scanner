@@ -11,10 +11,10 @@
 //!
 //! The decision order for one crate:
 //!
-//! 1. Drop every yanked entry, and every entry in `cve_blocked` that is
-//!    not in `allowlisted`. A yanked version is never a candidate, even
-//!    when it is the newest one, and an allowlist entry does not revive a
-//!    yanked version either.
+//! 1. Drop every yanked entry, and every entry in `cve_blocked` or
+//!    `too_new` that is not in `allowlisted`. A yanked version is never a
+//!    candidate, even when it is the newest one, and an allowlist entry
+//!    does not revive a yanked version either.
 //! 2. A surviving version is *forwardable* if an operator allowlisted it,
 //!    or a cargo-vet audit covers it, or AI review passed it. The
 //!    allowlist comes first, matching the PyPI path's precedence: a human
@@ -42,6 +42,11 @@ pub struct CascadeInput {
     pub entries: Vec<CargoIndexEntry>,
     /// Versions that CVE filtering removed.
     pub cve_blocked: HashSet<String>,
+    /// Versions the release-age gate removed: published too recently
+    /// under `CargoRegistryConfig::min_release_age_days`. Filtered with
+    /// the same precedence as `cve_blocked` — an allowlisted version
+    /// survives either gate.
+    pub too_new: HashSet<String>,
     /// The AI-review cache, keyed by version.
     pub review_status: HashMap<String, ReviewStatus>,
     /// Versions that a qualifying cargo-vet audit covers.
@@ -89,6 +94,9 @@ pub fn plan_cascade(input: &CascadeInput) -> NextStep {
         // version has overridden every judgement check, not just the
         // reviewed ones.
         if input.cve_blocked.contains(&entry.vers) && !input.allowlisted.contains(&entry.vers) {
+            continue;
+        }
+        if input.too_new.contains(&entry.vers) && !input.allowlisted.contains(&entry.vers) {
             continue;
         }
         if !survivors.contains(&entry.vers) {
@@ -147,6 +155,7 @@ mod tests {
         let input = CascadeInput {
             entries: vec![entry("1.0.0", false), entry("0.9.0", false)],
             cve_blocked: HashSet::new(),
+            too_new: HashSet::new(),
             review_status: HashMap::new(),
             vet_covered: HashSet::new(),
             allowlisted: HashSet::new(),
@@ -162,6 +171,7 @@ mod tests {
         let input = CascadeInput {
             entries: vec![entry("1.0.0", false), entry("0.9.0", false)],
             cve_blocked: HashSet::new(),
+            too_new: HashSet::new(),
             review_status: HashMap::new(),
             vet_covered: HashSet::from(["1.0.0".to_string(), "0.9.0".to_string()]),
             allowlisted: HashSet::new(),
@@ -178,6 +188,7 @@ mod tests {
         let input = CascadeInput {
             entries: vec![entry("1.0.0", false), entry("0.9.0", false)],
             cve_blocked: HashSet::from(["1.0.0".to_string()]),
+            too_new: HashSet::new(),
             review_status: HashMap::new(),
             vet_covered: HashSet::new(),
             allowlisted: HashSet::new(),
@@ -193,6 +204,7 @@ mod tests {
         let input = CascadeInput {
             entries: vec![entry("1.1.0", true), entry("1.0.0", false)],
             cve_blocked: HashSet::new(),
+            too_new: HashSet::new(),
             review_status: HashMap::new(),
             vet_covered: HashSet::new(),
             allowlisted: HashSet::new(),
@@ -209,6 +221,7 @@ mod tests {
         let input = CascadeInput {
             entries: vec![entry("1.1.0", true), entry("1.0.0", false)],
             cve_blocked: HashSet::new(),
+            too_new: HashSet::new(),
             review_status: HashMap::from([("1.0.0".to_string(), ReviewStatus::Failed)]),
             vet_covered: HashSet::new(),
             allowlisted: HashSet::new(),
@@ -227,6 +240,7 @@ mod tests {
         let input = CascadeInput {
             entries: vec![entry("1.0.0", false), entry("0.9.0", false)],
             cve_blocked: HashSet::new(),
+            too_new: HashSet::new(),
             review_status,
             vet_covered: HashSet::new(),
             allowlisted: HashSet::new(),
@@ -243,6 +257,7 @@ mod tests {
         let input = CascadeInput {
             entries: vec![entry("1.0.0", false), entry("0.9.0", false)],
             cve_blocked: HashSet::new(),
+            too_new: HashSet::new(),
             review_status: HashMap::from([
                 ("1.0.0".to_string(), ReviewStatus::Failed),
                 ("0.9.0".to_string(), ReviewStatus::Failed),
@@ -258,6 +273,7 @@ mod tests {
         let input = CascadeInput {
             entries: vec![entry("1.0.0", false), entry("0.9.0", false)],
             cve_blocked: HashSet::new(),
+            too_new: HashSet::new(),
             review_status: HashMap::from([
                 ("1.0.0".to_string(), ReviewStatus::Failed),
                 ("0.9.0".to_string(), ReviewStatus::Passed),
@@ -277,6 +293,7 @@ mod tests {
         let input = CascadeInput {
             entries: vec![entry("1.0.0", false), entry("0.9.0", false)],
             cve_blocked: HashSet::from(["1.0.0".to_string(), "0.9.0".to_string()]),
+            too_new: HashSet::new(),
             review_status: HashMap::new(),
             vet_covered: HashSet::new(),
             allowlisted: HashSet::new(),
@@ -289,6 +306,7 @@ mod tests {
         let input = CascadeInput {
             entries: Vec::new(),
             cve_blocked: HashSet::new(),
+            too_new: HashSet::new(),
             review_status: HashMap::new(),
             vet_covered: HashSet::new(),
             allowlisted: HashSet::new(),
@@ -305,6 +323,7 @@ mod tests {
                 entry("0.2.0", false),
             ],
             cve_blocked: HashSet::new(),
+            too_new: HashSet::new(),
             review_status: HashMap::new(),
             vet_covered: HashSet::from([
                 "0.9.0".to_string(),
@@ -328,6 +347,7 @@ mod tests {
         let input = CascadeInput {
             entries: vec![entry("2.0.0-rc.1", false), entry("2.0.0", false)],
             cve_blocked: HashSet::new(),
+            too_new: HashSet::new(),
             review_status: HashMap::new(),
             vet_covered: HashSet::from(["2.0.0-rc.1".to_string(), "2.0.0".to_string()]),
             allowlisted: HashSet::new(),
@@ -351,6 +371,7 @@ mod tests {
                 entry("zzz", false),
             ],
             cve_blocked: HashSet::new(),
+            too_new: HashSet::new(),
             review_status: HashMap::new(),
             vet_covered: HashSet::from([
                 "not-a-version".to_string(),
@@ -375,6 +396,7 @@ mod tests {
         let input = CascadeInput {
             entries: vec![entry("not-a-version", false)],
             cve_blocked: HashSet::new(),
+            too_new: HashSet::new(),
             review_status: HashMap::new(),
             vet_covered: HashSet::new(),
             allowlisted: HashSet::new(),
@@ -390,6 +412,7 @@ mod tests {
         let input = CascadeInput {
             entries: vec![entry("1.0.0", false), entry("1.0.0", false)],
             cve_blocked: HashSet::new(),
+            too_new: HashSet::new(),
             review_status: HashMap::new(),
             vet_covered: HashSet::from(["1.0.0".to_string()]),
             allowlisted: HashSet::new(),
@@ -405,10 +428,45 @@ mod tests {
         let input = CascadeInput {
             entries: vec![entry("1.0.0", false), entry("1.0.0", false)],
             cve_blocked: HashSet::from(["1.0.0".to_string()]),
+            too_new: HashSet::new(),
             review_status: HashMap::new(),
             vet_covered: HashSet::new(),
             allowlisted: HashSet::new(),
         };
         assert_eq!(plan_cascade(&input), NextStep::Forward(Vec::new()));
+    }
+
+    #[test]
+    fn a_too_new_newest_version_is_skipped_in_favor_of_an_older_clean_one() {
+        let input = CascadeInput {
+            entries: vec![entry("1.0.0", false), entry("0.9.0", false)],
+            cve_blocked: HashSet::new(),
+            too_new: HashSet::from(["1.0.0".to_string()]),
+            review_status: HashMap::new(),
+            vet_covered: HashSet::new(),
+            allowlisted: HashSet::new(),
+        };
+        assert_eq!(
+            plan_cascade(&input),
+            NextStep::NeedsReview("0.9.0".to_string()),
+            "a version the release-age gate flagged must be skipped just like a CVE block"
+        );
+    }
+
+    #[test]
+    fn an_allowlisted_version_is_forwarded_despite_being_too_new() {
+        let input = CascadeInput {
+            entries: vec![entry("1.0.0", false)],
+            cve_blocked: HashSet::new(),
+            too_new: HashSet::from(["1.0.0".to_string()]),
+            review_status: HashMap::new(),
+            vet_covered: HashSet::new(),
+            allowlisted: HashSet::from(["1.0.0".to_string()]),
+        };
+        assert_eq!(
+            plan_cascade(&input),
+            NextStep::Forward(vec!["1.0.0".to_string()]),
+            "an operator sign-off overrides the release-age gate, same as it overrides a CVE block"
+        );
     }
 }

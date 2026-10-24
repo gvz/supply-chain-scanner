@@ -75,6 +75,7 @@ fn base_config(scan_budget: Duration) -> Config {
             require_fix_available: false,
             unknown_severity: UnknownSeverity::Allow,
         },
+        min_release_age_days: None,
         download: Default::default(),
         allowlist: Vec::new(),
         plugins: Vec::new(),
@@ -589,6 +590,97 @@ async fn blocking_advisory_refuses_before_any_download() {
     }
 
     server.verify().await;
+}
+
+#[tokio::test]
+async fn an_artifact_published_too_recently_is_refused_without_a_download() {
+    let server = MockServer::start().await;
+    let filename = "demo_package-1.0.0-py3-none-any.whl";
+    let sha256 = "a".repeat(64);
+
+    Mock::given(method("GET"))
+        .and(path(format!("/packages/{filename}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(build_wheel_bytes()))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/simple/demo-package/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            r#"{{"files":[{{"filename":"{filename}","upload-time":"{}"}}]}}"#,
+            chrono::Utc::now().to_rfc3339()
+        )))
+        .mount(&server)
+        .await;
+
+    let mut cfg = base_config(Duration::from_secs(12));
+    cfg.min_release_age_days = Some(7);
+    let harness = build_harness(cfg, &server, FakeSandbox::empty());
+
+    let key = key_for(&sha256, filename);
+    let entry = entry_for(&server, filename, Some(&sha256));
+
+    let decision = harness.scanner.decide(&key, &entry).await;
+    match decision {
+        Decision::Refuse { reason, why_id } => {
+            assert_eq!(reason.code, "too-new");
+            assert_eq!(
+                why_id, None,
+                "a release-age refusal must not be a stored verdict, or it would \
+                 refuse this artifact forever even once it has aged past the \
+                 threshold"
+            );
+        }
+        other => panic!("expected Refuse, got {other:?}"),
+    }
+
+    assert!(
+        harness
+            .verdict_store
+            .get(&key, &harness.fingerprint)
+            .expect("query verdict")
+            .is_none(),
+        "no verdict must be stored for a release-age refusal"
+    );
+
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn an_artifact_old_enough_proceeds_through_the_rest_of_the_scan() {
+    let server = MockServer::start().await;
+    let filename = "demo_package-1.0.0-py3-none-any.whl";
+    let body = build_wheel_bytes();
+    let sha256 = sha256_hex(&body);
+
+    Mock::given(method("GET"))
+        .and(path(format!("/packages/{filename}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/simple/demo-package/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            r#"{{"files":[{{"filename":"{filename}","upload-time":"{}"}}]}}"#,
+            (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339()
+        )))
+        .mount(&server)
+        .await;
+
+    let mut cfg = base_config(Duration::from_secs(12));
+    cfg.min_release_age_days = Some(7);
+    let harness = build_harness(cfg, &server, FakeSandbox::empty());
+
+    let key = key_for(&sha256, filename);
+    let entry = entry_for(&server, filename, Some(&sha256));
+
+    let decision = harness.scanner.decide(&key, &entry).await;
+    match decision {
+        Decision::Serve(served_path) => {
+            assert_eq!(std::fs::read(&served_path).expect("read served file"), body);
+        }
+        other => panic!("expected Serve, got {other:?}"),
+    }
 }
 
 #[tokio::test]

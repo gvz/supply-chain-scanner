@@ -786,3 +786,73 @@ async fn the_absolute_download_cap_still_bounds_an_endlessly_slow_transfer() {
     );
     assert!(!dest.exists(), "nothing may be left at dest");
 }
+
+#[tokio::test]
+async fn release_times_reads_upload_time_from_the_json_simple_index() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/simple/example-package/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"files":[{"filename":"example_package-1.2.3-py3-none-any.whl","upload-time":"2024-01-15T10:00:00Z"}]}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let (_dir, db) = open_db();
+    let cache = IndexCache::new(db);
+    let base = Url::parse(&format!("{}/simple/", server.uri())).expect("valid base url");
+    let upstream = Upstream::new(base, cache).expect("construct upstream");
+
+    let times = upstream
+        .release_times("example-package")
+        .await
+        .expect("release_times should succeed");
+
+    let released = times
+        .get("example_package-1.2.3-py3-none-any.whl")
+        .expect("the file's upload time must be present");
+    assert_eq!(released.to_rfc3339(), "2024-01-15T10:00:00+00:00");
+}
+
+/// An index that predates PEP 700 (or never recorded it) reports no
+/// `upload-time` for a file. That file is simply absent from the
+/// returned map rather than an error.
+#[tokio::test]
+async fn release_times_omits_a_file_with_no_reported_upload_time() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/simple/example-package/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"files":[{"filename":"example_package-1.2.3-py3-none-any.whl"}]}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let (_dir, db) = open_db();
+    let cache = IndexCache::new(db);
+    let base = Url::parse(&format!("{}/simple/", server.uri())).expect("valid base url");
+    let upstream = Upstream::new(base, cache).expect("construct upstream");
+
+    let times = upstream
+        .release_times("example-package")
+        .await
+        .expect("release_times should succeed even with no upload times reported");
+
+    assert!(
+        times.is_empty(),
+        "a file with no upload-time must not appear in the map"
+    );
+}
+
+#[tokio::test]
+async fn release_times_maps_a_404_to_upstream_error_not_found() {
+    let server = MockServer::start().await;
+    let (_dir, db) = open_db();
+    let cache = IndexCache::new(db);
+    let base = Url::parse(&format!("{}/simple/", server.uri())).expect("valid base url");
+    let upstream = Upstream::new(base, cache).expect("construct upstream");
+
+    let result = upstream.release_times("missing-package").await;
+
+    assert!(matches!(result, Err(UpstreamError::NotFound)));
+}

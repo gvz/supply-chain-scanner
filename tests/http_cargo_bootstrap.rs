@@ -277,6 +277,7 @@ fn cargo_config(
             require_fix_available: false,
             unknown_severity: UnknownSeverity::Allow,
         },
+        min_release_age_days: None,
         download: Default::default(),
         allowlist: Vec::new(),
         plugins: Vec::new(),
@@ -288,6 +289,7 @@ fn cargo_config(
             cargo_vet_sources: Vec::new(),
             required_criterion: "safe-to-deploy".to_string(),
             trusted_reviewers: Vec::new(),
+            min_release_age_days: None,
         }),
     }
 }

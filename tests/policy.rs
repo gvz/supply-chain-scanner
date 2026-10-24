@@ -30,6 +30,7 @@ fn base_config() -> Config {
             require_fix_available: false,
             unknown_severity: UnknownSeverity::Allow,
         },
+        min_release_age_days: None,
         download: Default::default(),
         allowlist: Vec::new(),
         plugins: Vec::new(),
@@ -262,6 +263,31 @@ fn fingerprint_changes_when_min_severity_changes() {
     assert_ne!(
         fp_a, fp_b,
         "changing min_severity must change the policy fingerprint"
+    );
+}
+
+#[test]
+fn fingerprint_changes_when_min_release_age_days_changes() {
+    let cfg_off = base_config();
+    let mut cfg_on = base_config();
+    cfg_on.min_release_age_days = Some(14);
+
+    let fp_off = policy_fingerprint(&cfg_off).expect("fingerprint with the gate off");
+    let fp_on = policy_fingerprint(&cfg_on).expect("fingerprint with the gate on");
+
+    assert_ne!(
+        fp_off, fp_on,
+        "turning the release-age gate on or off must change the policy fingerprint"
+    );
+}
+
+#[test]
+fn min_release_age_days_defaults_to_off() {
+    let policy = Policy::build(Arc::new(base_config())).expect("build policy");
+    assert_eq!(
+        policy.min_release_age_days(),
+        None,
+        "an unconfigured deployment must leave the release-age gate off"
     );
 }
 

@@ -73,6 +73,7 @@ fn base_config(plugin_binary: PathBuf) -> Config {
         max_concurrent_scans: None,
         ai_review: None,
         cargo_registry: None,
+        npm_registry: None,
     }
 }
 

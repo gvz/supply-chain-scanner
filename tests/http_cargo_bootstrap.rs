@@ -291,6 +291,7 @@ fn cargo_config(
             trusted_reviewers: Vec::new(),
             min_release_age_days: None,
         }),
+        npm_registry: None,
     }
 }
 

@@ -100,6 +100,15 @@ pub struct Config {
     /// deployments of the same binary.
     #[serde(default)]
     pub cargo_registry: Option<CargoRegistryConfig>,
+    /// The npm registry deployment's own settings, read from the optional
+    /// `[npm_registry]` table. Absent means this process runs the PyPI
+    /// deployment, exactly as it does today.
+    ///
+    /// One config file carries at most one of `[cargo_registry]` or
+    /// `[npm_registry]` — never both: the three ecosystems (PyPI, cargo,
+    /// npm) ship as three deployments of the same binary.
+    #[serde(default)]
+    pub npm_registry: Option<NpmRegistryConfig>,
 }
 
 /// How long an artifact download may take.
@@ -305,6 +314,56 @@ fn default_required_criterion() -> String {
     "safe-to-deploy".to_string()
 }
 
+fn default_npm_scan_budget() -> Duration {
+    Duration::from_secs(120)
+}
+
+fn default_npm_max_packument_bytes() -> u64 {
+    67_108_864
+}
+
+/// The npm registry deployment's settings, read from the optional
+/// `[npm_registry]` table.
+///
+/// Mirrors [`CargoRegistryConfig`]: every field that can have a sane
+/// default has one, so a minimal table names only the upstream registry.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NpmRegistryConfig {
+    /// The npm registry this proxy fetches package metadata from, normally
+    /// `https://registry.npmjs.org/`.
+    pub upstream_registry_url: Url,
+    /// How long a package metadata fetch may take. npm's client retries a
+    /// 429 only twice by default, so a PyPI-shaped ~12-second deadline
+    /// would convert ordinary slowness into a hard `npm install` failure.
+    /// npm's own `fetch-timeout` is 300 seconds, so this deployment holds
+    /// the connection on a much more generous budget (default 120s) instead.
+    #[serde(with = "humantime_serde", default = "default_npm_scan_budget")]
+    pub scan_budget: Duration,
+    /// Hard cap, in bytes, on one packument's downloaded size. Packuments
+    /// are small JSON documents (typically under 1 MiB) but must allow
+    /// reasonable overages for packages with many versions. This is an
+    /// operational safety limit, like [`DownloadLimits::max_artifact_bytes`].
+    #[serde(default = "default_npm_max_packument_bytes")]
+    pub max_packument_bytes: u64,
+    /// The youngest a published package version may be and still be
+    /// forwarded, in days since npm published it. `None` (the default) turns
+    /// this gate off entirely, so an unconfigured npm deployment behaves as
+    /// it does today. This is the npm deployment's setting; the
+    /// `[cargo_registry]` deployment has its own independent setting, so
+    /// the two ecosystems can run different thresholds (or one with the gate
+    /// off and the other with it on).
+    ///
+    /// This is a best-effort hygiene control, not a security gate like
+    /// `cve` or AI review: when upstream does not report a version's publish
+    /// time at all, the gate does not block — it logs and defers to the
+    /// other checks, which is why an age it cannot determine is never
+    /// treated as "too new" the way a confirmed CVE is always treated as
+    /// blocking.
+    #[serde(default)]
+    pub min_release_age_days: Option<u64>,
+}
+
 /// The cargo/crates.io deployment's settings, read from the optional
 /// `[cargo_registry]` table.
 ///
@@ -415,6 +474,12 @@ impl Config {
                 self.scan_budget,
                 MAX_SCAN_BUDGET,
                 PIP_DEFAULT_TIMEOUT
+            );
+        }
+        if self.cargo_registry.is_some() && self.npm_registry.is_some() {
+            bail!(
+                "a config file must carry at most one of [cargo_registry] or \
+                 [npm_registry], never both: each ecosystem runs as a separate deployment"
             );
         }
         if let Some(ai) = self.ai_review.as_ref() {

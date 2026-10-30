@@ -76,6 +76,16 @@ const FIELD_SEP: &[u8] = &[0u8];
 /// must never invalidate a verdict already stored. A config with no
 /// `[cargo_registry]` table appends nothing, by the same reasoning as
 /// `[ai_review]` above.
+///
+/// A config with `[npm_registry]` set appends, in order: the marker
+/// `npm_registry`, then `min_release_age_days` when set. The age gate
+/// changes what a scan admits, so changing it invalidates stored verdicts.
+/// `upstream_registry_url`, `scan_budget`, and `max_packument_bytes` stay
+/// out: they are operational knobs, like `bind` and `base_url`, and
+/// moving a deployment or retuning a timeout must not invalidate every
+/// stored verdict. A config with no `[npm_registry]` table appends
+/// nothing, by the same reasoning as `[ai_review]` and `[cargo_registry]`
+/// above.
 pub fn policy_fingerprint(cfg: &Config) -> anyhow::Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(serialize_cve_line(&cfg.cve).as_bytes());
@@ -152,6 +162,21 @@ pub fn policy_fingerprint(cfg: &Config) -> anyhow::Result<String> {
             hasher.update(FIELD_SEP);
             hasher.update(source.url.as_str().as_bytes());
         }
+    }
+
+    if let Some(registry) = cfg.npm_registry.as_ref() {
+        hasher.update(FIELD_SEP);
+        hasher.update(b"npm_registry");
+
+        if let Some(days) = registry.min_release_age_days {
+            hasher.update(FIELD_SEP);
+            hasher.update(b"min_release_age_days");
+            hasher.update(FIELD_SEP);
+            hasher.update(days.to_string().as_bytes());
+        }
+
+        // `upstream_registry_url`, `scan_budget`, and `max_packument_bytes`
+        // are deliberately absent: see this function's doc comment.
     }
 
     Ok(hex::encode(hasher.finalize()))

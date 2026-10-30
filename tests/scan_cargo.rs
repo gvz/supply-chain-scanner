@@ -79,6 +79,7 @@ fn base_config(scan_budget: Duration) -> Config {
         max_concurrent_scans: None,
         ai_review: None,
         cargo_registry: None,
+        npm_registry: None,
     }
 }
 

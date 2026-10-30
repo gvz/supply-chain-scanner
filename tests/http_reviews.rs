@@ -82,6 +82,7 @@ fn base_config() -> Config {
             block_opaque_executables: false,
         }),
         cargo_registry: None,
+        npm_registry: None,
     }
 }
 

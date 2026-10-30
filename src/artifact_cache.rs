@@ -253,17 +253,23 @@ impl ArtifactCache {
     }
 }
 
-/// Rejects anything that isn't a lowercase 64-character hex string before
-/// it reaches the filesystem: a cache key is not a safe path component
-/// just because it is *usually* one, and `sha256` ultimately traces back
-/// to upstream-supplied artifact data by way of [`ArtifactKey`].
+/// Validates a registry-declared digest (sha1, sha256, or sha512) before it
+/// reaches the filesystem. A cache key is not a safe path component just
+/// because it is *usually* one, and the digest ultimately traces back to
+/// upstream-supplied artifact data by way of [`ArtifactKey`].
+///
+/// Accepts exactly 40 (sha1), 64 (sha256), or 128 (sha512) lowercase hex
+/// characters. This is a filesystem-path security boundary: it rejects
+/// uppercase, non-hex, and any length other than these three.
 fn validated_sha256(sha256: &str) -> anyhow::Result<&str> {
-    let is_valid = sha256.len() == 64
+    let is_valid = matches!(sha256.len(), 40 | 64 | 128)
         && sha256
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
     if !is_valid {
-        anyhow::bail!("sha256 is not a lowercase 64-character hex string: {sha256:?}");
+        anyhow::bail!(
+            "digest is not a lowercase hex string of length 40 (sha1), 64 (sha256), or 128 (sha512): {sha256:?}"
+        );
     }
     Ok(sha256)
 }

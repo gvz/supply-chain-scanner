@@ -511,6 +511,90 @@ fn insert_keeps_a_matching_pre_existing_file_and_drops_the_redundant_copy() {
     assert_eq!(std::fs::read(&dest).expect("read cached file"), content);
 }
 
+#[test]
+fn insert_and_get_round_trip_a_sha512_digest() {
+    let (src_dir, _cache_dir, _db, cache) = open_cache();
+    let sha512 = "a".repeat(128); // 128 lowercase hex chars (sha512)
+    let k = key(&sha512);
+    let source = temp_source_file(&src_dir, "artifact.tar.gz", b"npm package bytes");
+
+    let stored_path = cache
+        .insert(&k, &source)
+        .expect("insert sha512 should succeed");
+    assert!(stored_path.is_file(), "insert must leave a file in place");
+    assert_eq!(
+        std::fs::read(&stored_path).expect("read stored file"),
+        b"npm package bytes"
+    );
+
+    let fetched = cache
+        .get(&k)
+        .expect("get should succeed")
+        .expect("sha512 entry must be present after insert");
+    assert_eq!(fetched, stored_path);
+}
+
+#[test]
+fn insert_and_get_round_trip_a_sha1_digest() {
+    let (src_dir, _cache_dir, _db, cache) = open_cache();
+    let sha1 = "b".repeat(40); // 40 lowercase hex chars (sha1)
+    let k = key(&sha1);
+    let source = temp_source_file(&src_dir, "artifact.tar.gz", b"old npm package");
+
+    let stored_path = cache
+        .insert(&k, &source)
+        .expect("insert sha1 should succeed");
+    assert!(stored_path.is_file(), "insert must leave a file in place");
+    assert_eq!(
+        std::fs::read(&stored_path).expect("read stored file"),
+        b"old npm package"
+    );
+
+    let fetched = cache
+        .get(&k)
+        .expect("get should succeed")
+        .expect("sha1 entry must be present after insert");
+    assert_eq!(fetched, stored_path);
+}
+
+#[test]
+fn a_digest_of_an_unsupported_length_is_still_rejected() {
+    let (src_dir, _cache_dir, _db, cache) = open_cache();
+    let source = temp_source_file(&src_dir, "artifact.tar.gz", b"payload");
+
+    // 63 and 100 hex chars (neither 40, 64, nor 128) must be rejected
+    for bad_digest in ["c".repeat(63), "d".repeat(100)] {
+        let k = key(&bad_digest);
+        assert!(
+            cache.insert(&k, &source).is_err(),
+            "insert must reject digest of unsupported length: {bad_digest:?}"
+        );
+        assert!(
+            cache.get(&k).is_err(),
+            "get must reject digest of unsupported length: {bad_digest:?}"
+        );
+    }
+}
+
+#[test]
+fn an_uppercase_or_non_hex_digest_is_still_rejected() {
+    let (src_dir, _cache_dir, _db, cache) = open_cache();
+    let source = temp_source_file(&src_dir, "artifact.tar.gz", b"payload");
+
+    // Uppercase and non-hex characters must still be rejected at all lengths
+    for bad_digest in ["A".repeat(64), "z".repeat(64)] {
+        let k = key(&bad_digest);
+        assert!(
+            cache.insert(&k, &source).is_err(),
+            "insert must reject non-lowercase-hex digest: {bad_digest:?}"
+        );
+        assert!(
+            cache.get(&k).is_err(),
+            "get must reject non-lowercase-hex digest: {bad_digest:?}"
+        );
+    }
+}
+
 /// `move_into_place`'s `EXDEV` fallback used to `fs::copy` straight to the
 /// final path, so a crash mid-copy left a truncated file at a
 /// content-addressed path with no row behind it. It now copies to a temp

@@ -10,6 +10,8 @@
 
 use std::fmt;
 
+pub mod packument;
+
 /// The longest npm package name the registry accepts, in characters.
 const MAX_NAME_LEN: usize = 214;
 

@@ -70,6 +70,7 @@ fn base_config() -> Config {
         // `ai_review_route_is_not_found_when_ai_review_is_unset` is the
         // one test for the gate itself and builds its own config.
         ai_review: Some(AiReviewConfig {
+            enabled: true,
             base_url: "http://127.0.0.1:9/chat/".parse().unwrap(),
             model: "test-model".to_string(),
             api_key_env: None,
@@ -407,6 +408,19 @@ async fn the_endpoint_is_not_found_when_ai_review_is_unset() {
     // endpoint just by upgrading to a binary that carries this feature.
     let mut cfg = base_config();
     cfg.ai_review = None;
+    let harness = harness_with_config(cfg).await;
+
+    let (status, _json) = get_json(&harness, "").await;
+
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn the_endpoint_is_not_found_when_ai_review_is_disabled() {
+    // A table that is present but `enabled = false` must gate the route
+    // the same way an absent table does, not the way a configured one does.
+    let mut cfg = base_config();
+    cfg.ai_review.as_mut().expect("table present").enabled = false;
     let harness = harness_with_config(cfg).await;
 
     let (status, _json) = get_json(&harness, "").await;

@@ -306,6 +306,7 @@ fn ai_review_config(server: &MockServer) -> AiReviewConfig {
     let mut base = Url::parse(&server.uri()).expect("valid provider url");
     base.set_path("/v1/");
     AiReviewConfig {
+        enabled: true,
         base_url: base,
         model: "test-model".to_string(),
         api_key_env: None,
@@ -716,6 +717,63 @@ async fn a_cargo_deployment_serves_api_reviews_behind_the_ai_gate() {
     assert!(
         body["reviews"].is_array(),
         "the listing must carry a reviews array: {body}"
+    );
+}
+
+/// `[ai_review]` with `enabled = false` must behave exactly like an
+/// absent table: the gate hides `/api/reviews`, the provider is never
+/// called, and a never-seen crate (which can only pass through a review)
+/// is forwarded empty rather than served.
+#[tokio::test]
+async fn a_disabled_reviewer_behaves_like_no_reviewer_at_all() {
+    let server = MockServer::start().await;
+    let bytes = crate_bytes("demo-crate", "1.0.0");
+    mount_registry(&server, "demo-crate", "1.0.0", &bytes).await;
+    mount_empty_osv_feed(&server).await;
+    mount_clean_model(&server).await;
+
+    let served = start(&server, |cfg, _| {
+        let mut ai = ai_review_config(&server);
+        ai.enabled = false;
+        cfg.ai_review = Some(ai);
+    })
+    .await
+    .expect("bootstrap a cargo deployment with the reviewer disabled");
+
+    let gated = reqwest::get(format!("{}api/reviews", served.base_url))
+        .await
+        .expect("GET api/reviews");
+    assert_eq!(
+        gated.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "a disabled [ai_review] table must hide /api/reviews, same as an absent one"
+    );
+
+    let index_url = format!("{}{}", served.base_url, index_path_for("demo-crate"));
+    let index_response = reqwest::get(&index_url)
+        .await
+        .expect("GET the crate's index file");
+    assert_eq!(
+        index_response.status(),
+        reqwest::StatusCode::OK,
+        "a crate with no usable version renders like an ordinary index, not an error"
+    );
+    let index_body = index_response.text().await.expect("read the index body");
+    assert!(
+        !index_body.contains("\"vers\":\"1.0.0\""),
+        "with no reviewer to pass, the only version must not be forwarded: {index_body}"
+    );
+
+    let model_calls = server
+        .received_requests()
+        .await
+        .expect("read the stand-in's request log")
+        .iter()
+        .filter(|request| request.url.path() == "/v1/chat/completions")
+        .count();
+    assert_eq!(
+        model_calls, 0,
+        "a disabled reviewer must never be called, even though the table is present"
     );
 }
 

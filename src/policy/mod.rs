@@ -40,8 +40,8 @@ const FIELD_SEP: &[u8] = &[0u8];
 /// tightening or loosening it must invalidate stored verdicts the same
 /// way editing `cve` does), then — in config list order —
 /// each plugin's name and the SHA-256 of its binary's current file
-/// contents, then, when `[ai_review]` is present, the reviewer's
-/// identity (see below).
+/// contents, then, when [`Config::ai_review`] returns `Some` (the table
+/// is present *and* `enabled`), the reviewer's identity (see below).
 ///
 /// Reorder-sensitive by construction: swapping two plugins' positions in
 /// `cfg.plugins` changes the byte sequence fed to the hasher even though
@@ -54,11 +54,16 @@ const FIELD_SEP: &[u8] = &[0u8];
 /// they are operational knobs, like `bind`, and moving a deployment to a
 /// different provider host must not invalidate every stored verdict.
 ///
-/// A config with no `[ai_review]` table appends nothing at all, so an
-/// unconfigured deployment produces a byte-identical digest to the same
-/// config on a binary built before the reviewer existed. Upgrading this
-/// proxy never invalidates a stored verdict by the mere presence of the
-/// new code.
+/// A config with no `[ai_review]` table — or one with `enabled = false`
+/// — appends nothing at all, so an unconfigured deployment, and a
+/// deployment that merely turned the reviewer off, both produce a
+/// byte-identical digest to the same config on a binary built before the
+/// reviewer existed. Upgrading this proxy never invalidates a stored
+/// verdict by the mere presence of the new code, and disabling the
+/// reviewer is indistinguishable, fingerprint-wise, from never having
+/// configured it — which is also why re-enabling it (going from
+/// `enabled = false` back to `true`) changes the fingerprint again: the
+/// set of checks a stored verdict passed through has changed either way.
 ///
 /// A config with `[cargo_registry]` set appends, in order: the marker
 /// `cargo_registry`, the required cargo-vet criterion, then — in config
@@ -97,7 +102,7 @@ pub fn policy_fingerprint(cfg: &Config) -> anyhow::Result<String> {
         hasher.update(binary_hash.as_bytes());
     }
 
-    if let Some(ai) = cfg.ai_review.as_ref() {
+    if let Some(ai) = cfg.ai_review() {
         hasher.update(FIELD_SEP);
         hasher.update(b"ai_review");
         hasher.update(FIELD_SEP);

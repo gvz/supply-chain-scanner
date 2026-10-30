@@ -246,6 +246,7 @@ fn exited(code: i32, output: &str) -> SandboxOutcome {
 /// the provider below is always a stub.
 fn ai_review_cfg() -> AiReviewConfig {
     AiReviewConfig {
+        enabled: true,
         base_url: "http://127.0.0.1:9/chat/".parse().unwrap(),
         model: "test-model".to_string(),
         api_key_env: None,

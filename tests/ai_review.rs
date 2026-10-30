@@ -73,6 +73,7 @@ fn binary() -> PathBuf {
 /// mutate the fields they care about.
 fn base_cfg() -> AiReviewConfig {
     AiReviewConfig {
+        enabled: true,
         base_url: Url::parse("http://127.0.0.1:9/chat/").expect("valid test base url"),
         model: "test-model".to_string(),
         api_key_env: None,

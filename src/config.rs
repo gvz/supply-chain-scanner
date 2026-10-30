@@ -253,6 +253,10 @@ fn default_ai_review_coverage_threshold() -> f32 {
     0.8
 }
 
+fn default_ai_review_enabled() -> bool {
+    true
+}
+
 /// The reviewer and its bounds, read from the optional `[ai_review]`
 /// table.
 ///
@@ -262,6 +266,17 @@ fn default_ai_review_coverage_threshold() -> f32 {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AiReviewConfig {
+    /// Whether the reviewer actually runs. Defaults to `true`, so a
+    /// `[ai_review]` table that omits this behaves exactly as it always
+    /// has. Setting it to `false` turns the reviewer off without losing
+    /// the rest of the table — `base_url`, `model`, and everything else
+    /// stay in the file, ready to flip back on — and [`Config::ai_review`]
+    /// is the one place that reads it, so every caller that asks "is the
+    /// reviewer on" sees the same answer. A disabled table still has to
+    /// parse and validate in full (see [`Config::validate`]): disabling
+    /// the reviewer is not a way to stage an incomplete one.
+    #[serde(default = "default_ai_review_enabled")]
+    pub enabled: bool,
     pub base_url: Url,
     pub model: String,
     /// Name of the environment variable that holds the API key. `None`
@@ -378,6 +393,18 @@ impl Config {
             .with_context(|| format!("parsing config file {}", path.display()))?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// The active `[ai_review]` table, or `None` when the table is
+    /// absent *or* present with `enabled = false`. This is the one place
+    /// that reads `AiReviewConfig::enabled`; every other caller that
+    /// needs to know whether the reviewer is on should call this instead
+    /// of reading `ai_review` directly, so a disabled table reads as
+    /// "off" everywhere — the policy fingerprint, the reviewer
+    /// construction at startup and on reload, the sandbox-requirement
+    /// check, and the `/api/reviews` route gate all agree.
+    pub fn ai_review(&self) -> Option<&AiReviewConfig> {
+        self.ai_review.as_ref().filter(|ai| ai.enabled)
     }
 
     fn validate(&self) -> anyhow::Result<()> {

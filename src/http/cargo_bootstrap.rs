@@ -156,7 +156,7 @@ pub async fn bootstrap_cargo_with_sandbox_factory(
     // unchanged rather than widening or moving it. It is already
     // ecosystem-agnostic: `AiReviewer::review` takes an `ArtifactKey` and
     // a directory, which is all a cargo review needs too.
-    let ai_reviewer = match config.ai_review.as_ref() {
+    let ai_reviewer = match config.ai_review() {
         Some(cfg) => Some(build_ai_reviewer(cfg, Arc::clone(&sandbox), db.clone())?),
         None => None,
     };

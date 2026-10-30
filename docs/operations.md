@@ -131,9 +131,23 @@ what that boundary is actually worth.
 ## The AI reviewer: an optional third gate
 
 A third scan gate, off by default. It stays off until an `[ai_review]` table
-appears in the configuration. With the table absent, the scan path is untouched
-and the policy fingerprint matches what an older binary produced. An upgrade
-changes nothing for an unconfigured deployment.
+appears in the configuration with `enabled` left at its default of `true` (or
+set explicitly). With the table absent, or present with `enabled = false`,
+the scan path is untouched and the policy fingerprint matches what an older
+binary produced. An upgrade changes nothing for an unconfigured deployment,
+and flipping `enabled` off changes nothing beyond turning the reviewer off —
+`base_url`, `model`, and the rest of the table stay in the file, ready to
+flip back on.
+
+This table, and its `enabled` flag, are shared by both deployments of this
+binary: a PyPI deployment reads `[ai_review]` at the top level of its config
+file, and a cargo deployment reads the very same `[ai_review]` table in its
+own, separate config file. There is no per-ecosystem `ai_review` setting to
+configure, because each ecosystem already runs as its own deployment with its
+own config file (see "Running a cargo/crates.io deployment" below) — turning
+the reviewer on or off, or changing any of its settings, is already
+independent between a PyPI deployment and a cargo deployment simply by
+editing that deployment's own file.
 
 Configured, one review runs per artifact, after the plugins. The proxy invokes
 its own binary as a hidden `collect` subcommand inside the bwrap sandbox.
@@ -147,6 +161,7 @@ artifact or lets the scan continue.
 
 | Setting | Default | Effect |
 |---|---|---|
+| `enabled` | true | Set false to turn the reviewer off without deleting the rest of the table. A disabled table behaves exactly like an absent one: the policy fingerprint, the sandbox requirement, `/api/reviews`, and reviewer construction all read it the same way. The table still has to validate in full either way — this is not a way to stage an incomplete one. |
 | `base_url` | required | Provider base. `chat/completions` is appended. Must be `https`, or `http` pointed at a loopback host. |
 | `model` | required | Model name. Sent with every request and stored in every review row. |
 | `api_key_env` | unset | Name of the environment variable that holds the API key. Unset sends no Authorization header. |

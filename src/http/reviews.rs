@@ -137,7 +137,7 @@ pub(crate) async fn reviews_for(
     // The cargo deployment has no `Reloader`, but the same gate is
     // correct there unchanged: its `[ai_review]` table is fixed at
     // startup, so this reads the boot value every time.
-    if config.current().ai_review.is_none() {
+    if config.current().ai_review().is_none() {
         return not_found();
     }
 

@@ -20,6 +20,7 @@ const TEST_KEY_ENV: &str = "SCS_TEST_PROVIDER_KEY";
 /// Builds an `AiReviewConfig` for a base url with `timeout`.
 fn cfg_url(base: Url, timeout: Duration) -> AiReviewConfig {
     AiReviewConfig {
+        enabled: true,
         base_url: base,
         model: "test-model".to_string(),
         api_key_env: Some(TEST_KEY_ENV.to_string()),

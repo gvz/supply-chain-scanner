@@ -232,7 +232,7 @@ pub async fn bootstrap(config: Config) -> anyhow::Result<Wired> {
     // `default_sandbox_factory` already failed closed on), the review
     // store on this same database, and this process's own executable as
     // the collector binary it runs under the sandbox.
-    let ai_reviewer = match config.ai_review.as_ref() {
+    let ai_reviewer = match config.ai_review() {
         Some(cfg) => Some(build_ai_reviewer(cfg, Arc::clone(&sandbox), db.clone())?),
         None => None,
     };
@@ -381,7 +381,7 @@ pub type SandboxFactory =
 pub fn default_sandbox_factory() -> SandboxFactory {
     Arc::new(
         |config: &Config| -> anyhow::Result<Arc<dyn SandboxRunner>> {
-            let sandboxed_checks = !config.plugins.is_empty() || config.ai_review.is_some();
+            let sandboxed_checks = !config.plugins.is_empty() || config.ai_review().is_some();
             if !sandboxed_checks {
                 Ok(Arc::new(NeverCalledSandbox))
             } else {
@@ -569,7 +569,7 @@ impl Reloader {
         // it must, see [`crate::policy`]) and a reviewer sealed to it in one
         // atomic swap. A build failure keeps the previous reviewer exactly
         // as a plugin failure keeps the previous plugins.
-        let ai_reviewer = match candidate.ai_review.as_ref() {
+        let ai_reviewer = match candidate.ai_review() {
             Some(cfg) => Some(
                 build_ai_reviewer(cfg, Arc::clone(&sandbox), self.db.clone()).context(
                     "building the ai reviewer for the reloaded configuration; keeping the \

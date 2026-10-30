@@ -64,6 +64,7 @@ fn plugin(name: &str, binary: &Path) -> PluginConfig {
 /// fields the plan pins as fingerprint inputs.
 fn ai_review() -> AiReviewConfig {
     AiReviewConfig {
+        enabled: true,
         base_url: "https://provider.example/v1/".parse().unwrap(),
         model: "gpt-reviewer".to_string(),
         api_key_env: None,
@@ -138,6 +139,39 @@ fn enabling_the_reviewer_changes_the_fingerprint() {
         fp_off, fp_on,
         "turning the reviewer on must change the fingerprint, or artifacts scanned \
          clean without a review would keep serving from a verdict that never met it"
+    );
+}
+
+#[test]
+fn a_disabled_reviewer_fingerprints_exactly_like_no_reviewer_at_all() {
+    let mut disabled = ai_review();
+    disabled.enabled = false;
+    let mut cfg_disabled = base_config();
+    cfg_disabled.ai_review = Some(disabled);
+
+    assert_eq!(
+        policy_fingerprint(&cfg_disabled).expect("fingerprint disabled"),
+        policy_fingerprint(&base_config()).expect("fingerprint absent"),
+        "an [ai_review] table with enabled = false must fingerprint identically \
+         to a config with no table at all"
+    );
+}
+
+#[test]
+fn re_enabling_a_disabled_reviewer_changes_the_fingerprint() {
+    let mut disabled = ai_review();
+    disabled.enabled = false;
+    let mut cfg_disabled = base_config();
+    cfg_disabled.ai_review = Some(disabled);
+
+    let mut cfg_enabled = base_config();
+    cfg_enabled.ai_review = Some(ai_review());
+
+    assert_ne!(
+        policy_fingerprint(&cfg_disabled).expect("fingerprint disabled"),
+        policy_fingerprint(&cfg_enabled).expect("fingerprint enabled"),
+        "flipping enabled back to true must change the fingerprint, same as \
+         turning the reviewer on from nothing"
     );
 }
 

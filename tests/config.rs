@@ -137,6 +137,11 @@ fn ai_review_minimal_applies_documented_defaults() {
         .as_ref()
         .expect("[ai_review] with base_url and model must load");
 
+    assert!(
+        ai.enabled,
+        "enabled must default to true, so an [ai_review] table that omits it \
+         behaves exactly as it always has"
+    );
     assert_eq!(ai.base_url.as_str(), "https://provider.example/v1/");
     assert_eq!(ai.model, "reviewer-1");
     assert_eq!(ai.api_key_env, None);
@@ -146,6 +151,36 @@ fn ai_review_minimal_applies_documented_defaults() {
     assert!((ai.coverage_threshold - 0.8).abs() < 1e-6);
     assert_eq!(ai.block_on, BlockOn::Malicious);
     assert!(!ai.block_opaque_executables);
+}
+
+#[test]
+fn ai_review_accepts_an_explicit_enabled_false() {
+    let toml = toml_with_ai_review(&format!("{AI_REVIEW_BASE}\nenabled = false"));
+    let file = write_temp_toml(&toml);
+
+    let config = Config::load(file.path()).expect("load config");
+
+    assert!(!config.ai_review.as_ref().expect("table loaded").enabled);
+    assert!(
+        config.ai_review().is_none(),
+        "Config::ai_review must read a disabled table as absent"
+    );
+}
+
+#[test]
+fn ai_review_disabled_still_validates_the_rest_of_the_table() {
+    let toml = toml_with_ai_review(&format!(
+        "{AI_REVIEW_BASE}\nenabled = false\ncoverage_threshold = 1.5"
+    ));
+    let file = write_temp_toml(&toml);
+
+    let result = Config::load(file.path());
+
+    assert!(
+        result.is_err(),
+        "a disabled table is not a way to stage an invalid one; it must still \
+         be fully validated"
+    );
 }
 
 #[test]

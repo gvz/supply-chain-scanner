@@ -226,6 +226,7 @@ fn config_with_min_release_age(
 
 fn ai_review_cfg(timeout: Duration) -> AiReviewConfig {
     AiReviewConfig {
+        enabled: true,
         base_url: "http://127.0.0.1:9/chat/".parse().unwrap(),
         model: "test-model".to_string(),
         api_key_env: None,

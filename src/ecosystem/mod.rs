@@ -3,6 +3,7 @@
 
 pub mod cargo;
 pub mod install_surface;
+pub mod npm;
 pub mod pypi;
 pub mod traits;
 

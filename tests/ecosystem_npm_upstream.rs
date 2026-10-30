@@ -14,7 +14,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use supply_chain_scanner::config::DownloadLimits;
 use supply_chain_scanner::ecosystem::npm::packument::Dist;
-use supply_chain_scanner::ecosystem::npm::upstream::{NpmUpstream, UpstreamError};
+use supply_chain_scanner::ecosystem::npm::upstream::{EtagCache, NpmUpstream, UpstreamError};
 use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -550,4 +550,72 @@ async fn download_tarball_of_a_truncated_body_errors_rather_than_leaving_a_parti
         leftovers.is_empty(),
         "a truncated download must not leave its temp file behind: {leftovers:?}"
     );
+}
+
+/// `NpmUpstream`'s ETag cache is bounded so a long-running deployment
+/// cannot grow it without bound across npm's millions of distinct
+/// package names. The production caps (500 entries, 200 MiB) are far too
+/// large to hit through `NpmUpstream::packument` in a fast test — that
+/// would need hundreds of distinct upstream fetches — so these drive the
+/// `EtagCache` eviction helper directly with tiny caps instead.
+#[test]
+fn etag_cache_evicts_the_oldest_entry_past_its_entry_cap() {
+    let mut cache = EtagCache::with_limits(2, 1_000_000);
+
+    cache.insert("a".to_string(), "etag-a".to_string(), "body-a".to_string());
+    cache.insert("b".to_string(), "etag-b".to_string(), "body-b".to_string());
+    cache.insert("c".to_string(), "etag-c".to_string(), "body-c".to_string());
+
+    assert!(
+        cache.get_body("a").is_none(),
+        "the oldest entry must be evicted once the entry cap is exceeded"
+    );
+    assert_eq!(cache.get_body("b"), Some("body-b".to_string()));
+    assert_eq!(cache.get_body("c"), Some("body-c".to_string()));
+}
+
+#[test]
+fn etag_cache_evicts_oldest_entries_past_its_total_bytes_cap() {
+    let mut cache = EtagCache::with_limits(100, 50);
+
+    cache.insert("a".to_string(), "etag-a".to_string(), "x".repeat(30));
+    cache.insert("b".to_string(), "etag-b".to_string(), "x".repeat(30));
+    cache.insert("c".to_string(), "etag-c".to_string(), "x".repeat(30));
+
+    assert!(
+        cache.get_body("a").is_none(),
+        "the oldest entry must be evicted once the total-bytes cap is exceeded"
+    );
+    assert!(
+        cache.get_body("b").is_none(),
+        "eviction must repeat until the total-bytes cap is satisfied again"
+    );
+    assert_eq!(cache.get_body("c"), Some("x".repeat(30)));
+}
+
+#[test]
+fn etag_cache_moves_a_re_inserted_name_to_the_back_instead_of_evicting_it_as_stale() {
+    let mut cache = EtagCache::with_limits(2, 1_000_000);
+
+    cache.insert(
+        "a".to_string(),
+        "etag-a1".to_string(),
+        "body-a1".to_string(),
+    );
+    cache.insert("b".to_string(), "etag-b".to_string(), "body-b".to_string());
+    // Refresh "a" — it must now be the most-recently-used entry, not the
+    // oldest, even though it was inserted first.
+    cache.insert(
+        "a".to_string(),
+        "etag-a2".to_string(),
+        "body-a2".to_string(),
+    );
+    cache.insert("c".to_string(), "etag-c".to_string(), "body-c".to_string());
+
+    assert!(
+        cache.get_body("b").is_none(),
+        "the entry that was never refreshed must be the one evicted"
+    );
+    assert_eq!(cache.get_body("a"), Some("body-a2".to_string()));
+    assert_eq!(cache.get_body("c"), Some("body-c".to_string()));
 }

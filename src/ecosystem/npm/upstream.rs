@@ -10,19 +10,24 @@
 //! As on the cargo and PyPI upstream paths, the two jobs need different
 //! timeout shapes, so this client keeps two [`reqwest::Client`]s.
 //!
-//! - **The packument fetch** is a small JSON document. It keeps a total
-//!   deadline, generous enough to stay well under
+//! - **The packument fetch** is a JSON document that, unlike a cargo
+//!   index file, can run to several megabytes for a package with many
+//!   published versions. It keeps a total deadline of 25s: large enough
+//!   that a multi-megabyte document finishes on any working connection,
+//!   but leaving roughly 95 of the 120s
 //!   [`crate::config::NpmRegistryConfig::scan_budget`]'s documented
-//!   default of 120s (npm's own `fetch-timeout` is 300s, so a PyPI-shaped
-//!   ~10s deadline would turn ordinary upstream slowness into a hard
-//!   `npm install` failure).
+//!   default for the tarball downloads and AI reviews a cascade still has
+//!   to run across the major-version lines it is working through. A
+//!   PyPI-shaped ~10s deadline is too tight for this document's size; a
+//!   deadline much closer to the full 120s would leave too little of the
+//!   budget for everything downstream of one slow fetch.
 //! - **The tarball download** has no total deadline. A total deadline
 //!   caps artifact size while it pretends to cap time. Instead this
 //!   client detects stalls with `read_timeout`, and
 //!   [`crate::config::DownloadLimits::max_duration`] bounds the whole call
 //!   from outside.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -51,14 +56,119 @@ use crate::ecosystem::npm::packument_path;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Upper bound on an entire packument request (connect through end of
-/// body). Kept well under
-/// [`crate::config::NpmRegistryConfig::scan_budget`]'s documented default
-/// of 120s, so one slow packument fetch cannot by itself consume the whole
-/// scan budget.
+/// body): 25s against the 120s
+/// [`crate::config::NpmRegistryConfig::scan_budget`]'s documented default,
+/// leaving roughly 95s of that budget for the tarball downloads and AI
+/// reviews still ahead of one packument fetch. This is a total deadline,
+/// not stall detection, so it cannot distinguish a large-but-healthy
+/// transfer from a merely slow one — which is exactly why it stays a
+/// fraction of the budget rather than creeping close to it.
 ///
 /// Deliberately not applied to the tarball download path — see the module
 /// docs and [`DownloadLimits`].
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(100);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Entry-count cap on [`EtagCache`]. npm's registry has millions of
+/// distinct package names, so a long-running deployment that queries
+/// many of them over its lifetime would otherwise grow this cache
+/// without bound. 500 is far more than any one deployment's cascade
+/// re-touches within a single scan (which works through one package's
+/// major-version lines, not hundreds of distinct packages at once), so
+/// this cap costs real cache hits only for a workload that is already
+/// querying an unusually wide spread of packages.
+const MAX_ETAG_CACHE_ENTRIES: usize = 500;
+
+/// Total-bytes cap on [`EtagCache`], in addition to
+/// [`MAX_ETAG_CACHE_ENTRIES`]: an entry holds a full packument body (up
+/// to [`crate::config::NpmRegistryConfig::max_packument_bytes`], 64 MiB
+/// by default), so a count cap alone does not bound memory if a
+/// deployment happens to cache many large packuments. 200 MiB is a small
+/// fraction of typical deployment memory, while still large enough to
+/// hold hundreds of ordinary (sub-1 MiB) packuments or a handful of the
+/// largest ones a registry actually serves.
+const MAX_ETAG_CACHE_BYTES: u64 = 200 * 1024 * 1024;
+
+/// An in-memory cache of the last successfully fetched packument body
+/// for each package name, keyed by the exact name a caller passed to
+/// [`NpmUpstream::packument`] (no normalization).
+///
+/// Bounded by both an entry count and a total-bytes cap
+/// ([`MAX_ETAG_CACHE_ENTRIES`], [`MAX_ETAG_CACHE_BYTES`] in
+/// [`EtagCache::new`]); whichever is exceeded evicts the single oldest
+/// entry (by insertion or last-update order), repeating until both caps
+/// are satisfied again. This is deliberately a soft, approximate policy
+/// rather than a hard refusal to cache an oversized or extra entry: a
+/// cache miss only costs a redundant upstream fetch next time, never
+/// correctness.
+///
+/// Kept as its own type (rather than a bare `Mutex<HashMap<..>>` on
+/// [`NpmUpstream`]) so the eviction logic has a seam `tests/` can drive
+/// directly with tiny caps — exercising eviction through
+/// [`NpmUpstream::packument`] at the production caps would need hundreds
+/// of distinct upstream fetches per test. Its constructor and accessors
+/// are `pub` for exactly that reason, the same way
+/// [`crate::db::index_cache::IndexCache`] is `pub` and driven directly
+/// from integration tests; it is not meant as a general-purpose cache
+/// for callers outside this module.
+pub struct EtagCache {
+    entries: HashMap<String, (String, String)>,
+    /// Insertion/last-update order, oldest first. A name appears at most
+    /// once; re-inserting a name already cached removes its old position
+    /// before pushing the fresh one to the back, so it is not evicted as
+    /// though it were the stalest entry.
+    order: VecDeque<String>,
+    total_bytes: u64,
+    max_entries: usize,
+    max_bytes: u64,
+}
+
+impl EtagCache {
+    fn new() -> Self {
+        Self::with_limits(MAX_ETAG_CACHE_ENTRIES, MAX_ETAG_CACHE_BYTES)
+    }
+
+    /// Builds a cache with explicit caps. Production code always goes
+    /// through [`EtagCache::new`]; this exists so tests can exercise
+    /// eviction with caps small enough to hit in a handful of inserts.
+    pub fn with_limits(max_entries: usize, max_bytes: u64) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            total_bytes: 0,
+            max_entries,
+            max_bytes,
+        }
+    }
+
+    pub fn get_etag(&self, name: &str) -> Option<String> {
+        self.entries.get(name).map(|(etag, _)| etag.clone())
+    }
+
+    pub fn get_body(&self, name: &str) -> Option<String> {
+        self.entries.get(name).map(|(_, body)| body.clone())
+    }
+
+    /// Inserts (or replaces) `name`'s cached `(etag, body)`, then evicts
+    /// the oldest entry, repeatedly, until both caps are satisfied.
+    pub fn insert(&mut self, name: String, etag: String, body: String) {
+        if let Some((_, old_body)) = self.entries.remove(&name) {
+            self.total_bytes = self.total_bytes.saturating_sub(old_body.len() as u64);
+            self.order.retain(|cached| cached != &name);
+        }
+        self.total_bytes = self.total_bytes.saturating_add(body.len() as u64);
+        self.order.push_back(name.clone());
+        self.entries.insert(name, (etag, body));
+
+        while self.entries.len() > self.max_entries || self.total_bytes > self.max_bytes {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some((_, evicted_body)) = self.entries.remove(&oldest) {
+                self.total_bytes = self.total_bytes.saturating_sub(evicted_body.len() as u64);
+            }
+        }
+    }
+}
 
 /// What went wrong talking to the npm registry upstream.
 ///
@@ -83,8 +193,8 @@ pub enum UpstreamError {
 /// tarball bodies of unbounded size and must not have one. See
 /// [`DownloadLimits`].
 ///
-/// The ETag cache is a simple in-memory map of package name to (etag,
-/// body). A `304` with no cached body for that name is
+/// The ETag cache ([`EtagCache`]) is an in-memory, bounded map of package
+/// name to (etag, body). A `304` with no cached body for that name is
 /// [`UpstreamError::Unavailable`], never an empty [`Packument`] — see
 /// [`NpmUpstream::packument`].
 pub struct NpmUpstream {
@@ -106,8 +216,9 @@ pub struct NpmUpstream {
     max_artifact_bytes: u64,
     /// Name -> (etag, body) of the last successfully fetched packument for
     /// that name. Populated only when upstream sends an `ETag`, and
-    /// consulted on the next fetch via `If-None-Match`.
-    etag_cache: Mutex<HashMap<String, (String, String)>>,
+    /// consulted on the next fetch via `If-None-Match`. Bounded — see
+    /// [`EtagCache`].
+    etag_cache: Mutex<EtagCache>,
 }
 
 impl NpmUpstream {
@@ -142,7 +253,7 @@ impl NpmUpstream {
             max_packument_bytes,
             download_max_duration: download_limits.max_duration,
             max_artifact_bytes: download_limits.max_artifact_bytes,
-            etag_cache: Mutex::new(HashMap::new()),
+            etag_cache: Mutex::new(EtagCache::new()),
         })
     }
 
@@ -174,7 +285,7 @@ impl NpmUpstream {
 
         let cached_etag = {
             let cache = self.etag_cache.lock().expect("etag cache mutex poisoned");
-            cache.get(name).map(|(etag, _)| etag.clone())
+            cache.get_etag(name)
         };
 
         let mut request = self.packument_client.get(url);
@@ -194,8 +305,8 @@ impl NpmUpstream {
         }
         if status == reqwest::StatusCode::NOT_MODIFIED {
             let cache = self.etag_cache.lock().expect("etag cache mutex poisoned");
-            return match cache.get(name) {
-                Some((_, body)) => parse_packument(body)
+            return match cache.get_body(name) {
+                Some(body) => parse_packument(&body)
                     .with_context(|| format!("parsing the cached packument for {name:?}"))
                     .map_err(UpstreamError::Other),
                 None => Err(UpstreamError::Unavailable(format!(
@@ -240,7 +351,7 @@ impl NpmUpstream {
 
         if let Some(etag) = etag_header {
             let mut cache = self.etag_cache.lock().expect("etag cache mutex poisoned");
-            cache.insert(name.to_string(), (etag, body));
+            cache.insert(name.to_string(), etag, body);
         }
 
         Ok(packument)

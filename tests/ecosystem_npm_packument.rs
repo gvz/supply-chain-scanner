@@ -135,6 +135,33 @@ fn declared_digest_rejects_an_unverifiable_integrity_algorithm() {
     assert!(declared_digest(&dist).is_none());
 }
 
+#[test]
+fn declared_digest_rejects_malformed_base64_under_a_valid_prefix() {
+    // "!!!" is not valid base64 under any prefix. A decode failure must
+    // not fall back to shasum either.
+    let dist = supply_chain_scanner::ecosystem::npm::packument::Dist {
+        tarball: "https://registry.npmjs.org/demo/-/demo-1.0.0.tgz".to_string(),
+        integrity: Some("sha512-!!!not-valid-base64!!!".to_string()),
+        shasum: Some("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed".to_string()),
+    };
+
+    assert!(declared_digest(&dist).is_none());
+}
+
+#[test]
+fn declared_digest_rejects_a_sha512_payload_of_the_wrong_decoded_length() {
+    // Valid sha512- prefix, valid base64, but the decoded payload is only
+    // 5 bytes rather than SHA-512's 64. A truncated or corrupted
+    // integrity string must not be accepted just because it parses.
+    let dist = supply_chain_scanner::ecosystem::npm::packument::Dist {
+        tarball: "https://registry.npmjs.org/demo/-/demo-1.0.0.tgz".to_string(),
+        integrity: Some("sha512-c2hvcnQ=".to_string()),
+        shasum: Some("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed".to_string()),
+    };
+
+    assert!(declared_digest(&dist).is_none());
+}
+
 fn three_version_body() -> String {
     r#"{
         "name": "demo",

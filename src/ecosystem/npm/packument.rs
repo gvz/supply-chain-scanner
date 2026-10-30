@@ -135,11 +135,13 @@ pub fn parse_packument(body: &str) -> Result<Packument> {
 /// occasionally `sha1-<base64>`). `shasum` is a plain hex SHA-1.
 ///
 /// When `integrity` is present but its algorithm prefix is neither
-/// `sha1-` nor `sha512-` (for example `sha384-`), or its base64 payload
-/// does not decode, this returns `None` — even when a usable `shasum` is
-/// also present. Falling back to `shasum` in that case would silently
-/// verify the tarball against a weaker digest than the one upstream
-/// actually declared, which is worse than refusing outright.
+/// `sha1-` nor `sha512-` (for example `sha384-`), its base64 payload
+/// does not decode, or the decoded payload is not that algorithm's
+/// exact digest length (20 bytes for SHA-1, 64 for SHA-512), this
+/// returns `None` — even when a usable `shasum` is also present.
+/// Falling back to `shasum` in that case would silently verify the
+/// tarball against a weaker digest than the one upstream actually
+/// declared, which is worse than refusing outright.
 pub fn declared_digest(dist: &Dist) -> Option<DeclaredDigest> {
     if let Some(integrity) = &dist.integrity {
         let (algorithm, encoded) = if let Some(rest) = integrity.strip_prefix("sha512-") {
@@ -153,6 +155,19 @@ pub fn declared_digest(dist: &Dist) -> Option<DeclaredDigest> {
             return None;
         };
         let bytes = BASE64.decode(encoded).ok()?;
+        let expected_len = match algorithm {
+            DigestAlgorithm::Sha1 => 20,
+            DigestAlgorithm::Sha512 => 64,
+        };
+        if bytes.len() != expected_len {
+            // Valid base64 that decodes to the wrong length (a truncated
+            // or otherwise corrupted integrity string) is just as
+            // unverifiable as an unknown algorithm. Catch it here, at the
+            // layer that knows which algorithm was declared, rather than
+            // letting a downstream hash comparison fail for an unrelated
+            // reason.
+            return None;
+        }
         return Some(DeclaredDigest {
             algorithm,
             hex: hex::encode(bytes),
@@ -217,22 +232,28 @@ pub fn filter_packument(source: &Packument, keep: &[String], public_base: &str) 
         .entry("versions".to_string())
         .or_insert_with(|| Value::Object(serde_json::Map::new()));
 
-    if let Value::Object(versions_map) = versions_slot {
-        versions_map.retain(|version, _| keep_set.contains(version.as_str()));
-        for (version, entry) in versions_map.iter_mut() {
-            survivors.push(version.clone());
-            if let Some(dist) = entry.get_mut("dist").and_then(Value::as_object_mut) {
-                let tarball_url = format!("{public_base}/{}", tarball_path(&source.name, version));
-                dist.insert("tarball".to_string(), Value::String(tarball_url));
-            }
-        }
-    } else {
-        // Upstream's "versions" was present but not an object. Parsing
-        // such a document would already have failed in parse_packument,
-        // so this is unreachable for any Packument it produced — but
-        // replace it with a well-formed empty object rather than leave
-        // the clone malformed.
-        *versions_slot = Value::Object(serde_json::Map::new());
+    // `parse_packument`'s all-or-nothing deserialization guarantees that
+    // any `Packument` it produced has a `raw["versions"]` that is a JSON
+    // object whose every entry has a JSON object `dist`. `Packument`'s
+    // fields are all `pub`, so nothing stops a caller outside this module
+    // from constructing one with a `raw` that violates that — and if that
+    // ever happens, failing loudly here is the only acceptable response.
+    // Silently treating "not an object" as "zero versions" would drop
+    // versions exactly the way this proxy's own gate does, making a bug
+    // indistinguishable from a refusal; silently skipping a tarball
+    // rewrite would be worse, forwarding a survivor whose `dist.tarball`
+    // still points at the real upstream registry instead of this proxy.
+    let versions_map = versions_slot
+        .as_object_mut()
+        .expect("invariant violated: Packument.raw[\"versions\"] must be a JSON object");
+    versions_map.retain(|version, _| keep_set.contains(version.as_str()));
+    for (version, entry) in versions_map.iter_mut() {
+        survivors.push(version.clone());
+        let dist = entry.get_mut("dist").and_then(Value::as_object_mut).expect(
+            "invariant violated: every Packument.raw[\"versions\"] entry must have an object \"dist\"",
+        );
+        let tarball_url = format!("{public_base}/{}", tarball_path(&source.name, version));
+        dist.insert("tarball".to_string(), Value::String(tarball_url));
     }
 
     let newest_survivor = semver_newest(&survivors);

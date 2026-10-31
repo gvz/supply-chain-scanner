@@ -2,6 +2,8 @@
 
 One Rust crate, one process, one SQLite file. This chapter gives the tour. The following chapters go deep on each part.
 
+Editable draw.io diagrams of everything below live in [`docs/diagrams/`](../../diagrams/). They are the fastest way to see the shape of the system, and they are kept in step with the code: start with `01-system-overview.drawio`.
+
 ## The crate
 
 The crate is a library plus a thin binary (`Cargo.toml` declares both):

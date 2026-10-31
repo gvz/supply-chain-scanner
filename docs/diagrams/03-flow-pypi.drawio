@@ -1,0 +1,229 @@
+<mxfile host="app.diagrams.net" agent="supply-chain-scanner" version="24.0.0">
+  <diagram id="flow-pypi" name="3. PyPI Request Flow">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1400" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="PyPI Request Flow" style="text;html=1;align=left;verticalAlign=middle;fontSize=22;fontStyle=1;fontColor=#1a1a1a;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="800" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" value="pip talks only to the proxy. The simple index is rewritten so every artifact link comes back here, and Scanner::decide is the one place that answers yes or no." style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="58" width="1250" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="lane1" value="pip" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#d6d6d6;verticalAlign=top;align=center;fontStyle=1;fontSize=12;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="100" width="150" height="620" as="geometry" />
+        </mxCell>
+        <mxCell id="lane2" value="proxy: HTTP layer" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#d6d6d6;verticalAlign=top;align=center;fontStyle=1;fontSize=12;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="210" y="100" width="330" height="620" as="geometry" />
+        </mxCell>
+        <mxCell id="lane3" value="proxy: decide + scan" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#d6d6d6;verticalAlign=top;align=center;fontStyle=1;fontSize=12;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="560" y="100" width="470" height="620" as="geometry" />
+        </mxCell>
+        <mxCell id="lane4" value="upstream + stores" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#d6d6d6;verticalAlign=top;align=center;fontStyle=1;fontSize=12;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="1050" y="100" width="400" height="620" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p1" value="1. GET /simple/&lt;pkg&gt;/" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="55" y="140" width="120" height="46" as="geometry" />
+        </mxCell>
+        <mxCell id="h1" value="simple_handler&#10;fetch page (index_cache), rewrite every&#10;href to /files/&lt;pkg&gt;/&lt;ver&gt;/&lt;file&gt;&#10;annotate blocked filenames from stored verdicts" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="225" y="130" width="300" height="66" as="geometry" />
+        </mxCell>
+        <mxCell id="p2" value="2. index page" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="55" y="210" width="120" height="46" as="geometry" />
+        </mxCell>
+        <mxCell id="p3" value="3. GET /files/&lt;pkg&gt;/&lt;ver&gt;/&lt;file&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="55" y="280" width="120" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="h2" value="artifact_handler&#10;parses the request, then calls Scanner::decide" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="225" y="285" width="300" height="46" as="geometry" />
+        </mxCell>
+
+        <mxCell id="d0" value="Scanner::decide — one snapshot of ScanRules for the whole decision" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;align=center;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="580" y="130" width="430" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="d1" value="allowlisted?&#10;(normalized package + exact version)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="580" y="185" width="200" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="d1n" value="Overrides every stored verdict and every&#10;judgement check, but never the hash: the&#10;bytes still must match the index-declared&#10;digest. Goes straight to fetch_decision." style="text;html=1;align=left;verticalAlign=top;fontSize=9;fontColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="795" y="185" width="215" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="d2" value="stored verdict for&#10;(eco, pkg, ver, file, digest)&#10;under today's fingerprint?" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="580" y="260" width="200" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="r_blocked" value="BLOCKED&#10;+ its why_id" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="580" y="345" width="110" height="46" as="geometry" />
+        </mxCell>
+        <mxCell id="r_clean" value="CLEAN&#10;re-check advisories,&#10;then serve from cache" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="705" y="345" width="140" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="r_none" value="no verdict (never scanned,&#10;or policy changed)&#10;→ full scan, single flight,&#10;under scan_budget" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="860" y="345" width="150" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="clean_note" value="A clean row is re-checked against the advisories on every request, because an advisory can be filed after the scan. That is why the mirror is local: the re-check must not depend on upstream being up." style="text;html=1;align=left;verticalAlign=top;fontSize=9;fontColor=#375623;" vertex="1" parent="1">
+          <mxGeometry x="705" y="400" width="305" height="50" as="geometry" />
+        </mxCell>
+
+        <mxCell id="fs" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;strokeWidth=2;verticalAlign=top;align=left;spacingLeft=8;spacingTop=4;" vertex="1" parent="1">
+          <mxGeometry x="580" y="460" width="430" height="245" as="geometry" />
+        </mxCell>
+        <mxCell id="fs_t" value="run_full_scan — stops at the first failure" style="text;html=1;align=left;verticalAlign=middle;fontSize=11;fontStyle=1;fontColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="590" y="466" width="350" height="20" as="geometry" />
+        </mxCell>
+        <mxCell id="g1" value="a. release age&#10;(best effort: no&#10;timestamp does not&#10;block) — deliberately&#10;NOT stored" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=9;align=center;" vertex="1" parent="1">
+          <mxGeometry x="590" y="494" width="78" height="76" as="geometry" />
+        </mxCell>
+        <mxCell id="g2" value="b. advisory&#10;lookup +&#10;CVE line&#10;→ store&#10;Blocked" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=9;align=center;" vertex="1" parent="1">
+          <mxGeometry x="676" y="494" width="78" height="76" as="geometry" />
+        </mxCell>
+        <mxCell id="g3" value="c. download&#10;(or reuse&#10;cached bytes)&#10;+ digest&#10;verify" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=9;align=center;" vertex="1" parent="1">
+          <mxGeometry x="762" y="494" width="78" height="76" as="geometry" />
+        </mxCell>
+        <mxCell id="g4" value="d. unpack&#10;then org&#10;plugins&#10;→ store&#10;Blocked" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=9;align=center;" vertex="1" parent="1">
+          <mxGeometry x="848" y="494" width="78" height="76" as="geometry" />
+        </mxCell>
+        <mxCell id="g5" value="e. AI review&#10;(when&#10;configured)&#10;→ store&#10;Blocked" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=9;align=center;" vertex="1" parent="1">
+          <mxGeometry x="934" y="494" width="68" height="76" as="geometry" />
+        </mxCell>
+        <mxCell id="g6" value="f. store Clean, insert into the artifact cache, serve" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="590" y="585" width="412" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="g_arrows1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=1;endArrow=block;endFill=1;" edge="1" parent="1" source="g1" target="g2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="g_arrows2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=1;endArrow=block;endFill=1;" edge="1" parent="1" source="g2" target="g3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="g_arrows3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=1;endArrow=block;endFill=1;" edge="1" parent="1" source="g3" target="g4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="g_arrows4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=1;endArrow=block;endFill=1;" edge="1" parent="1" source="g4" target="g5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="g_arrows5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#82b366;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="g5" target="g6">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="u1" value="PyPI simple index" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1070" y="140" width="160" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="u2" value="PyPI file host&#10;(wheels, sdists)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1070" y="200" width="160" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="s1" value="index_cache" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1250" y="140" width="180" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="s2" value="verdicts" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1250" y="200" width="180" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="s3" value="advisories (local OSV mirror)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1070" y="270" width="360" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="s4" value="artifact_cache (verified bytes on disk)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1070" y="330" width="360" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="s5" value="AI provider (when [ai_review] is set)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1070" y="390" width="360" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="s6" value="reviews (audit trail behind /api/reviews and /why)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1070" y="450" width="360" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="s_note" value="Every store call runs on the blocking pool, so the async runtime never stalls on SQLite." style="text;html=1;align=left;verticalAlign=top;fontSize=9;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="1070" y="510" width="360" height="40" as="geometry" />
+        </mxCell>
+
+        <mxCell id="out_title" value="4. The three answers, as pip sees them" style="text;html=1;align=left;verticalAlign=middle;fontSize=13;fontStyle=1;fontColor=#1a1a1a;" vertex="1" parent="1">
+          <mxGeometry x="40" y="750" width="600" height="28" as="geometry" />
+        </mxCell>
+        <mxCell id="o1" value="SERVE&#10;200 with the verified bytes" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=center;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="790" width="240" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="o2" value="REFUSE&#10;403, phrase:&#10;BLOCKED &lt;code&gt; - why &lt;url&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;align=center;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="300" y="790" width="240" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="o3" value="UNVERIFIABLE&#10;503, phrase:&#10;UNVERIFIABLE &lt;code&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;align=center;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="560" y="790" width="240" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="o4" value="IN PROGRESS&#10;429, retryable;&#10;the detached scan finishes&#10;and stores its verdict" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;align=center;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="820" y="790" width="240" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="o_note" value="The retryable answer is 429 and not 503 on purpose: pip auto-retries a 503, which would bury the message. 503 is reserved for Unverifiable, where retrying immediately is pointless. The URL in the BLOCKED phrase is what makes a refusal actionable, so the phrase builder reserves bytes for it and shortens the code instead." style="text;html=1;align=left;verticalAlign=top;fontSize=10;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="865" width="1020" height="50" as="geometry" />
+        </mxCell>
+
+        <mxCell id="inv" value="THE INVARIANT&#10;A check that could not run is Unverifiable, never a serve, and it is never stored as a durable Blocked verdict. Storing it would refuse the artifact forever over a broken check, and would tell a developer 'we found malware' about something nothing examined. Each scan also decodes under one ScanRules snapshot, so a SIGHUP landing mid-scan cannot swap the policy a verdict was produced under." style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;strokeWidth=2;align=left;verticalAlign=top;fontSize=11;fontColor=#9c2b25;fontStyle=1;spacingLeft=10;spacingTop=6;whiteSpace=wrap;" vertex="1" parent="1">
+          <mxGeometry x="40" y="935" width="1020" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_p1_h1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#6c8ebf;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1" target="h1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_h1_p2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#6c8ebf;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="h1" target="p2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_p2_p3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#6c8ebf;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p2" target="p3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_p3_h2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#6c8ebf;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p3" target="h2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_h2_d0" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#9673a6;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="h2" target="d0">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_d0_d1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="d0" target="d1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_d1_d2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="d1" target="d2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_d2_b" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="d2" target="r_blocked">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_d2_c" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#82b366;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="d2" target="r_clean">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_d2_n" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#9673a6;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="d2" target="r_none">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_n_fs" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#9673a6;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="r_none" target="fs">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_fs_o1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#82b366;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="fs" target="o1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_b_o2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="r_blocked" target="o2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_c_o1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#82b366;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="r_clean" target="o1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_h1_u1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#6c8ebf;strokeWidth=1;endArrow=block;endFill=1;dashed=1;" edge="1" parent="1" source="h1" target="u1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_h1_s1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#82b366;strokeWidth=1;endArrow=block;endFill=1;dashed=1;" edge="1" parent="1" source="h1" target="s1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="legend" value="Legend" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="1100" y="790" width="200" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="lg1" value="developer action" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1100" y="820" width="170" height="34" as="geometry" />
+        </mxCell>
+        <mxCell id="lg2" value="gate / refusal" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1285" y="820" width="160" height="34" as="geometry" />
+        </mxCell>
+        <mxCell id="lg3" value="clean path" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1100" y="865" width="170" height="34" as="geometry" />
+        </mxCell>
+        <mxCell id="lg4" value="proxy code" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1285" y="865" width="160" height="34" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

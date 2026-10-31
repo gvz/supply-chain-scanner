@@ -483,7 +483,24 @@ impl Config {
             );
         }
         if let Some(ai) = self.ai_review.as_ref() {
-            validate_ai_review(ai, self.scan_budget)?;
+            // The reviewer's timeout must fit under the budget the
+            // *selected deployment* actually draws from while reviewing
+            // one candidate. On an npm deployment that is
+            // `npm_registry.scan_budget` (default 120s, deliberately far
+            // looser than the top-level field), never the top-level
+            // `scan_budget` the PyPI and cargo paths read: that field is
+            // capped at `MAX_SCAN_BUDGET` (14s), so validating against it
+            // on an npm deployment would make a sensible 60s reviewer
+            // timeout unloadable even though the npm cascade never reads
+            // that field at all. The PyPI and cargo paths are untouched —
+            // neither has a budget field of its own, so they keep
+            // validating against `self.scan_budget` exactly as before.
+            let effective_budget = self
+                .npm_registry
+                .as_ref()
+                .map(|npm| npm.scan_budget)
+                .unwrap_or(self.scan_budget);
+            validate_ai_review(ai, effective_budget)?;
         }
         Ok(())
     }
@@ -492,6 +509,11 @@ impl Config {
 /// Validates `[ai_review]`. In order: `timeout` against the scan budget,
 /// `coverage_threshold` bounds, `max_payload_bytes` floor, `base_url`
 /// scheme and host, `api_key_env` resolution.
+///
+/// `scan_budget` is the budget of whichever deployment this config
+/// selects — `npm_registry.scan_budget` on an npm deployment, the
+/// top-level `scan_budget` otherwise. See the call site in
+/// [`Config::validate`].
 fn validate_ai_review(ai: &AiReviewConfig, scan_budget: Duration) -> anyhow::Result<()> {
     if ai.timeout >= scan_budget {
         bail!(

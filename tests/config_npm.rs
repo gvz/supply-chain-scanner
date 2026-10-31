@@ -51,6 +51,10 @@ fn toml_with_npm_registry(body: &str) -> String {
 
 const NPM_REGISTRY_BASE: &str = "upstream_registry_url = \"https://registry.npmjs.org/\"";
 
+/// Matches `tests/config.rs`'s own `AI_REVIEW_BASE`: the two required
+/// `[ai_review]` fields with no optional ones set.
+const AI_REVIEW_BASE: &str = "base_url = \"https://provider.example/v1/\"\nmodel = \"reviewer-1\"";
+
 fn load(toml: &str) -> Config {
     let file = write_temp_toml(toml);
     Config::load(file.path()).expect("load config")
@@ -196,6 +200,57 @@ fn changing_npm_min_release_age_days_changes_the_fingerprint() {
         policy_fingerprint(&on).expect("fingerprint with the gate on"),
         "turning the release-age gate on or off changes what an npm scan \
          admits, so it must change the fingerprint"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// I3: [ai_review].timeout must be validated against the npm deployment's
+// own budget, not the top-level `scan_budget` the npm cascade never reads.
+// ---------------------------------------------------------------------------
+
+/// A 60s reviewer timeout is far above the top-level `scan_budget`'s
+/// 14-second ceiling, so this only loads if `Config::validate` checks
+/// `ai.timeout` against `npm_registry.scan_budget` (120s here) rather than
+/// the top-level field.
+#[test]
+fn an_ai_review_timeout_within_the_npm_scan_budget_loads() {
+    let toml = format!(
+        "{BASE_TOML}\n\
+         [npm_registry]\n{NPM_REGISTRY_BASE}\n\
+         \n\
+         [ai_review]\n{AI_REVIEW_BASE}\ntimeout = \"60s\"\n"
+    );
+    let config = load(&toml);
+
+    let ai = config
+        .ai_review
+        .as_ref()
+        .expect("[ai_review] with a 60s timeout must load under a 120s npm budget");
+    assert_eq!(ai.timeout, Duration::from_secs(60));
+}
+
+/// The same 60s timeout against a deployment whose npm budget was turned
+/// down to 12s must be rejected: the reviewer could never finish inside
+/// the budget it actually runs under.
+#[test]
+fn an_ai_review_timeout_above_a_tightened_npm_scan_budget_is_rejected() {
+    let toml = format!(
+        "{BASE_TOML}\n\
+         [npm_registry]\n{NPM_REGISTRY_BASE}\nscan_budget = \"12s\"\n\
+         \n\
+         [ai_review]\n{AI_REVIEW_BASE}\ntimeout = \"60s\"\n"
+    );
+    let file = write_temp_toml(&toml);
+    let result = Config::load(file.path());
+
+    assert!(
+        result.is_err(),
+        "a 60s ai_review timeout must be rejected against a 12s npm scan_budget"
+    );
+    let error_msg = result.unwrap_err().to_string();
+    assert!(
+        error_msg.contains("timeout") && error_msg.contains("scan_budget"),
+        "the error must name the timeout/scan_budget relationship: got {error_msg}"
     );
 }
 

@@ -19,7 +19,7 @@ use crate::ecosystem::install_surface::InstallSurface;
 
 /// Version of the collector's file-selection logic. It joins the policy
 /// fingerprint, so any change here re-reviews every artifact.
-pub const COLLECTOR_VERSION: &str = "1";
+pub const COLLECTOR_VERSION: &str = "2";
 
 /// What the collector can do with one file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +40,8 @@ pub enum FileClass {
 pub const REVIEWABLE_EXTENSIONS: &[&str] = &[
     // Python source and the Cython forms that compile to it.
     "py", "pyi", "pyx", "pxd", "pxi", //
+    // JavaScript and TypeScript source.
+    "js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx", //
     // Packaging metadata in text form.
     "cfg", "toml", "ini", "txt", "lock", // Shell scripts: executable text.
     "sh", "bash", "zsh", // General-purpose configuration and data-interchange text.
@@ -141,6 +143,9 @@ pub const SUSPICION_SIGNALS: &[(&str, u32)] = &[
     ("compile(", 1),
     ("__import__", 2),
     ("importlib", 1),
+    ("new Function(", 3),
+    ("vm.runIn", 2),
+    ("require('vm')", 1),
     // Decoding and deserialization of opaque payloads.
     ("base64", 1),
     ("b64decode", 2),
@@ -152,14 +157,22 @@ pub const SUSPICION_SIGNALS: &[(&str, u32)] = &[
     ("binascii", 1),
     ("pickle.loads", 2),
     ("marshal.loads", 2),
+    ("atob(", 2),
+    ("Buffer.from(", 1),
     // Child processes.
     ("subprocess", 2),
     ("os.system", 2),
     ("os.popen", 2),
     ("Popen", 1),
+    ("child_process", 2),
+    ("execSync", 2),
+    ("spawnSync", 2),
+    ("execFile", 1),
     // Foreign function calls into native code.
     ("ctypes", 2),
     ("cffi", 1),
+    ("process.dlopen", 2),
+    ("ffi-napi", 1),
     // Network.
     ("socket", 2),
     ("urllib", 2),
@@ -167,10 +180,19 @@ pub const SUSPICION_SIGNALS: &[(&str, u32)] = &[
     ("http.client", 2),
     ("httpx", 1),
     ("aiohttp", 1),
+    ("http.request", 2),
+    ("https.request", 2),
+    ("net.connect", 2),
+    ("dns.", 1),
+    ("fetch(", 2),
+    ("axios", 1),
     // Environment and credential reads.
     ("os.environ", 1),
     ("getenv", 1),
     ("environ", 1),
+    ("process.env", 1),
+    ("os.homedir(", 1),
+    (".npmrc", 1),
 ];
 
 /// Bonus weight for a long run of base64-alphabet characters. One

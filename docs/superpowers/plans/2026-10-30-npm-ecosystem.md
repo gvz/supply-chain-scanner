@@ -748,6 +748,10 @@ git commit -m "feat(http): serve the npm packument, gated on the cascade"
 
 ### Task 11: The tarball route — metadata approval, then plugins
 
+**Status: DONE** (commit `830b8d1`). Verified in-tree: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --no-fail-fast` all clean (39 suites).
+
+**Route deviation, approved by the operator.** The plan's route `/{*name}/-/{file}` is not registerable: `matchit` 0.8 (which axum 0.8 uses) rejects a catch-all that is not the final segment ("Catch-all parameters are only allowed at the end of a route"), and `/{name}/-/{file}` conflicts with the existing `/{*path}`. The tarball is therefore dispatched from the one catch-all: `npm_packument_handler` checks `npm_download::looks_like_tarball` first and hands the path to `npm_download::npm_download_handler`. Externally identical for every case below, including the scoped-path Review Focus case.
+
 **Files:**
 - Create: `src/http/npm_download.rs`
 - Modify: `src/http/mod.rs`, `src/http/npm_packument.rs` (register the route)
@@ -759,7 +763,7 @@ git commit -m "feat(http): serve the npm packument, gated on the cascade"
 
 Order of operations, and the design's load-bearing constraint: resolve the name and version from the path, then call `approved_for_download`. Only `Approved` proceeds. `NotApproved` is a refusal — the download path never reviews inline. An approved artifact then goes through the plugin gate, deduplicated by digest through `plugin_run_coordinator` with a `FinishGuard` first, exactly as `cargo_download.rs` does; an artifact already marked plugin-checked serves its verified bytes directly.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[tokio::test] async fn an_approved_artifact_passes_the_plugins_and_is_served() {}
@@ -778,21 +782,21 @@ Order of operations, and the design's load-bearing constraint: resolve the name 
 #[tokio::test] async fn a_path_traversal_in_the_tarball_filename_is_a_400() {}
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test --test http_npm_download`
 Expected: FAIL to compile.
 
-- [ ] **Step 3: Implement the handler**
+- [x] **Step 3: Implement the handler**
 
 The version comes from the tarball filename, which must be exactly `{unscoped}-{version}.tgz` for the requested package; anything else is a 400 rather than a guess. The filename is never used as a path.
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `cargo test --test http_npm_download`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/http/npm_download.rs src/http/mod.rs src/http/npm_packument.rs tests/http_npm_download.rs

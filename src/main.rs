@@ -1,21 +1,35 @@
 //! Supply chain scanner binary: a thin wrapper around the library's own
 //! fail-closed startup sequences ([`supply_chain_scanner::http::bootstrap`]
 //! for a PyPI deployment, [`supply_chain_scanner::http::bootstrap_cargo`]
-//! for a cargo one), plus the operational concerns that only make sense
+//! for a cargo one, [`supply_chain_scanner::http::bootstrap_npm`] for an
+//! npm one), plus the operational concerns that only make sense
 //! for a real running process — the periodic advisory-sync,
 //! cargo-vet-sync and cache-eviction tickers, the `SIGHUP` config-reload
 //! handler on the PyPI path, and binding the actual listener.
 //!
-//! # Two deployments, one binary
+//! Each deployment spawns only the tickers it needs. An npm deployment
+//! syncs OSV's npm feed and evicts the artifact cache; a cargo deployment
+//! syncs crates.io and cargo-vet as well; the PyPI deployment syncs its
+//! own feed.
 //!
-//! `run` dispatches on `config.cargo_registry.is_some()`. A config file
-//! with a `[cargo_registry]` table is a cargo deployment: a sparse index,
-//! a crate-vet fast path, and a `.crate` download; it gets the cargo
+//! # Three deployments, one binary
+//!
+//! `run` dispatches on which ecosystem table is present, checked in the
+//! order npm, cargo, neither. A config file with an `[npm_registry]`
+//! table is an npm deployment: a packument route, a `.tgz` download gate,
+//! and a mandatory reviewer; it gets the npm bootstrap, the npm advisory
+//! ticker, and the cache eviction ticker. A config file with a
+//! `[cargo_registry]` table is a cargo deployment: a sparse index, a
+//! crate-vet fast path, and a `.crate` download; it gets the cargo
 //! bootstrap, the cargo advisory ticker for `"crates.io"`, a cargo-vet
-//! ticker, and the cache eviction ticker. A config file without it is the
-//! PyPI deployment, unchanged: the PyPI bootstrap, its advisory ticker,
-//! its cache eviction ticker, and the `SIGHUP` reload handler. No process
-//! serves both, per the design spec.
+//! ticker, and the cache eviction ticker. A config file with neither is
+//! the PyPI deployment, unchanged: the PyPI bootstrap, its advisory
+//! ticker, its cache eviction ticker, and the `SIGHUP` reload handler.
+//!
+//! The order is a lookup, not a precedence rule: `Config::validate`
+//! already rejects a file carrying both `[cargo_registry]` and
+//! `[npm_registry]`, so at most one of the first two branches can match.
+//! No process serves two ecosystems, per the design spec.
 //!
 //! Served HTTP/1.1 only: `axum` and `hyper` are both built here with only
 //! the `http1` Cargo feature enabled (see `Cargo.toml`), so this process
@@ -37,7 +51,8 @@ use supply_chain_scanner::artifact_cache::ArtifactCache;
 use supply_chain_scanner::config::Config;
 use supply_chain_scanner::ecosystem::install_surface::install_surface_for;
 use supply_chain_scanner::http::cargo_bootstrap::CARGO_ADVISORY_ECOSYSTEM;
-use supply_chain_scanner::http::{bootstrap, bootstrap_cargo, watch_for_reload};
+use supply_chain_scanner::http::npm_packument::NPM_ECOSYSTEM;
+use supply_chain_scanner::http::{bootstrap, bootstrap_cargo, bootstrap_npm, watch_for_reload};
 
 /// An HTTP proxy that scans PyPI artifacts before serving them.
 #[derive(Debug, Parser)]
@@ -132,10 +147,12 @@ fn run_collector(
 /// Starts one deployment, whichever the configuration selects, and serves
 /// it until the process ends.
 ///
-/// The dispatch is one test — `config.cargo_registry.is_some()` — and it
-/// is the only place the two deployments diverge in this function. The
-/// PyPI branch below is byte-for-byte the startup this binary has always
-/// performed.
+/// The dispatch is a three-way lookup — `[npm_registry]`, then
+/// `[cargo_registry]`, then neither — and it is the only place the three
+/// deployments diverge in this function. `Config::validate` already
+/// rejects a file carrying both ecosystem tables, so the order is a
+/// lookup rather than a precedence rule. The PyPI branch below is
+/// byte-for-byte the startup this binary has always performed.
 async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
     let bind = config.bind;
     let cache_dir = config.cache_dir.clone();
@@ -143,12 +160,41 @@ async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
     let db_path = config.db_path.clone();
     let advisory_sync_interval = config.advisory_sync_interval;
     let advisory_source_url = config.advisory_source_url.clone();
+    let npm = config.npm_registry.clone();
     let cargo = config.cargo_registry.clone();
 
     tracing::info!(?bind, config = %config_path.display(), "starting up");
 
-    match cargo {
-        Some(cargo_config) => {
+    match (npm, cargo) {
+        (Some(npm_config), _) => {
+            tracing::info!(
+                upstream_registry_url = %npm_config.upstream_registry_url,
+                min_release_age_days = ?npm_config.min_release_age_days,
+                "starting an npm deployment ([npm_registry] is present)"
+            );
+            let wired = bootstrap_npm(config).await.context("startup failed")?;
+            tracing::info!("startup sequence completed; every configured check is available");
+
+            spawn_npm_advisory_sync_ticker(
+                db_path.clone(),
+                advisory_source_url,
+                advisory_sync_interval,
+            );
+            spawn_cache_eviction_ticker(db_path, cache_dir, cache_ttl);
+
+            // The npm path has no `Reloader` and installs no SIGHUP
+            // handler. Say so once, at startup, rather than let an
+            // operator send a signal that changes nothing.
+            tracing::warn!(
+                config = %config_path.display(),
+                "SIGHUP configuration reload is a PyPI-path feature and is not \
+                 implemented for an npm deployment; a change to this file needs a \
+                 restart to take effect"
+            );
+
+            serve(bind, wired.router).await
+        }
+        (None, Some(cargo_config)) => {
             tracing::info!(
                 upstream_index = %cargo_config.upstream_index_url,
                 cargo_vet_sync_interval = ?cargo_config.cargo_vet_sync_interval,
@@ -178,7 +224,7 @@ async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
 
             serve(bind, wired.router).await
         }
-        None => {
+        (None, None) => {
             let wired = bootstrap(config).await.context("startup failed")?;
             tracing::info!("startup sequence completed; every configured check is available");
 
@@ -320,6 +366,62 @@ fn spawn_cargo_advisory_sync_ticker(db_path: PathBuf, source_url: url::Url, inte
                 Err(err) => tracing::warn!(
                     error = %err,
                     "periodic crates.io advisory sync failed; keeping the existing mirror"
+                ),
+            }
+        }
+    });
+}
+
+/// Periodically re-syncs the npm OSV advisory mirror, the npm
+/// deployment's counterpart to [`spawn_cargo_advisory_sync_ticker`].
+///
+/// Same shape, same failure contract: one database pool and one HTTP
+/// client for the life of the ticker, a failed sync logged and retried
+/// next tick, and the existing mirror left untouched in the meantime (see
+/// [`supply_chain_scanner::advisory::osv::OsvSync::sync`]). Only the
+/// ecosystem id and the name normalizer differ, and the id is the one
+/// constant this deployment stores verdicts under: OSV publishes its npm
+/// feed under `"npm"` too, so there is no second spelling to join
+/// against.
+fn spawn_npm_advisory_sync_ticker(db_path: PathBuf, source_url: url::Url, interval: Duration) {
+    tokio::spawn(async move {
+        let db = match supply_chain_scanner::db::Db::open(&db_path)
+            .context("opening database for the npm advisory sync ticker")
+        {
+            Ok(db) => db,
+            Err(err) => {
+                tracing::error!(error = %err, "npm advisory sync ticker could not open the database; it will not run");
+                return;
+            }
+        };
+        let http = match reqwest::Client::builder()
+            .build()
+            .context("building the npm advisory sync HTTP client")
+        {
+            Ok(http) => http,
+            Err(err) => {
+                tracing::error!(error = %err, "npm advisory sync ticker could not build an HTTP client; it will not run");
+                return;
+            }
+        };
+        let store = supply_chain_scanner::db::advisory::AdvisoryStore::new(db);
+        let sync = supply_chain_scanner::advisory::osv::OsvSync::new(store, http, source_url);
+
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await; // the first tick fires immediately; bootstrap already synced once.
+        loop {
+            ticker.tick().await;
+            match sync
+                .sync(
+                    NPM_ECOSYSTEM,
+                    supply_chain_scanner::ecosystem::npm::normalize_name,
+                )
+                .await
+            {
+                Ok(count) => tracing::info!(count, "npm advisory mirror synced"),
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "periodic npm advisory sync failed; keeping the existing mirror"
                 ),
             }
         }

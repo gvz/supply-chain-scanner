@@ -31,6 +31,7 @@ pub mod artifact;
 pub mod cargo_bootstrap;
 pub mod cargo_download;
 pub mod cargo_index;
+pub mod npm_bootstrap;
 pub mod npm_download;
 pub mod npm_packument;
 pub mod refusal;
@@ -66,6 +67,7 @@ use crate::policy::Policy;
 use crate::scan::Scanner;
 
 pub use cargo_bootstrap::{bootstrap_cargo, bootstrap_cargo_with_sandbox_factory, CargoWired};
+pub use npm_bootstrap::{bootstrap_npm, bootstrap_npm_with_sandbox_factory, NpmWired};
 
 /// Shared state handed to every HTTP handler.
 ///

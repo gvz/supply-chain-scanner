@@ -986,7 +986,8 @@ no task owned. Three are closed; the fourth is a test that was added separately.
   now says so instead of implying the seam was finished. Commit `cbb98ea`.
 - **No lockfile test.** The spec asked for a test that a real lockfile's
   `resolved` URLs point at the proxy. Task 14 documented the hazard in prose
-  only. Covered by `tests/npm_lockfile.rs`, which pins both directions: a
-  lockfile written behind the proxy records exactly the URLs `filter_packument`
-  forwards, and a lockfile written without the proxy names hosts the proxy never
-  serves.
+  only. Covered by `tests/npm_lockfile.rs` (commit `6d63dfd`), which pins both
+  directions: a lockfile written behind the proxy records exactly the URLs
+  `filter_packument` forwards, and a lockfile written without the proxy names
+  hosts the proxy never serves. Four tests, hermetic, inline fixtures, no
+  registry contact and no `npm` binary.

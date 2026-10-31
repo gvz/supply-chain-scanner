@@ -13,6 +13,11 @@
 //! reason, its own function: [`bootstrap_cargo`] in `cargo_bootstrap`,
 //! which produces a [`CargoWired`] instead of a [`Wired`].
 //!
+//! The npm deployment likewise has its own surface and its own state
+//! struct, [`npm_packument::NpmAppState`]: the packument route npm's
+//! client actually talks to (`npm_packument`), the `/-/ping` and audit
+//! stub routes, and (mounted by a later task) the tarball download.
+//!
 //! The simple-index and artifact handlers take `Arc<dyn
 //! crate::ecosystem::Ecosystem>` rather than a concrete PyPI type, so this
 //! module does not change when a second ecosystem backend arrives. The
@@ -26,6 +31,7 @@ pub mod artifact;
 pub mod cargo_bootstrap;
 pub mod cargo_download;
 pub mod cargo_index;
+pub mod npm_packument;
 pub mod refusal;
 pub mod refusals;
 pub mod reviews;

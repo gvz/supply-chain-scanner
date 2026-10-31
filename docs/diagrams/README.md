@@ -4,6 +4,10 @@ Drawio sources for the scanner's architecture and request flows. Open any file
 with [draw.io](https://app.diagrams.net) or the VS Code draw.io extension. Every
 file is plain, editable XML with no external assets.
 
+Rendered copies live in [`svg/`](svg/). Each SVG embeds a full copy of its
+diagram in a `content` attribute, so it is both an image and an editable drawio
+file. See [Editing and regenerating](#editing-and-regenerating).
+
 | File | What it shows |
 |---|---|
 | `01-system-overview.drawio` | The whole system on one page: developer machines, the proxy's layers, the five gates, durable state, the operator surface, and the external world. Start here. |
@@ -14,6 +18,34 @@ file is plain, editable XML with no external assets.
 | `06-data-model.drawio` | The SQLite schema: verdicts, reviews, the advisory mirror, cargo-vet proofs, and the caches. |
 | `07-ai-review-pipeline.drawio` | The AI reviewer end to end: collector, prompt, provider, reply parsing, the fixed decision order, and what gets stored. |
 | `08-deployment-startup.drawio` | The three deployments, their fail-closed startup order, what each refuses to start without, and the background tickers. |
+
+## Editing and regenerating
+
+The `.drawio` file is the source of truth. Edit it, then rebuild the SVGs:
+
+```bash
+./docs/diagrams/build-svg.sh
+```
+
+That needs draw.io desktop (`drawio` on PATH) and `xvfb-run`, because the export
+drives a headless Electron window. The script rebuilds every SVG from every
+`.drawio` beside it.
+
+Each SVG carries its diagram in a `content` attribute, which makes the loop work
+in both directions:
+
+- Edit the `.drawio`, rebuild, commit both. This is the normal path, because a
+diff of rendered SVG is unreadable in review.
+- Open a `.svg` directly in draw.io desktop, edit it, and save. drawio reads the
+  embedded copy back out. The result then has to be re-exported as `.drawio` for
+  the change to be reviewable.
+
+**A rendering caveat worth knowing.** drawio emits label text inside
+`foreignObject` elements, with a single `<text>` fallback per file. Browsers
+render that correctly. GitHub's Markdown image proxy strips `foreignObject`, so an
+SVG embedded in a README on GitHub shows shapes with no text. For a hosted view,
+export PNG with `--embed-diagram` instead, or link the `.drawio` file and let a
+reader open it in draw.io.
 
 ## Reading order
 

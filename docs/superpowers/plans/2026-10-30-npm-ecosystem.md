@@ -865,6 +865,15 @@ git commit -m "fix(cargo): require index-gate approval before serving a .crate"
 
 ### Task 13: Bootstrap and the three-way startup dispatch
 
+**Status: DONE** (commit `836aa1f`). Verified in-tree: `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --no-fail-fast` all clean (40 suites, zero failures).
+
+Implementation notes beyond the plan's letter:
+
+- The AI-reviewer requirement tests `config.ai_review()` rather than `ai_review.is_some()`, so a present-but-disabled table is refused exactly like an absent one. A disabled reviewer cannot review, and the no-fast-path invariant holds either way.
+- `ArtifactCache` is not `Clone`, and both `NpmScanner` and `NpmAppState` need one, so the bootstrap opens two handles over the same `db` and `cache_dir`. Same backing cache, no duplicated storage.
+- The dispatch matches on `(npm_registry, cargo_registry)`. `Config::validate` rejects both tables, so the arms are mutually exclusive and the tuple order is a lookup, not a precedence rule.
+- `a_plugin_refusal_why_link_resolves` drives a refusing plugin stub, so it exercises a real plugin refusal rather than a clean pass.
+
 **Files:**
 - Create: `src/http/npm_bootstrap.rs`
 - Modify: `src/http/mod.rs`, `src/main.rs`
@@ -882,7 +891,7 @@ The cargo deployment needs two ecosystem constants because the OSV feed spells i
 
 Fail-closed, as the other two bootstraps are: the advisory mirror syncs before the listener binds. With no `[ai_review]` configured, startup logs an explicit `error!` naming that no version can be forwarded without a reviewer and **refuses to start** — serving a registry that can never answer is worse than a clear startup failure. (The spec left refuse-vs-warn open; refusing is the choice here.) A config with no ecosystem table is still the PyPI deployment, unchanged.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[tokio::test] async fn bootstrap_npm_serves_a_package_through_the_full_cascade() {
@@ -898,21 +907,21 @@ Fail-closed, as the other two bootstraps are: the advisory mirror syncs before t
 #[tokio::test] async fn a_plugin_refusal_why_link_resolves() {}
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test --test http_npm_bootstrap`
 Expected: FAIL to compile.
 
-- [ ] **Step 3: Implement the bootstrap and the dispatch**
+- [x] **Step 3: Implement the bootstrap and the dispatch**
 
 Follow `cargo_bootstrap.rs` closely, including its two-upstream-clients note and its sandbox-factory seam for tests. The npm path has no `Reloader`, so `main.rs` logs the same restart-only warning the cargo path does.
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `cargo test --test http_npm_bootstrap`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/http/npm_bootstrap.rs src/http/mod.rs src/main.rs tests/http_npm_bootstrap.rs

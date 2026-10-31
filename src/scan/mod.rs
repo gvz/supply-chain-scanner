@@ -41,6 +41,7 @@
 pub mod cargo;
 pub mod cargo_cascade;
 pub mod coordinator;
+pub mod npm_cascade;
 
 use std::collections::HashSet;
 use std::path::PathBuf;

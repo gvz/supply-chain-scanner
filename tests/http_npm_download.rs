@@ -28,7 +28,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use supply_chain_scanner::artifact_cache::ArtifactCache;
 use supply_chain_scanner::config::{
-    Config, ConfigHandle, CveLine, NpmRegistryConfig, PluginConfig, UnknownSeverity,
+    AllowEntry, Config, ConfigHandle, CveLine, NpmRegistryConfig, PluginConfig, UnknownSeverity,
 };
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::db::review::ReviewStore;
@@ -264,6 +264,17 @@ struct Harness {
 
 impl Harness {
     async fn start(server: MockServer, behaviour: Behaviour) -> Harness {
+        Self::start_with(server, behaviour, |_cfg| {}).await
+    }
+
+    /// Like [`Harness::start`], but `configure` runs on the built `Config`
+    /// before the policy and scanner are constructed from it — the seam
+    /// the allowlist tests use to add a `[[allowlist]]` entry.
+    async fn start_with(
+        server: MockServer,
+        behaviour: Behaviour,
+        configure: impl FnOnce(&mut Config),
+    ) -> Harness {
         let (db_dir, db) = open_db();
         let plugin_dir = tempfile::tempdir().expect("plugin dir");
         let plugin_binary = plugin_dir.path().join("yara");
@@ -271,7 +282,8 @@ impl Harness {
         // Keep the plugin directory alive for the harness's lifetime.
         std::mem::forget(plugin_dir);
 
-        let cfg = base_config(&server, plugin_binary);
+        let mut cfg = base_config(&server, plugin_binary);
+        configure(&mut cfg);
         let base = Url::parse(&format!("{}/", server.uri())).expect("valid registry base url");
 
         let policy = Arc::new(Policy::build(Arc::new(cfg.clone())).expect("build policy"));
@@ -635,4 +647,90 @@ async fn a_path_traversal_in_the_tarball_filename_is_a_400() {
 
     assert_eq!(status, 400, "got body {body:?}");
     assert_eq!(harness.sandbox.calls(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// I2: an allowlisted version has no stored verdict (the packument gate
+// never reviews an allowlisted survivor), so it must still be downloadable
+// here, with its digest verified regardless.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_allowlisted_never_reviewed_version_downloads_with_its_digest_verified() {
+    let server = MockServer::start().await;
+    let v = version("demo", "1.0.0");
+    mount_packument(&server, "demo", &[version("demo", "1.0.0")]).await;
+    mount_tarball(&server, "demo", &v).await;
+
+    let harness = Harness::start_with(server, Behaviour::Clean, |cfg| {
+        cfg.allowlist = vec![AllowEntry {
+            package: "demo".to_string(),
+            version: "1.0.0".to_string(),
+        }];
+    })
+    .await;
+
+    assert_eq!(
+        harness
+            .verdicts
+            .get(&key_for("demo", &v), &harness.fingerprint)
+            .expect("read the verdict store"),
+        None,
+        "this test only means something without a stored verdict to fall back on: the \
+         packument gate never reviews an allowlisted survivor"
+    );
+
+    let (status, body) = harness.get("/demo/-/demo-1.0.0.tgz").await;
+
+    assert_eq!(
+        status, 200,
+        "an allowlisted version with no stored verdict must still be served: {body:?}"
+    );
+    assert_eq!(
+        harness.sandbox.calls(),
+        1,
+        "the allowlist lifts the judgement checks, never the plugin gate"
+    );
+    assert_eq!(harness.hits("/demo/-/demo-1.0.0.tgz").await, 1);
+}
+
+#[tokio::test]
+async fn a_digest_mismatch_on_an_allowlisted_version_is_still_refused() {
+    let server = MockServer::start().await;
+    let good = version("demo", "1.0.0");
+    mount_packument(&server, "demo", &[version("demo", "1.0.0")]).await;
+
+    // Upstream serves bytes that do not match the shasum its own
+    // packument declared for them.
+    let mut tampered = good.bytes.clone();
+    tampered.extend_from_slice(b"tampered");
+    Mock::given(method("GET"))
+        .and(path("/demo/-/demo-1.0.0.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tampered))
+        .mount(&server)
+        .await;
+
+    let harness = Harness::start_with(server, Behaviour::Clean, |cfg| {
+        cfg.allowlist = vec![AllowEntry {
+            package: "demo".to_string(),
+            version: "1.0.0".to_string(),
+        }];
+    })
+    .await;
+
+    let (status, body) = harness.get("/demo/-/demo-1.0.0.tgz").await;
+
+    assert_ne!(
+        status, 200,
+        "mismatched bytes must never be served, even for an allowlisted version"
+    );
+    assert!(
+        status >= 400,
+        "the refusal must be an error status, got {status} with body {body:?}"
+    );
+    assert_eq!(
+        harness.sandbox.calls(),
+        0,
+        "the plugins must not see bytes that failed verification"
+    );
 }

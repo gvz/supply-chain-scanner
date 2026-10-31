@@ -37,6 +37,21 @@
 //! plugin pass would substitute one check for the other three. This is
 //! the same hole [`super::cargo_download`] closed on the cargo path.
 //!
+//! # The allowlist is consulted first of all, and still requires a digest
+//!
+//! Mirroring [`super::cargo_download`] exactly: an allowlist entry is
+//! checked before [`NpmScanner::approved_for_download`] is ever called,
+//! because the packument gate stores a verdict only for a version it
+//! reviewed, and the allowlist exists precisely to admit a version that
+//! gate never saw. Without this branch an allowlisted version can be
+//! *advertised* (the packument cascade treats an allowlisted survivor as
+//! forwardable) but never *downloaded* — `approved_for_download` would
+//! answer `NotApproved` for it forever, since no review ever ran to store
+//! a `Clean` verdict. The allowlist overrides the verdict, never the
+//! integrity check: this branch still fetches the version's `dist` fresh
+//! from upstream and still runs it through [`download_and_verify`], the
+//! same digest check every other path goes through.
+//!
 //! # The stored verdict is the cache, exactly as on the other paths
 //!
 //! - **Approved and already plugin-checked** — serve the bytes from the
@@ -67,13 +82,14 @@ use axum::http::{header, StatusCode};
 use axum::response::Response;
 
 use crate::db::verdict::VerdictStore;
-use crate::ecosystem::npm::packument::Dist;
+use crate::ecosystem::npm::packument::{declared_digest, Dist};
 use crate::ecosystem::npm::upstream::UpstreamError;
-use crate::ecosystem::npm::validate_name;
+use crate::ecosystem::npm::{normalize_name, validate_name};
 use crate::model::{ArtifactKey, RefusalReason, Verdict};
 use crate::plugin::{is_check_failure, unpack};
 use crate::scan::coordinator::{self, FinishGuard};
-use crate::scan::npm::DownloadApproval;
+use crate::scan::is_allowlisted;
+use crate::scan::npm::{artifact_key, DownloadApproval};
 
 use super::npm_packument::NpmAppState;
 use super::refusal::{refusal_response, unverifiable_response};
@@ -122,6 +138,36 @@ pub async fn npm_download_handler(state: &NpmAppState, path: &str) -> Response {
         Ok(version) => version,
         Err(detail) => return bad_request_response(&detail),
     };
+
+    // The allowlist is consulted first, matching `cargo_download_handler`'s
+    // own rule: an operator's explicit decision overrides the packument
+    // gate's admission entirely, because that gate's stored verdict is the
+    // only thing `approved_for_download` can ever answer `Approved` from,
+    // and an allowlisted version may never have been reviewed at all. It
+    // never overrides the integrity check — `download_and_verify` still
+    // checks the downloaded bytes against the digest this lookup fetches
+    // fresh from upstream, below.
+    if is_allowlisted_npm(&state.config.current(), &name, &version) {
+        return match allowlisted_target(state, &name, &version).await {
+            Ok((key, dist)) => {
+                let fingerprint = state.npm_scanner.fingerprint();
+                let target = Target {
+                    key: &key,
+                    name: &name,
+                    version: &version,
+                    dist: &dist,
+                };
+                // Always runs the plugin gate, exactly as
+                // `cargo_download_handler`'s own allowlist branch does:
+                // this is the one place a request reaches the plugins
+                // without `approved_for_download` ever answering
+                // `Approved`, so it is also the one place that fetches the
+                // packument itself.
+                serve_with_plugin_dedup(state, &target, &fingerprint).await
+            }
+            Err(response) => response,
+        };
+    }
 
     // Documented above: the metadata approval is asked first, and nothing
     // is fetched from upstream until it answers `Approved`.
@@ -215,6 +261,65 @@ fn version_from_filename(name: &str, file: &str) -> Result<String, String> {
     }
 
     Ok(version.to_string())
+}
+
+/// Whether the operator has allowlisted `name` at `version`.
+///
+/// Reuses [`is_allowlisted`], the crate's single implementation of the
+/// allowlist comparison, for both spellings a package name can arrive in:
+/// the registry's own spelling (scope and slash included) and its
+/// npm-lowercased form. Mirrors `cargo_download::is_allowlisted_crate`.
+fn is_allowlisted_npm(config: &crate::config::Config, name: &str, version: &str) -> bool {
+    is_allowlisted(config, name, version) || is_allowlisted(config, &normalize_name(name), version)
+}
+
+/// Looks up `name`'s packument upstream for an allowlisted `version`,
+/// without consulting any stored verdict, so an allowlisted version is
+/// served even when the packument gate never admitted it (never reviewed
+/// it at all, in fact — the allowlist is what lets this proxy serve a
+/// version the cascade never saw).
+///
+/// This is the allowlist override's own packument read, mirroring
+/// `cargo_download::allowlisted_entry`. The version still has to exist
+/// upstream: the digest in the returned [`Dist`] is what the downloaded
+/// bytes are verified against in [`download_and_verify`], so a version
+/// upstream does not list is a 404 exactly as it is on the approval path,
+/// and a `dist` with no digest this proxy can verify is `Unverifiable`
+/// exactly as it is there too.
+async fn allowlisted_target(
+    state: &NpmAppState,
+    name: &str,
+    version: &str,
+) -> Result<(ArtifactKey, Dist), Response> {
+    let packument = match state.upstream.packument(name).await {
+        Ok(packument) => packument,
+        Err(UpstreamError::NotFound) => return Err(not_found_response()),
+        Err(err) => {
+            return Err(unverifiable_response(&RefusalReason {
+                code: "unverifiable:upstream".to_string(),
+                detail: sanitize(&format!(
+                    "could not read the npm packument right now: {err:#}"
+                )),
+            }))
+        }
+    };
+
+    let Some(entry) = packument.versions.get(version).cloned() else {
+        return Err(not_found_response());
+    };
+
+    let Some(digest) = declared_digest(&entry.dist) else {
+        return Err(unverifiable_response(&RefusalReason {
+            code: "unverifiable:npm-digest".to_string(),
+            detail: sanitize(&format!(
+                "{name} {version} has no verifiable digest declared upstream"
+            )),
+        }));
+    };
+
+    let normalized = normalize_name(name);
+    let key = artifact_key(&normalized, &packument.name, version, &digest);
+    Ok((key, entry.dist))
 }
 
 /// The refusal for a version the packument gate never admitted.

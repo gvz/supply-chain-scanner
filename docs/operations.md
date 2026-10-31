@@ -172,7 +172,7 @@ artifact or lets the scan continue.
 | `base_url` | required | Provider base. `chat/completions` is appended. Must be `https`, or `http` pointed at a loopback host. |
 | `model` | required | Model name. Sent with every request and stored in every review row. |
 | `api_key_env` | unset | Name of the environment variable that holds the API key. Unset sends no Authorization header. |
-| `timeout` | 8s | Total deadline for one *review*: the collector run and the provider call, including its one possible retry, all draw from this single budget. Must stay below `scan_budget`. |
+| `timeout` | 8s | Total deadline for one *review*: the collector run and the provider call, including its one possible retry, all draw from this single budget. Must stay below the deployment's own scan budget — the top-level `scan_budget` on the PyPI and cargo deployments (capped at 14s), or `npm_registry.scan_budget` (default 120s) on an npm deployment, whichever table the config actually carries. |
 | `max_payload_bytes` | 262144 | Cap on the file content sent to the model in one review. Floor: 4096. |
 | `max_output_tokens` | 1024 | The request's `max_tokens`. |
 | `coverage_threshold` | 0.8 | Minimum share of reviewable bytes that must reach the model. |
@@ -635,12 +635,25 @@ candidate in each major. Deprecated versions are not excluded, because npm
 installs them routinely and excluding them would break ordinary resolution.
 
 The tarball gate runs after that, at the download. It admits a version only when
-the packument gate stored a passing verdict for it, and then it runs the org's
-plugin binaries over the unpacked tree. A version with no stored verdict is
-refused with a reason naming that the packument gate never admitted it. The
-download path never reviews inline. No tarball bytes are served for an artifact
-that has not passed CVE filtering, the release-age gate, AI review, and the
-plugins.
+the packument gate stored a passing verdict for it, *or* the operator
+allowlisted it, and then it runs the org's plugin binaries over the unpacked
+tree. A version with no stored verdict and no allowlist entry is refused with a
+reason naming that the packument gate never admitted it. The download path
+never reviews inline. No tarball bytes are served for an artifact that has not
+passed CVE filtering, the release-age gate, AI review, and the plugins — or
+been allowlisted.
+
+**The allowlist is consulted at the download gate too, and for good reason.**
+An allowlisted survivor is forwardable at the packument gate without ever being
+reviewed (the whole point of the override), so it has no stored verdict for the
+download gate to find. Without its own allowlist check, the download gate would
+refuse every allowlisted version with "the packument gate never admitted it" —
+true of the review, false of the operator's own decision. So the download
+handler checks the allowlist first, exactly as the packument gate does, and
+only then falls back to the stored-verdict check. The allowlist overrides the
+verdict; it never overrides the integrity check, so the handler still fetches
+the version's declared digest from the packument and verifies the downloaded
+bytes against it regardless of which path admitted the version.
 
 **Where the gate sits.** Both gates are reached through the same `/{*path}`
 catch-all as the packument, which dispatches internally. The proxy's router
@@ -658,14 +671,25 @@ instead of from a half-completed publish. The two audit stubs keep their own
 
 **The packument cache is in memory, not on disk.** The design named the
 SQLite-backed `IndexCache` as the model. What shipped instead is a bounded
-in-process ETag cache plus a last-good-packument map. The consequence is worth
-knowing: the stale fallback that answers a request during an upstream outage
-only knows packages this process has already fetched since it started. After a
-restart, the first request for a package during an outage gets an empty
-packument rather than the last good one. This is a deliberate simplification,
-not an oversight, because the alternative was a schema and a migration for a
-cache whose whole purpose is to make the common case cheap. A warm cache is the
-mitigation, exactly as it is for a first `npm install`.
+in-process ETag cache plus a bounded last-good-packument map. The consequence
+is worth knowing: the stale fallback that answers a request during an upstream
+outage only knows packages this process has already fetched since it started.
+After a restart, the first request for a package during an outage gets an
+empty packument rather than the last good one. This is a deliberate
+simplification, not an oversight, because the alternative was a schema and a
+migration for a cache whose whole purpose is to make the common case cheap. A
+warm cache is the mitigation, exactly as it is for a first `npm install`.
+
+Both maps are bounded, by an entry count and a byte cap, each evicting its
+oldest entry first once either cap is exceeded. The last-good-packument map
+holds a fully *parsed* `Packument` per name, not the response text the ETag
+cache holds, and a parsed document is several times heavier in memory than the
+text it came from — so its caps (300 entries, a 150 MiB weighted-bytes budget)
+are both lower than the ETag cache's (500 entries, 200 MiB of actual text
+bytes), to keep its real memory footprint in the same small-fraction-of-
+deployment-memory range despite the heavier structure. Without these caps, a
+long-running deployment that fetches a wide spread of distinct package names
+over its lifetime would grow either map without bound.
 
 **What a developer's machine needs.** Point npm at the proxy:
 

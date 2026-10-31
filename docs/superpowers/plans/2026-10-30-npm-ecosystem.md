@@ -919,24 +919,26 @@ git commit -m "feat: wire a full npm registry deployment end to end"
 
 ### Task 14: Operator documentation
 
+**Status: DONE** (commit `751dd94`). Verified in-tree: `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --no-fail-fast` all clean (24 suites, including `tests/config.rs`'s `load_parses_example_config`, which parses `config.example.toml`). Added to `docs/operations.md`: the "Running an npm deployment" section, the "The npm lockfile the proxy cannot see" section, a shared-digest note under "Integrity", an upgrade-costs-a-re-review note under the fingerprint discussion, and the npm thresholds in "A minimum release age". Added the commented `[npm_registry]` block to `config.example.toml`, with every default copied from `src/config.rs`.
+
 **Files:**
 - Modify: `docs/operations.md`, `config.example.toml`
 
-- [ ] **Step 1: Document the npm deployment**
+- [x] **Step 1: Document the npm deployment**
 
 A "Running an npm deployment" section mirroring the cargo one: the settings table with every default from `src/config.rs` (`upstream_registry_url`, `scan_budget`, `max_packument_bytes`, `min_release_age_days`), the `npm config set registry` developer setup, the two gates and which checks fire at each, that `advisory_source_url` must point at OSV's npm feed, and that `[ai_review]` is mandatory for this deployment because there is no fast path past review.
 
-- [ ] **Step 2: Document the `npm ci` limitation**
+- [x] **Step 2: Document the `npm ci` limitation**
 
 Under "Known defects, not yet fixed": a lockfile generated without the proxy pins `resolved` at the public registry, so `npm ci` fetches those tarballs directly and no gate applies; the proxy cannot intercept a request not sent to it, and the operational fix is regenerating lockfiles behind the proxy. Also note the converse — lockfiles made behind the proxy carry internal URLs and do not work outside the network.
 
-- [ ] **Step 3: Note the shared-digest and install-script changes**
+- [x] **Step 3: Note the shared-digest and install-script changes**
 
 That the artifact cache now holds sha1 and sha512 digests alongside sha256, and that the collector and prompt version bumps re-review every artifact in every ecosystem once, on first request after the upgrade.
 
-- [ ] **Step 4: Add the commented `[npm_registry]` block to `config.example.toml`**
+- [x] **Step 4: Add the commented `[npm_registry]` block to `config.example.toml`**
 
-- [ ] **Step 5: Verify and commit**
+- [x] **Step 5: Verify and commit**
 
 Run: `cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test --no-fail-fast`
 

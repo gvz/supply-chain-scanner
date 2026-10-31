@@ -149,6 +149,31 @@ fn declared_digest_rejects_malformed_base64_under_a_valid_prefix() {
 }
 
 #[test]
+fn declared_digest_rejects_a_shasum_of_the_wrong_length() {
+    // A SHA-1 hex digest is always exactly 40 characters. A truncated
+    // shasum must not be silently accepted as a shorter, weaker hash.
+    let dist = supply_chain_scanner::ecosystem::npm::packument::Dist {
+        tarball: "https://registry.npmjs.org/demo/-/demo-1.0.0.tgz".to_string(),
+        integrity: None,
+        shasum: Some("2aae6c35c94fcfb415dbe95f408b9ce91ee846".to_string()), // 39 chars
+    };
+
+    assert!(declared_digest(&dist).is_none());
+}
+
+#[test]
+fn declared_digest_rejects_a_shasum_with_non_hex_characters() {
+    let dist = supply_chain_scanner::ecosystem::npm::packument::Dist {
+        tarball: "https://registry.npmjs.org/demo/-/demo-1.0.0.tgz".to_string(),
+        integrity: None,
+        // 40 characters, but "g" and "!" are not hex digits.
+        shasum: Some("gaae6c35c94fcfb415dbe95f408b9ce91ee846!!".to_string()),
+    };
+
+    assert!(declared_digest(&dist).is_none());
+}
+
+#[test]
 fn declared_digest_rejects_a_sha512_payload_of_the_wrong_decoded_length() {
     // Valid sha512- prefix, valid base64, but the decoded payload is only
     // 5 bytes rather than SHA-512's 64. A truncated or corrupted
@@ -274,6 +299,77 @@ fn filter_drops_a_non_latest_tag_whose_target_was_removed() {
     let dist_tags = filtered.get("dist-tags").unwrap().as_object().unwrap();
     assert!(!dist_tags.contains_key("beta"));
     assert_eq!(dist_tags.get("latest").unwrap().as_str().unwrap(), "1.0.0");
+}
+
+#[test]
+fn filter_never_repoints_latest_to_a_prerelease_when_a_final_release_survived() {
+    // semver ranks 2.0.0-beta.1 above 1.0.0 (a higher series' prerelease
+    // outranks a lower series' final release), so an unfiltered
+    // semver-max would repoint `latest` at the prerelease once the real
+    // 2.0.0 is filtered out. npm's own convention is that `latest` is
+    // never a prerelease, so 1.0.0 — the newest *final* release among the
+    // survivors — must win instead.
+    let body = r#"{
+        "name": "demo",
+        "versions": {
+            "1.0.0": {
+                "version": "1.0.0",
+                "dist": {"tarball": "https://registry.npmjs.org/demo/-/demo-1.0.0.tgz"}
+            },
+            "2.0.0": {
+                "version": "2.0.0",
+                "dist": {"tarball": "https://registry.npmjs.org/demo/-/demo-2.0.0.tgz"}
+            },
+            "2.0.0-beta.1": {
+                "version": "2.0.0-beta.1",
+                "dist": {"tarball": "https://registry.npmjs.org/demo/-/demo-2.0.0-beta.1.tgz"}
+            }
+        },
+        "dist-tags": {"latest": "2.0.0"},
+        "time": {}
+    }"#;
+    let packument = parse_packument(body).unwrap();
+    // 2.0.0 (the original `latest` target) is filtered out; both 1.0.0
+    // and the 2.0.0 prerelease survive.
+    let keep = vec!["1.0.0".to_string(), "2.0.0-beta.1".to_string()];
+    let filtered = filter_packument(&packument, &keep, "https://proxy.example/npm");
+
+    let dist_tags = filtered.get("dist-tags").unwrap().as_object().unwrap();
+    assert_eq!(
+        dist_tags.get("latest").unwrap().as_str().unwrap(),
+        "1.0.0",
+        "latest must prefer the final release over a semver-higher prerelease"
+    );
+}
+
+#[test]
+fn filter_repoints_latest_to_a_prerelease_when_that_is_the_only_survivor() {
+    let body = r#"{
+        "name": "demo",
+        "versions": {
+            "1.0.0": {
+                "version": "1.0.0",
+                "dist": {"tarball": "https://registry.npmjs.org/demo/-/demo-1.0.0.tgz"}
+            },
+            "2.0.0-beta.1": {
+                "version": "2.0.0-beta.1",
+                "dist": {"tarball": "https://registry.npmjs.org/demo/-/demo-2.0.0-beta.1.tgz"}
+            }
+        },
+        "dist-tags": {"latest": "1.0.0"},
+        "time": {}
+    }"#;
+    let packument = parse_packument(body).unwrap();
+    // Only the prerelease survives.
+    let keep = vec!["2.0.0-beta.1".to_string()];
+    let filtered = filter_packument(&packument, &keep, "https://proxy.example/npm");
+
+    let dist_tags = filtered.get("dist-tags").unwrap().as_object().unwrap();
+    assert_eq!(
+        dist_tags.get("latest").unwrap().as_str().unwrap(),
+        "2.0.0-beta.1",
+        "a prerelease must still be used when it is the only survivor"
+    );
 }
 
 #[test]

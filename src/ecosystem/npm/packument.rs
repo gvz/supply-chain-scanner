@@ -174,29 +174,62 @@ pub fn declared_digest(dist: &Dist) -> Option<DeclaredDigest> {
         });
     }
 
+    // A SHA-1 hex digest is always exactly 40 hex characters. Checking
+    // both here, rather than letting a malformed `shasum` fall through to
+    // a downstream hash comparison, turns a confusing "digest mismatch"
+    // refusal into a precise one that names the actual problem: upstream
+    // declared something that is not a hash at all. This can never
+    // accept a shorter-but-otherwise-valid-looking string by accident,
+    // since the length check runs before the hex check.
     let shasum = dist.shasum.as_ref()?;
+    if shasum.len() != 40 || !shasum.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
     Some(DeclaredDigest {
         algorithm: DigestAlgorithm::Sha1,
         hex: shasum.to_lowercase(),
     })
 }
 
-/// Returns the semver-newest of `versions`, or `None` if it is empty.
+/// Returns the semver-newest of `versions`, or `None` if it is empty,
+/// preferring a non-prerelease survivor over a prerelease one regardless
+/// of semver order between them.
 ///
-/// A version that fails to parse as semver sorts below every version
-/// that does, so a malformed survivor is never preferred over a valid
-/// one — mirrors `sort_newest_first` in
-/// [`crate::scan::cargo_cascade`].
+/// `semver`'s own `Ord` ranks every prerelease *below* its final release
+/// (`2.0.0-beta.1 < 2.0.0`) but still ranks a prerelease of a higher
+/// series above a lower final release (`2.0.0-beta.1 > 1.0.0`). Left
+/// unfiltered, that second fact is exactly what let a bare `npm install
+/// foo` land on a prerelease: once the real `2.0.0` was filtered out by
+/// this proxy's gates, `2.0.0-beta.1` could still out-rank the `1.0.0`
+/// final release that was also a survivor. npm's own convention is that
+/// `latest` is never a prerelease, so this picks the newest *final*
+/// release among `versions` first and only considers a prerelease when
+/// every parseable survivor is one.
+///
+/// A version that fails to parse as semver is dropped from consideration
+/// the same way `sort_newest_first` in [`crate::scan::cargo_cascade`]
+/// drops one — unless every entry in `versions` fails to parse, in which
+/// case this still returns a deterministic (lexicographic) answer rather
+/// than `None`, exactly as the pre-existing all-or-nothing comparison
+/// this replaces did.
 fn semver_newest(versions: &[String]) -> Option<String> {
-    versions
+    let parsed: Vec<(Version, &String)> = versions
         .iter()
-        .max_by(|a, b| match (Version::parse(a), Version::parse(b)) {
-            (Ok(left), Ok(right)) => left.cmp(&right),
-            (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
-            (Err(_), Ok(_)) => std::cmp::Ordering::Less,
-            (Err(_), Err(_)) => a.cmp(b),
-        })
-        .cloned()
+        .filter_map(|v| Version::parse(v).ok().map(|parsed| (parsed, v)))
+        .collect();
+
+    if parsed.is_empty() {
+        return versions.iter().max().cloned();
+    }
+
+    let non_prerelease_newest = parsed
+        .iter()
+        .filter(|(version, _)| version.pre.is_empty())
+        .max_by(|a, b| a.0.cmp(&b.0));
+
+    non_prerelease_newest
+        .or_else(|| parsed.iter().max_by(|a, b| a.0.cmp(&b.0)))
+        .map(|(_, v)| (*v).clone())
 }
 
 /// Builds the packument this proxy serves back to npm: only `keep`'s
@@ -211,8 +244,11 @@ fn semver_newest(versions: &[String]) -> Option<String> {
 /// `dist-tags` rules:
 /// - a tag whose target survived is kept unchanged;
 /// - `latest`, if its original target did not survive, is repointed to
-///   the semver-newest survivor (or dropped if there are no survivors
-///   at all);
+///   the semver-newest survivor that is not a prerelease (or dropped if
+///   there are no survivors at all) — see [`semver_newest`] for why a
+///   prerelease is never preferred, even one from a newer series than
+///   every non-prerelease survivor, unless it is the only survivor there
+///   is;
 /// - any other tag whose target did not survive is dropped.
 ///
 /// With no survivors, this still returns a well-formed document with

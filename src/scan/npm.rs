@@ -55,7 +55,7 @@
 //! version npm could have learned about, so a download request is simply
 //! not the place a review belongs.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -92,6 +92,149 @@ const ECOSYSTEM: &str = "npm";
 /// A real npm deployment always configures the table; this is defense in
 /// depth, not a path any production deployment exercises.
 const DEFAULT_SCAN_BUDGET: Duration = Duration::from_secs(120);
+
+/// Entry-count cap on [`LastGoodPackumentCache`]. Lower than
+/// [`crate::ecosystem::npm::upstream::EtagCache`]'s 500: a cached
+/// [`Packument`] is a heavier resident than that cache's plain `String`
+/// bodies (see [`PACKUMENT_WEIGHT_MULTIPLIER`]), so even disregarding the
+/// weighted-bytes cap below, holding as many entries costs more baseline
+/// memory per entry. A long-running deployment that queries a wide spread
+/// of distinct package names over its lifetime would otherwise grow this
+/// map without bound, exactly the gap the `EtagCache` bounding pass
+/// missed for this map.
+const MAX_LAST_GOOD_PACKUMENT_ENTRIES: usize = 300;
+
+/// Approximation of how much larger a parsed [`Packument`] is in memory
+/// than the JSON text it was parsed from. [`EtagCache`] can cap directly
+/// on a cached body's own `len()`, because it caches the text itself;
+/// `LastGoodPackumentCache` caches the *parsed* [`Packument`], whose
+/// dominant cost is `Packument::raw`'s `serde_json::Value` tree — one
+/// heap-allocated node per JSON token, each carrying `Value`'s own enum
+/// discriminant plus a `String`, `Vec`, or `Map` of its own, rather than
+/// one contiguous byte buffer. 4x is a conservative estimate for that
+/// per-node overhead, not a measured figure: the alternative was
+/// threading the original response's byte length through
+/// [`crate::ecosystem::npm::upstream::NpmUpstream::packument`]'s public
+/// return type solely so this weight check could use it, which this cache
+/// chooses not to do.
+const PACKUMENT_WEIGHT_MULTIPLIER: u64 = 4;
+
+/// Weighted-bytes cap on [`LastGoodPackumentCache`], in the same units
+/// [`packument_weight`] returns (a re-serialized length, multiplied by
+/// [`PACKUMENT_WEIGHT_MULTIPLIER`]). Lower than
+/// [`crate::ecosystem::npm::upstream::EtagCache`]'s 200 MiB (of actual
+/// text bytes) by roughly the weight multiplier, so this cache's real
+/// memory footprint stays in the same small-fraction-of-deployment-memory
+/// range as that one, despite caching a heavier structure per entry.
+const MAX_LAST_GOOD_PACKUMENT_WEIGHT: u64 = 150 * 1024 * 1024;
+
+/// Approximates `packument`'s in-memory weight, for
+/// [`LastGoodPackumentCache`]'s eviction policy: the size of its `raw`
+/// document re-serialized to JSON text, multiplied by
+/// [`PACKUMENT_WEIGHT_MULTIPLIER`] to approximate the larger footprint of
+/// the parsed `Value` tree actually held in memory. A re-serialization
+/// failure (not expected: `raw` came from a successful `parse_packument`
+/// call) weighs as zero rather than erroring — this is a soft eviction
+/// hint, not a correctness-bearing size, so the worst a wrong weight can
+/// do is cache slightly more or less than intended.
+fn packument_weight(packument: &Packument) -> u64 {
+    serde_json::to_vec(&packument.raw)
+        .map(|bytes| bytes.len() as u64 * PACKUMENT_WEIGHT_MULTIPLIER)
+        .unwrap_or(0)
+}
+
+/// A bounded cache of the last successfully fetched [`Packument`] per
+/// normalized package name, used by [`NpmScanner`] to answer an upstream
+/// outage with the versions already known to pass rather than an empty
+/// packument.
+///
+/// Shaped exactly like
+/// [`crate::ecosystem::npm::upstream::EtagCache`]: an entry count cap and
+/// a total-weight cap ([`MAX_LAST_GOOD_PACKUMENT_ENTRIES`],
+/// [`MAX_LAST_GOOD_PACKUMENT_WEIGHT`] in [`LastGoodPackumentCache::new`]),
+/// whichever is exceeded evicting the single oldest entry (by insertion or
+/// last-update order, tracked the same `VecDeque` way), repeating until
+/// both caps are satisfied again. A cache miss during an outage only
+/// costs falling back to an empty packument for that one request — see
+/// [`NpmScanner::decide_packument`] — never a wrong decision, so a soft,
+/// approximate eviction policy is the right trade here exactly as it is
+/// for `EtagCache`.
+///
+/// `with_limits` is `pub` for the same reason `EtagCache::with_limits` is:
+/// it gives `tests/` a seam to drive eviction directly with tiny caps,
+/// rather than needing hundreds of distinct upstream fetches to exercise
+/// the production caps.
+pub struct LastGoodPackumentCache {
+    entries: HashMap<String, Packument>,
+    /// Insertion/last-update order, oldest first. A name appears at most
+    /// once; re-inserting a name already cached removes its old position
+    /// before pushing the fresh one to the back, so it is not evicted as
+    /// though it were the stalest entry.
+    order: VecDeque<String>,
+    total_weight: u64,
+    max_entries: usize,
+    max_weight: u64,
+}
+
+impl LastGoodPackumentCache {
+    fn new() -> Self {
+        Self::with_limits(
+            MAX_LAST_GOOD_PACKUMENT_ENTRIES,
+            MAX_LAST_GOOD_PACKUMENT_WEIGHT,
+        )
+    }
+
+    /// Builds a cache with explicit caps. Production code always goes
+    /// through [`LastGoodPackumentCache::new`]; this exists so tests can
+    /// exercise eviction with caps small enough to hit in a handful of
+    /// inserts.
+    pub fn with_limits(max_entries: usize, max_weight: u64) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            total_weight: 0,
+            max_entries,
+            max_weight,
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<Packument> {
+        self.entries.get(name).cloned()
+    }
+
+    /// Inserts (or replaces) `name`'s cached packument, then evicts the
+    /// oldest entry, repeatedly, until both caps are satisfied.
+    pub fn insert(&mut self, name: String, packument: Packument) {
+        if let Some(old) = self.entries.remove(&name) {
+            self.total_weight = self.total_weight.saturating_sub(packument_weight(&old));
+            self.order.retain(|cached| cached != &name);
+        }
+        self.total_weight = self
+            .total_weight
+            .saturating_add(packument_weight(&packument));
+        self.order.push_back(name.clone());
+        self.entries.insert(name, packument);
+
+        while self.entries.len() > self.max_entries || self.total_weight > self.max_weight {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.entries.remove(&oldest) {
+                self.total_weight = self.total_weight.saturating_sub(packument_weight(&evicted));
+            }
+        }
+    }
+
+    /// The number of entries currently cached. Not used by production
+    /// code; exposed so `tests/` can assert on eviction directly.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
 
 /// What [`NpmScanner::decide_packument`] tells the registry-metadata
 /// handler to serve for one package.
@@ -171,7 +314,13 @@ pub struct NpmScanner {
     /// an empty packument. It holds only upstream's published metadata,
     /// never a review outcome, so a failed review never leaves a version
     /// in a half-cached state here.
-    last_good_packument: Arc<Mutex<HashMap<String, Packument>>>,
+    ///
+    /// Bounded by both an entry count and a weighted-bytes cap — see
+    /// [`LastGoodPackumentCache`]. A long-running deployment that fetches
+    /// many distinct package names over its lifetime would otherwise grow
+    /// this map without bound, holding a full parsed [`Packument`]
+    /// (including its `raw` JSON tree) for every one of them forever.
+    last_good_packument: Arc<Mutex<LastGoodPackumentCache>>,
 }
 
 /// The per-version facts one cascade iteration needs, all fetched from
@@ -224,7 +373,7 @@ impl NpmScanner {
             config,
             coordinator,
             artifact_cache,
-            last_good_packument: Arc::new(Mutex::new(HashMap::new())),
+            last_good_packument: Arc::new(Mutex::new(LastGoodPackumentCache::new())),
         }
     }
 
@@ -294,7 +443,7 @@ impl NpmScanner {
         self.last_good_packument
             .lock()
             .ok()
-            .and_then(|cache| cache.get(normalized).cloned())
+            .and_then(|cache| cache.get(normalized))
     }
 
     /// Answers an upstream outage from versions this proxy already knows
@@ -799,7 +948,7 @@ impl NpmScanner {
         // hash-verified on the way in, so there is nothing to download
         // again.
         let (archive_path, _download_dir, freshly_downloaded) = match self.cache_get(key).await {
-            Ok(Some(cached_path)) => match symlink_for_unpack(&cached_path, &key.filename) {
+            Ok(Some(cached_path)) => match super::symlink_for_unpack(&cached_path, &key.filename) {
                 Ok((guard, link)) => (link, Some(guard), false),
                 Err(err) => {
                     tracing::warn!(
@@ -924,6 +1073,22 @@ impl NpmScanner {
     /// Answers the download gate's one question for one exact version:
     /// is there a durable pass on record for it? Never runs a review —
     /// see the module docs.
+    ///
+    /// An upstream outage here is never a hard "no": falling through to
+    /// [`DownloadApproval::NotApproved`] would read, to the download
+    /// handler, as "the packument gate never admitted this version" —
+    /// which is false for a version that may well carry a stored `Clean`
+    /// verdict already, blocked only by a momentary blip re-reading its
+    /// `dist`. [`DownloadApproval::Unverifiable`] maps to a retryable
+    /// response instead, exactly as [`crate::scan::cargo::CargoScanner::approved_for_download`]'s
+    /// own outage path does. Before giving up, this also falls back to
+    /// [`NpmScanner::known_good`] — the same last-good packument
+    /// [`NpmScanner::decide_packument`] falls back to — purely to look up
+    /// `version`'s `dist`. That fallback cannot weaken the gate: the
+    /// digest it yields is still the one the caller re-verifies against
+    /// the downloaded bytes, so a stale or wrong `dist.tarball` there
+    /// only risks a download that then fails its hash check, never a
+    /// wrongly-approved one.
     pub async fn approved_for_download(&self, name: &str, version: &str) -> DownloadApproval {
         if validate_name(name).is_err() {
             tracing::debug!(
@@ -934,23 +1099,51 @@ impl NpmScanner {
         }
         let normalized = normalize_name(name);
 
-        let packument = match self.upstream.packument(name).await {
-            Ok(packument) => packument,
+        // `is_live` distinguishes a freshly fetched packument from a
+        // last-good fallback: only a live fetch can turn a missing
+        // version into a confident `NotFound`. A version absent from a
+        // stale cached packument during an outage is merely unconfirmed,
+        // not confirmed absent.
+        let (packument, is_live) = match self.upstream.packument(name).await {
+            Ok(packument) => (packument, true),
             Err(UpstreamError::NotFound) => return DownloadApproval::NotFound,
-            Err(err) => {
-                tracing::warn!(
-                    package = normalized,
-                    version,
-                    error = %err,
-                    "could not read the npm packument for a download approval check; refusing \
-                     rather than approving"
-                );
-                return DownloadApproval::NotApproved;
-            }
+            Err(err) => match self.known_good(&normalized) {
+                Some(packument) => (packument, false),
+                None => {
+                    tracing::warn!(
+                        package = normalized,
+                        version,
+                        error = %err,
+                        "could not read the npm packument for a download approval check, and no \
+                         last-good packument is cached for it; answering unverifiable rather \
+                         than a hard refusal"
+                    );
+                    return DownloadApproval::Unverifiable(RefusalReason {
+                        code: "unverifiable:upstream".to_string(),
+                        detail: format!("could not read the npm packument right now: {err:#}"),
+                    });
+                }
+            },
         };
 
         let Some(entry) = packument.versions.get(version) else {
-            return DownloadApproval::NotFound;
+            return if is_live {
+                DownloadApproval::NotFound
+            } else {
+                tracing::warn!(
+                    package = normalized,
+                    version,
+                    "the version is absent from the last-good cached npm packument, and \
+                     upstream could not be reached to confirm whether it exists at all"
+                );
+                DownloadApproval::Unverifiable(RefusalReason {
+                    code: "unverifiable:upstream".to_string(),
+                    detail: format!(
+                        "could not confirm whether {normalized} {version} exists: upstream is \
+                         unreachable and it is not in the last cached packument"
+                    ),
+                })
+            };
         };
 
         let Some(digest) = declared_digest(&entry.dist) else {
@@ -1088,24 +1281,6 @@ fn empty_packument(name: &str) -> Packument {
         time: BTreeMap::new(),
         raw: serde_json::json!({ "name": name, "versions": {}, "dist-tags": {} }),
     }
-}
-
-/// Creates a fresh temp directory containing one symlink, named
-/// `filename`, pointing at `target`. Used to hand `unpack` a path it can
-/// recognize the archive format from when the real bytes live under a
-/// content-addressed cache path that carries no extension at all.
-/// Mirrors `scan::symlink_for_unpack`'s own private helper on the PyPI
-/// path exactly; duplicated here because that one is private to its
-/// module. The returned [`tempfile::TempDir`] must be kept alive for as
-/// long as the symlink needs to resolve.
-fn symlink_for_unpack(
-    target: &Path,
-    filename: &str,
-) -> anyhow::Result<(tempfile::TempDir, PathBuf)> {
-    let dir = tempfile::tempdir()?;
-    let link_path = dir.path().join(filename);
-    std::os::unix::fs::symlink(target, &link_path)?;
-    Ok((dir, link_path))
 }
 
 /// The value to broadcast to a concurrent joiner. It is `Some(verdict)`

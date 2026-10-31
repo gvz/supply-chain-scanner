@@ -8,7 +8,7 @@
 //! collector binary over the unpacked tree. Nothing here talks to a model
 //! provider or to `bwrap`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -33,7 +33,7 @@ use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::db::review::ReviewStore;
 use supply_chain_scanner::db::verdict::VerdictStore;
 use supply_chain_scanner::db::Db;
-use supply_chain_scanner::ecosystem::npm::packument::{DeclaredDigest, DigestAlgorithm};
+use supply_chain_scanner::ecosystem::npm::packument::{DeclaredDigest, DigestAlgorithm, Packument};
 use supply_chain_scanner::ecosystem::npm::upstream::NpmUpstream;
 use supply_chain_scanner::model::{ArtifactKey, Verdict};
 use supply_chain_scanner::plugin::{
@@ -42,7 +42,7 @@ use supply_chain_scanner::plugin::{
 use supply_chain_scanner::policy::Policy;
 use supply_chain_scanner::scan::coordinator::ScanCoordinator;
 use supply_chain_scanner::scan::npm::{
-    artifact_key, DownloadApproval, NpmIndexDecision, NpmScanner,
+    artifact_key, DownloadApproval, LastGoodPackumentCache, NpmIndexDecision, NpmScanner,
 };
 
 // ---------------------------------------------------------------------------
@@ -1039,4 +1039,182 @@ async fn approved_for_download_returns_the_stored_block_and_its_why_id() {
         }
         other => panic!("expected Refused, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// I5: a packument-fetch outage during `approved_for_download` must answer
+// `Unverifiable` (retryable), never the hard `NotApproved` refusal that
+// reads as "the packument gate never admitted this version" — which is
+// false for a version that may already carry a stored `Clean` verdict.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn approved_for_download_falls_back_to_the_last_good_packument_during_an_outage() {
+    let server = MockServer::start().await;
+    let demo = vec![version("demo", "1.0.0")];
+    mount_packument(&server, "demo", &demo).await;
+    mount_downloads(&server, "demo", &demo).await;
+
+    let harness = build_harness(
+        base_config("http://localhost:8080", &server, Duration::from_secs(10)),
+        &server,
+        clean_scripts(),
+        Reply::Clean,
+        Duration::from_secs(10),
+        Duration::ZERO,
+        true,
+    );
+
+    // Populate both the stored verdict and the last-good packument cache
+    // via an ordinary successful cascade run first.
+    let first = harness.scanner.decide_packument("demo").await;
+    assert_eq!(forwarded_versions(&first), vec!["1.0.0".to_string()]);
+
+    // Now take the packument endpoint down. `approved_for_download` has
+    // to re-fetch the packument (it never trusts a cached verdict's `dist`
+    // without re-reading it), so this forces it onto the outage path.
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/demo"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let approval = harness.scanner.approved_for_download("demo", "1.0.0").await;
+
+    match approval {
+        DownloadApproval::Approved {
+            key: approved_key,
+            dist,
+        } => {
+            assert_eq!(approved_key, key("demo", "1.0.0", &demo[0].shasum));
+            assert_eq!(
+                dist.shasum,
+                Some(demo[0].shasum.clone()),
+                "the dist used to verify the download must come from the last-good packument"
+            );
+        }
+        other => panic!(
+            "an already-reviewed version must still approve via the last-good packument \
+             fallback during an outage, got {other:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn approved_for_download_during_an_outage_with_nothing_cached_is_unverifiable_not_refused() {
+    let server = MockServer::start().await;
+    // No successful fetch has ever happened, so there is nothing in the
+    // last-good packument cache to fall back to.
+    Mock::given(method("GET"))
+        .and(path("/demo"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let harness = build_harness(
+        base_config("http://localhost:8080", &server, Duration::from_secs(10)),
+        &server,
+        clean_scripts(),
+        Reply::Clean,
+        Duration::from_secs(10),
+        Duration::ZERO,
+        true,
+    );
+
+    let approval = harness.scanner.approved_for_download("demo", "1.0.0").await;
+
+    match approval {
+        DownloadApproval::Unverifiable(reason) => {
+            assert_eq!(reason.code, "unverifiable:upstream");
+        }
+        other => panic!(
+            "an outage with no stored pass to fall back on must be unverifiable (retryable), \
+             never the hard not-approved refusal, got {other:?}"
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// I4: `LastGoodPackumentCache` (the bounding `src/scan/npm.rs` adds for
+// `last_good_packument`, mirroring `EtagCache`'s shape in
+// `src/ecosystem/npm/upstream.rs`). Driven directly with tiny caps, the
+// same seam `tests/ecosystem_npm_upstream.rs` uses for `EtagCache`'s own
+// eviction tests, rather than needing hundreds of distinct packages to hit
+// the production caps.
+// ---------------------------------------------------------------------------
+
+/// A packument whose `raw` is a plain JSON string of `filler_len`
+/// characters, so its re-serialized length — and therefore its cache
+/// weight — is exactly `filler_len + 2` (the two quote bytes) before the
+/// cache's own weight multiplier.
+fn weighted_packument(name: &str, filler_len: usize) -> Packument {
+    Packument {
+        name: name.to_string(),
+        versions: BTreeMap::new(),
+        dist_tags: BTreeMap::new(),
+        time: BTreeMap::new(),
+        raw: serde_json::Value::String("x".repeat(filler_len)),
+    }
+}
+
+#[test]
+fn last_good_packument_cache_evicts_the_oldest_entry_past_its_entry_cap() {
+    let mut cache = LastGoodPackumentCache::with_limits(2, 1_000_000);
+
+    cache.insert("a".to_string(), weighted_packument("a", 10));
+    cache.insert("b".to_string(), weighted_packument("b", 10));
+    cache.insert("c".to_string(), weighted_packument("c", 10));
+
+    assert!(
+        cache.get("a").is_none(),
+        "the oldest entry must be evicted once the entry cap is exceeded"
+    );
+    assert!(cache.get("b").is_some());
+    assert!(cache.get("c").is_some());
+    assert_eq!(cache.len(), 2);
+}
+
+#[test]
+fn last_good_packument_cache_evicts_oldest_entries_past_its_weight_cap() {
+    // Each entry here weighs the same, and the cap sits between one and
+    // two entries' worth of weight, so every insert past the first must
+    // evict down to just the newest — the same shape
+    // `etag_cache_evicts_oldest_entries_past_its_total_bytes_cap` uses for
+    // `EtagCache`.
+    let mut cache = LastGoodPackumentCache::with_limits(100, 50);
+
+    cache.insert("a".to_string(), weighted_packument("a", 10));
+    cache.insert("b".to_string(), weighted_packument("b", 10));
+    cache.insert("c".to_string(), weighted_packument("c", 10));
+
+    assert!(
+        cache.get("a").is_none(),
+        "the oldest entry must be evicted once the weight cap is exceeded"
+    );
+    assert!(
+        cache.get("b").is_none(),
+        "eviction must repeat until the weight cap is satisfied again"
+    );
+    assert!(cache.get("c").is_some());
+}
+
+#[test]
+fn last_good_packument_cache_moves_a_re_inserted_name_to_the_back_instead_of_evicting_it_as_stale()
+{
+    let mut cache = LastGoodPackumentCache::with_limits(2, 1_000_000);
+
+    cache.insert("a".to_string(), weighted_packument("a", 10));
+    cache.insert("b".to_string(), weighted_packument("b", 10));
+    // Refresh "a" — it must now be the most-recently-used entry, not the
+    // oldest, even though it was inserted first.
+    cache.insert("a".to_string(), weighted_packument("a", 20));
+    cache.insert("c".to_string(), weighted_packument("c", 10));
+
+    assert!(
+        cache.get("b").is_none(),
+        "the entry that was never refreshed must be the one evicted"
+    );
+    assert!(cache.get("a").is_some());
+    assert!(cache.get("c").is_some());
 }

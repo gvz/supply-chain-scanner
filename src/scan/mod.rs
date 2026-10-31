@@ -1064,7 +1064,12 @@ fn verdict_for_dedup(decision: &Decision) -> Option<Verdict> {
 /// content-addressed cache path that carries no extension at all. The
 /// returned [`tempfile::TempDir`] must be kept alive for as long as the
 /// symlink needs to resolve.
-fn symlink_for_unpack(
+///
+/// `pub(crate)` so [`crate::scan::npm`] can reuse this exact helper
+/// instead of keeping its own verbatim copy — the npm scanner's unpack
+/// path needs precisely the same symlink-beside-a-content-addressed-path
+/// trick this one already implements, enrichment and all.
+pub(crate) fn symlink_for_unpack(
     target: &std::path::Path,
     filename: &str,
 ) -> anyhow::Result<(tempfile::TempDir, PathBuf)> {

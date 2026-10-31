@@ -783,6 +783,13 @@ git commit -m "feat(http): gate the npm tarball on metadata approval and org plu
 
 ### Task 12: Close the same hole on the cargo download path
 
+**Status: DONE** (commit `b80c701`). Verified in-tree: `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, and 47 tests across `http_cargo_download`, `http_cargo_bootstrap`, `scan_cargo`, `http_cargo_index` all clean. Implementation notes beyond the plan's letter:
+
+- `CargoDownloadApproval` keeps `Unverifiable` distinct from `NotApproved`, so an index outage answers 503 `unverifiable:upstream` rather than claiming the version was never admitted. Both still refuse.
+- Exactly one index read per request: the allowlist branch fetches it itself, every other branch goes through `approved_for_download`.
+- Two existing download tests (`a_hash_mismatch_is_refused_and_nothing_is_stored`, `a_plugin_that_could_not_run_is_a_503_not_a_stored_block`) assert that nothing is stored, so seeding an index-gate verdict would have made them vacuous. They now run through the allowlist override, which reaches the integrity check and plugin gate with no stored verdict.
+- `tests/http_cargo_bootstrap.rs` needed no change: its happy path already exercises the real cascade, which stores `Clean` before the download.
+
 `cargo_download_handler`'s `Ok(None) => {}` arm falls through to `serve_gated(.., true)`, serving a version with no stored verdict on plugin-pass alone — never CVE-filtered, age-checked, or AI-reviewed. The spec requires this closed in both ecosystems.
 
 **Files:**
@@ -793,7 +800,7 @@ git commit -m "feat(http): gate the npm tarball on metadata approval and org plu
 **Interfaces:**
 - Produces: `CargoScanner::approved_for_download(&self, name: &str, version: &str) -> CargoDownloadApproval`, with its own enum in `scan/cargo.rs` whose `Approved` variant carries `{ key: ArtifactKey, entry: CargoIndexEntry }`. Deliberately **not** the same type as Task 9's `DownloadApproval`: the approved variant carries an ecosystem-specific payload (`CargoIndexEntry` here, npm's `Dist` there), so one shared enum would need a generic or an untyped field for no gain. The two are parallel by design, and the *gate order* is what has to match, not the type.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[tokio::test] async fn a_version_the_index_cascade_never_approved_is_refused_without_a_download() {
@@ -807,21 +814,21 @@ git commit -m "feat(http): gate the npm tarball on metadata approval and org plu
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test --test http_cargo_download`
 Expected: the first test FAILS — the artifact is currently downloaded and served.
 
-- [ ] **Step 3: Require metadata approval before the plugin gate**
+- [x] **Step 3: Require metadata approval before the plugin gate**
 
 Replace the fall-through so only an allowlisted version or one with a stored `Clean` verdict reaches `serve_with_plugin_dedup`. A version with no stored verdict is refused with a reason naming that it was never admitted by the index gate.
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `cargo test --test http_cargo_download --test http_cargo_bootstrap --test scan_cargo`
 Expected: PASS. A bootstrap test that relied on the old fall-through needs its fixture to seed an index-gate pass first; that is a fixture fix, not a behaviour concession.
 
-- [ ] **Step 5: Document the behaviour change and commit**
+- [x] **Step 5: Document the behaviour change and commit**
 
 Add a note to `docs/operations.md` under the cargo deployment: a `.crate` download for a version the index gate never admitted is now refused rather than plugin-gated and served, and why.
 

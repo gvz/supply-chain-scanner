@@ -4,8 +4,8 @@ Drawio sources for the scanner's architecture and request flows. Open any file
 with [draw.io](https://app.diagrams.net) or the VS Code draw.io extension. Every
 file is plain, editable XML with no external assets.
 
-Rendered copies live in [`svg/`](svg/). Each SVG embeds a full copy of its
-diagram in a `content` attribute, so it is both an image and an editable drawio
+Rendered copies live in [`png/`](png/). Each PNG embeds a full copy of its
+diagram in a `zTXt` chunk, so it is both a viewable image and an editable drawio
 file. See [Editing and regenerating](#editing-and-regenerating).
 
 | File | What it shows |
@@ -21,31 +21,33 @@ file. See [Editing and regenerating](#editing-and-regenerating).
 
 ## Editing and regenerating
 
-The `.drawio` file is the source of truth. Edit it, then rebuild the SVGs:
+The `.drawio` file is the source of truth. Edit it, then rebuild the PNGs:
 
 ```bash
-./docs/diagrams/build-svg.sh
+./docs/diagrams/build-png.sh
 ```
 
 That needs draw.io desktop (`drawio` on PATH) and `xvfb-run`, because the export
-drives a headless Electron window. The script rebuilds every SVG from every
-`.drawio` beside it.
+drives a headless Electron window. The script rebuilds every PNG from every
+`.drawio` beside it, at 2x scale so label text stays legible. Set `SCALE=3` in
+the environment for a sharper export at a larger file size.
 
-Each SVG carries its diagram in a `content` attribute, which makes the loop work
-in both directions:
+Each PNG carries its diagram in a compressed `zTXt` chunk, which makes the loop
+work in both directions:
 
 - Edit the `.drawio`, rebuild, commit both. This is the normal path, because a
-diff of rendered SVG is unreadable in review.
-- Open a `.svg` directly in draw.io desktop, edit it, and save. drawio reads the
-  embedded copy back out. The result then has to be re-exported as `.drawio` for
+diff of rendered pixels is unreadable in review.
+- Open a `.png` directly in draw.io desktop, edit it, and save. drawio reads the
+  embedded copy back out. A round trip preserves every cell: 50 cells in, 50 out,
+  on `01-system-overview`. The result then has to be re-exported as `.drawio` for
   the change to be reviewable.
 
-**A rendering caveat worth knowing.** drawio emits label text inside
-`foreignObject` elements, with a single `<text>` fallback per file. Browsers
-render that correctly. GitHub's Markdown image proxy strips `foreignObject`, so an
-SVG embedded in a README on GitHub shows shapes with no text. For a hosted view,
-export PNG with `--embed-diagram` instead, or link the `.drawio` file and let a
-reader open it in draw.io.
+**Why PNG rather than SVG.** drawio emits SVG label text inside `foreignObject`
+elements. Browsers render that correctly, but GitHub's Markdown image proxy
+strips it, so an SVG embedded in a README there shows shapes with no text. A PNG
+renders correctly everywhere and is roughly a quarter of the size. The cost is
+that PNG pixels are fixed at export time: no zoom-selectable text and no dark-mode
+adaptation. For reading locally, open the `.drawio` in draw.io.
 
 ## Reading order
 

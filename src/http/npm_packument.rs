@@ -13,9 +13,14 @@
 //!   `POST /-/npm/v1/security/audits/quick` — npm's audit summary
 //!   requests. See "The audit endpoints are a privacy decision" below.
 //!
-//! The tarball route (`/{*name}/-/{file}`) belongs to Task 11's
-//! `npm_download`, which registers it on this same router. This module
-//! does not define or register it.
+//! The tarball route is served from the same `/{*path}` catch-all, by
+//! dispatch. [`super::npm_download`] owns the tarball gate, and
+//! [`npm_packument_handler`] hands it a path that [`super::npm_download::looks_like_tarball`]
+//! recognizes before treating the path as a package name. A tarball
+//! cannot have a route of its own: `matchit`, which axum 0.8 uses,
+//! permits a catch-all only as the final path segment, and a narrower
+//! route conflicts with the one below. See that module for the exact
+//! router errors.
 //!
 //! # Why this proxy always serves the full packument
 //!
@@ -50,11 +55,12 @@
 //! [`crate::ecosystem::npm::validate_name`].
 //!
 //! `/-/ping`, the two audit routes, `/refusals`, `/why/<id>`,
-//! `/api/reviews`, `/healthz`, and (once Task 11 registers it) the
-//! tarball route are all static-prefix routes on the same router as the
-//! `/{*path}` catch-all. `matchit` resolves a static segment before a
-//! wildcard, so every one of them is reachable even though the catch-all
-//! would otherwise swallow anything.
+//! `/api/reviews` and `/healthz` are static-prefix routes on the same
+//! router as the `/{*path}` catch-all. `matchit` resolves a static
+//! segment before a wildcard, so every one of them is reachable even
+//! though the catch-all would otherwise swallow anything. The tarball
+//! path rides the catch-all and is distinguished inside the handler, as
+//! described above.
 //!
 //! # Why the three shared routes are thin extractors
 //!
@@ -89,8 +95,8 @@ use super::{bad_request_response, not_found_response};
 /// [`super::refusals`] queries for on this deployment.
 pub const NPM_ECOSYSTEM: &str = "npm";
 
-/// Shared state for every handler in this module and for Task 11's
-/// `npm_download`.
+/// Shared state for every handler in this module and for
+/// [`super::npm_download`]'s tarball gate.
 ///
 /// Cheap to clone: every field is an `Arc`, as axum's `State` extractor
 /// requires. Mirrors [`super::cargo_index::CargoAppState`]'s own
@@ -98,8 +104,8 @@ pub const NPM_ECOSYSTEM: &str = "npm";
 /// [`super::AppState`]: a cargo or npm deployment never boots the PyPI
 /// fields, and a PyPI deployment never boots these.
 ///
-/// Each field is here because a handler in this router (or Task 11's)
-/// reads it:
+/// Each field is here because a handler in this router (or the tarball
+/// gate) reads it:
 ///
 /// - `npm_scanner` — the cascade behind the packument gate
 ///   ([`npm_packument_handler`]). Its `fingerprint()` is the policy
@@ -108,22 +114,21 @@ pub const NPM_ECOSYSTEM: &str = "npm";
 ///   download path reads.
 /// - `config` — `public_url` (read inside the cascade itself for the
 ///   rewritten tarball URLs) and `ai_review` for `/api/reviews`'s gate.
-/// - `upstream` — the npm registry client. Task 11's download handler
-///   needs the version's `dist` object and tarball bytes directly;
-///   `NpmScanner` exposes neither beyond what the packument cascade
-///   already consumed.
+/// - `upstream` — the npm registry client. The tarball gate needs the
+///   version's `dist` object and tarball bytes directly; `NpmScanner`
+///   exposes neither beyond what the packument cascade already consumed.
 /// - `verdicts` — the durable verdict store the download gate reads and
 ///   writes, and that `/refusals` and `/why/<id>` read from.
-/// - `plugins` — the runner Task 11's download gate executes the org's
-///   plugin binaries through.
-/// - `artifact_cache` — the content-addressed cache Task 11's download
-///   gate serves already-verified bytes from.
+/// - `plugins` — the runner the tarball gate executes the org's plugin
+///   binaries through.
+/// - `artifact_cache` — the content-addressed cache the tarball gate
+///   serves already-verified bytes from.
 /// - `reviews` — the AI-review audit table, read by `/why/<id>` and
 ///   `/api/reviews`. The same store the PyPI and cargo paths serve from.
 /// - `plugin_run_coordinator` — deduplicates concurrent first-touch
-///   tarball downloads for the same artifact digest, Task 11's own
-///   instance of the single-flight pattern [`NpmScanner`] already uses
-///   for its own AI-review cascade.
+///   tarball downloads for the same artifact digest, the tarball gate's
+///   own instance of the single-flight pattern [`NpmScanner`] already
+///   uses for its AI-review cascade.
 #[derive(Clone)]
 pub struct NpmAppState {
     pub npm_scanner: Arc<NpmScanner>,
@@ -144,10 +149,10 @@ pub struct NpmAppState {
 }
 
 /// Builds the npm deployment's router: `/-/ping`, the two audit stubs,
-/// `/refusals`, `/why/<id>`, `/api/reviews`, `/healthz`, and the catch-all
-/// packument route. Task 11 mounts the tarball route on this same
-/// `Router` by modifying this function; this task's router does not
-/// carry it.
+/// `/refusals`, `/why/<id>`, `/api/reviews`, `/healthz`, and the
+/// `/{*path}` catch-all that serves both packuments and, by dispatch,
+/// tarballs. See this module's docs for why the tarball shares the
+/// catch-all.
 ///
 /// Route precedence is exactly [`super::cargo_index::cargo_router`]'s:
 /// every static-prefix route here resolves before the `/{*path}`
@@ -236,6 +241,14 @@ pub async fn npm_packument_handler(
     State(state): State<NpmAppState>,
     Path(path): Path<String>,
 ) -> Response {
+    // A tarball request arrives on this same catch-all. See
+    // `super::npm_download`'s module docs for why it cannot have a route
+    // of its own: `matchit` permits a catch-all only as the final path
+    // segment, and a narrower route conflicts with this one.
+    if super::npm_download::looks_like_tarball(&path) {
+        return super::npm_download::npm_download_handler(&state, &path).await;
+    }
+
     let name = match validate_name(&path) {
         Ok(name) => name,
         Err(err) => return bad_request_response(&format!("invalid npm package name: {err}")),

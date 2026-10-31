@@ -31,6 +31,7 @@ pub mod artifact;
 pub mod cargo_bootstrap;
 pub mod cargo_download;
 pub mod cargo_index;
+pub mod npm_download;
 pub mod npm_packument;
 pub mod refusal;
 pub mod refusals;

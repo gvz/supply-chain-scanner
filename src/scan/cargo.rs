@@ -46,7 +46,7 @@ use crate::ai::{AiReviewer, ReviewOutcome};
 use crate::config::ConfigHandle;
 use crate::db::advisory::AdvisoryStore;
 use crate::db::cargo_vet::CargoVetStore;
-use crate::db::verdict::VerdictStore;
+use crate::db::verdict::{StoredVerdict, VerdictStore};
 use crate::ecosystem::cargo::index::{validate_name, CargoIndexEntry};
 use crate::ecosystem::cargo::normalize_name;
 use crate::ecosystem::cargo::upstream::{CargoUpstream, UpstreamError};
@@ -89,6 +89,45 @@ pub enum CargoIndexDecision {
     /// to retry shortly. The reviews that already finished are stored, so
     /// a retry resumes rather than restarts.
     InProgress,
+}
+
+/// What [`CargoScanner::approved_for_download`] tells the `.crate`
+/// download handler about one exact crate version.
+///
+/// This is deliberately its own enum, not a reuse of the npm path's
+/// `DownloadApproval`. The `Approved` variant carries what a cargo
+/// download needs to fetch and verify the bytes — the artifact key and
+/// the index entry whose `cksum` they are checked against — where npm's
+/// carries its ecosystem's `dist` object instead. One shared enum would
+/// need a generic or an untyped payload for no gain. The two are
+/// parallel by design: the *gate order* is what has to match, not the
+/// type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CargoDownloadApproval {
+    /// A durable `Clean` verdict is on record for this version, under
+    /// the running policy fingerprint. That verdict is the index gate's
+    /// own record that the version was CVE-filtered, age-checked, and
+    /// reviewed. `entry` is upstream's index entry, so the handler has
+    /// the `cksum` it must verify the bytes against.
+    Approved {
+        key: ArtifactKey,
+        entry: CargoIndexEntry,
+    },
+    /// A durable `Blocked` verdict is on record. Carries the stored
+    /// reason and, when one exists, the `why_id` for a `/why/<id>` link.
+    Refused(RefusalReason, Option<String>),
+    /// No stored verdict exists for this version at all. The index gate
+    /// never admitted it, so it was never CVE-filtered, aged-checked, or
+    /// reviewed. This is a refusal at download time, never an
+    /// invitation to review inline: the gate that can review is the
+    /// index cascade, not this one.
+    NotApproved,
+    /// Upstream has no such crate, or no such version of it.
+    NotFound,
+    /// The question could not be answered — the sparse index was
+    /// unreachable, or the verdict store could not be read. Never a
+    /// pass.
+    Unverifiable(RefusalReason),
 }
 
 /// Decides, for one crate, which published versions this proxy may
@@ -226,6 +265,102 @@ impl CargoScanner {
         };
 
         self.run_cascade(&normalized, &entries, deadline).await
+    }
+
+    /// Answers the `.crate` download gate's one question for one exact
+    /// version: did the sparse-index cascade admit it?
+    ///
+    /// The answer is the stored verdict, and nothing else. A version is
+    /// admitted when its durable verdict is `Clean` — either the AI
+    /// review passed it or cargo-vet covered it, after the CVE line and
+    /// the release-age gate had their say. A version with no verdict is
+    /// [`CargoDownloadApproval::NotApproved`]: the cascade never reached
+    /// it, so nothing about it has been checked, and downloading its
+    /// bytes would serve an artifact on plugin-pass alone.
+    ///
+    /// This never runs a review. A download is not where a review
+    /// belongs: the client asks for the bytes because the index gate
+    /// already advertised them, so a version without a verdict means the
+    /// client is asking for something the gate never admitted.
+    ///
+    /// `name` and `version` are untrusted. An invalid name answers
+    /// [`CargoDownloadApproval::NotFound`]; the HTTP layer validates
+    /// first and answers 400, so this second test is defense in depth.
+    pub async fn approved_for_download(&self, name: &str, version: &str) -> CargoDownloadApproval {
+        if validate_name(name).is_err() {
+            tracing::debug!(
+                package = name,
+                "refusing a download approval check for an invalid crate name"
+            );
+            return CargoDownloadApproval::NotFound;
+        }
+        let normalized = normalize_name(name);
+
+        let entries = match self.upstream.index_entries(name).await {
+            Ok(entries) => entries,
+            Err(UpstreamError::NotFound) => return CargoDownloadApproval::NotFound,
+            Err(err) => {
+                tracing::warn!(
+                    package = normalized,
+                    version,
+                    error = %err,
+                    "could not read the cargo sparse index for a download approval check; \
+                     refusing rather than approving"
+                );
+                // The handler sanitizes this for the wire; the code is
+                // fixed text.
+                return CargoDownloadApproval::Unverifiable(RefusalReason {
+                    code: "unverifiable:upstream".to_string(),
+                    detail: format!("could not read the cargo sparse index right now: {err:#}"),
+                });
+            }
+        };
+
+        let Some(entry) = entries.iter().find(|entry| entry.vers == version).cloned() else {
+            return CargoDownloadApproval::NotFound;
+        };
+
+        let key = artifact_key(&normalized, &entry);
+        let fingerprint = self.fingerprint();
+
+        match self.lookup_stored_verdict(&key, &fingerprint).await {
+            Ok(Some(stored)) => match stored.verdict {
+                Verdict::Clean => CargoDownloadApproval::Approved { key, entry },
+                Verdict::Blocked(reason) => {
+                    CargoDownloadApproval::Refused(reason, Some(stored.why_id))
+                }
+            },
+            Ok(None) => CargoDownloadApproval::NotApproved,
+            Err(err) => {
+                tracing::warn!(
+                    package = normalized,
+                    version,
+                    error = %format!("{err:#}"),
+                    "could not read the stored cargo verdict; refusing the download rather \
+                     than approving it"
+                );
+                CargoDownloadApproval::Unverifiable(RefusalReason {
+                    code: "unverifiable:internal".to_string(),
+                    detail: format!("looking up the stored verdict: {err:#}"),
+                })
+            }
+        }
+    }
+
+    /// Reads one stored verdict on the blocking pool.
+    async fn lookup_stored_verdict(
+        &self,
+        key: &ArtifactKey,
+        fingerprint: &str,
+    ) -> anyhow::Result<Option<StoredVerdict>> {
+        let store = Arc::clone(&self.verdict_store);
+        let key = key.clone();
+        let fingerprint = fingerprint.to_string();
+        tokio::task::spawn_blocking(move || store.get(&key, &fingerprint))
+            .await
+            .map_err(|join_error| {
+                anyhow::anyhow!("the cargo verdict lookup task panicked: {join_error}")
+            })?
     }
 
     /// Stores `entries` as the last good index body for `normalized`.

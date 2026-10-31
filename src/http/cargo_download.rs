@@ -17,7 +17,7 @@
 //! PyPI. A plugin run is expensive, so it happens once per artifact, not
 //! once per download:
 //!
-//! - **No verdict, or a verdict not yet plugin-checked** — download the
+//! - **A stored `Clean` verdict, not yet plugin-checked** — download the
 //!   `.crate`, verify it against the index's `cksum`, unpack it, run every
 //!   configured plugin, then store and serve the outcome.
 //! - **A stored `Clean` verdict already marked plugin-checked** — serve
@@ -27,6 +27,30 @@
 //!   that admitted it.
 //! - **A stored `Blocked` verdict** — refuse, with the stored reason and
 //!   its `/why/<id>` link.
+//! - **No stored verdict at all** — refuse, without downloading anything.
+//!   See below.
+//!
+//! # The index gate is the admission, and this gate cannot replace it
+//!
+//! The index cascade is the gate that CVE-filters, age-checks, and
+//! reviews a version, and it records a `Clean` verdict for every version
+//! it admits. A version with no stored verdict is therefore a version the
+//! cascade never admitted: it is not in any sparse-index response this
+//! proxy served, so cargo had no way to learn about it except by asking
+//! this route directly.
+//!
+//! Such a request used to fall through to the plugin gate and be served on
+//! plugin-pass alone, which meant an artifact nobody had CVE-filtered,
+//! age-checked, or reviewed could reach a developer. It is now
+//! [`RefusalReason`] code `not-index-approved`. This handler cannot review
+//! the version itself — reviewing belongs to the cascade, which is what
+//! decides whether a version is *advertisable*, and a download request is
+//! not evidence that it should be. An operator who wants a version the
+//! cascade could not reach allowlists it; that override is checked first,
+//! below, and still requires the bytes to match the index `cksum`.
+//!
+//! The one exception is the allowlist, by design: an operator's explicit
+//! decision in the config stands in for the index gate's judgement checks.
 //!
 //! `plugin_checked` is a separate flag from the verdict on purpose. The
 //! index cascade stores `Verdict::Clean` for a crate-vet-covered version
@@ -79,6 +103,7 @@ use crate::ecosystem::cargo::normalize_name;
 use crate::ecosystem::cargo::upstream::UpstreamError;
 use crate::model::{ArtifactKey, RefusalReason, Verdict};
 use crate::plugin::{is_check_failure, unpack};
+use crate::scan::cargo::CargoDownloadApproval;
 use crate::scan::coordinator::{self, FinishGuard};
 use crate::scan::is_allowlisted;
 
@@ -96,7 +121,8 @@ const CRATE_CONTENT_TYPE: &str = "application/gzip";
 const MAX_VERSION_LEN: usize = 128;
 
 /// `GET /crates/{crate}/{version}/download`: the `.crate` bytes, gated on
-/// the organization's plugins.
+/// the organization's plugins, and only for a version the index gate
+/// admitted or the operator allowlisted.
 pub async fn cargo_download_handler(
     State(state): State<CargoAppState>,
     Path((raw_name, raw_version)): Path<(String, String)>,
@@ -112,61 +138,98 @@ pub async fn cargo_download_handler(
         return bad_request_response(&detail);
     }
 
-    let entries = match state.upstream.index_entries(&name).await {
+    // The allowlist is consulted first, matching `Scanner::decide_inner`
+    // on the PyPI path: an operator who allowlisted this crate and version
+    // has overridden the judgement checks, and that override has to reach
+    // the stored block and the index gate's own admission alike. It never
+    // overrides the integrity check — the bytes still have to match the
+    // index `cksum`, which `download_and_verify` enforces on every path
+    // this branches to.
+    //
+    // This branch is the one place a request reaches the plugins without a
+    // stored verdict, so it is also the one place that fetches the index
+    // itself: `approved_for_download` fetches it on every other path.
+    if is_allowlisted_crate(&state.config.current(), &name, &raw_version) {
+        return match allowlisted_entry(&state, &name, &raw_version).await {
+            Ok((key, entry)) => serve_gated(&state, &key, &entry, true).await,
+            Err(response) => response,
+        };
+    }
+
+    match state
+        .cargo_scanner
+        .approved_for_download(&name, &raw_version)
+        .await
+    {
+        CargoDownloadApproval::Approved { key, entry } => {
+            let fingerprint = state.cargo_scanner.fingerprint();
+            if plugin_checked(&state.verdicts, &key, &fingerprint).await {
+                return serve_gated(&state, &key, &entry, false).await;
+            }
+            serve_gated(&state, &key, &entry, true).await
+        }
+        CargoDownloadApproval::Refused(reason, why_id) => {
+            // A stored block carries its own `/why` id, fetched the same
+            // way the PyPI path fetches it.
+            let link = why_id.and_then(|id| why_url(&state.config.current(), &id));
+            refusal_response(&reason, link.as_deref())
+        }
+        CargoDownloadApproval::NotApproved => {
+            refusal_response(&not_index_approved_reason(&name, &raw_version), None)
+        }
+        CargoDownloadApproval::NotFound => not_found_response(),
+        CargoDownloadApproval::Unverifiable(reason) => unverifiable_response(&RefusalReason {
+            code: reason.code,
+            detail: sanitize(&reason.detail),
+        }),
+    }
+}
+
+/// Looks up the index entry for an allowlisted `name`/`version` without
+/// consulting any verdict, so an allowlisted version is served even when
+/// the cascade never admitted it.
+///
+/// This is the allowlist override's own index read. The version still has
+/// to exist upstream: the `cksum` in the returned entry is what the
+/// downloaded bytes are verified against, and a version the index does not
+/// list is a 404 exactly as it is on the approval path.
+async fn allowlisted_entry(
+    state: &CargoAppState,
+    name: &str,
+    version: &str,
+) -> Result<(ArtifactKey, CargoIndexEntry), Response> {
+    let entries = match state.upstream.index_entries(name).await {
         Ok(entries) => entries,
-        Err(UpstreamError::NotFound) => return not_found_response(),
+        Err(UpstreamError::NotFound) => return Err(not_found_response()),
         Err(err) => {
-            return unverifiable_response(&RefusalReason {
+            return Err(unverifiable_response(&RefusalReason {
                 code: "unverifiable:upstream".to_string(),
                 detail: sanitize(&format!(
                     "could not read the cargo sparse index right now: {err:#}"
                 )),
-            })
+            }))
         }
     };
 
-    let Some(entry) = entries.iter().find(|entry| entry.vers == raw_version) else {
-        return not_found_response();
+    let Some(entry) = entries.iter().find(|entry| entry.vers == version).cloned() else {
+        return Err(not_found_response());
     };
 
-    let key = crate::scan::cargo::artifact_key(&normalize_name(&name), entry);
-    let fingerprint = state.cargo_scanner.fingerprint();
+    let key = crate::scan::cargo::artifact_key(&normalize_name(name), &entry);
+    Ok((key, entry))
+}
 
-    // The allowlist is consulted before the stored verdict, matching
-    // `Scanner::decide_inner` on the PyPI path: an operator who
-    // allowlisted this crate and version has overridden the judgement
-    // checks, and that override has to reach the stored block too. It
-    // never overrides the integrity check — the bytes still have to match
-    // the index `cksum`, which `download_and_verify` enforces on every
-    // path this branches to.
-    if is_allowlisted_crate(&state.config.current(), &name, &entry.vers) {
-        return serve_gated(&state, &key, entry, true).await;
+/// The refusal for a version the sparse-index cascade never admitted: no
+/// stored verdict, so no CVE filter, no release-age check, and no review
+/// ever saw it.
+fn not_index_approved_reason(name: &str, version: &str) -> RefusalReason {
+    RefusalReason {
+        code: "not-index-approved".to_string(),
+        detail: sanitize(&format!(
+            "{name} {version} was never admitted by the sparse-index gate, so it has not \
+             been CVE-filtered, age-checked, or reviewed; this proxy does not download it"
+        )),
     }
-
-    match stored_verdict(&state.verdicts, &key, &fingerprint).await {
-        Ok(Some(Verdict::Blocked(reason))) => {
-            // A stored block carries its own `/why` id, fetched the same
-            // way the PyPI path fetches it.
-            let link = stored_why_id(&state.verdicts, &key, &fingerprint)
-                .await
-                .and_then(|id| why_url(&state.config.current(), &id));
-            return refusal_response(&reason, link.as_deref());
-        }
-        Ok(Some(Verdict::Clean)) => {
-            let checked = plugin_checked(&state.verdicts, &key, &fingerprint).await;
-            if checked {
-                return serve_gated(&state, &key, entry, false).await;
-            }
-        }
-        Ok(None) => {}
-        Err(err) => {
-            return unverifiable_response(&internal_reason(&format!(
-                "looking up the stored verdict: {err:#}"
-            )))
-        }
-    }
-
-    serve_gated(&state, &key, entry, true).await
 }
 
 /// Serves the verified bytes for `key`, running the plugins first when
@@ -566,20 +629,6 @@ fn validate_version_segment(version: &str) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 // Blocking-store access, each on the blocking pool
 // ---------------------------------------------------------------------------
-
-async fn stored_verdict(
-    store: &Arc<VerdictStore>,
-    key: &ArtifactKey,
-    fingerprint: &str,
-) -> anyhow::Result<Option<Verdict>> {
-    let store = Arc::clone(store);
-    let key = key.clone();
-    let fingerprint = fingerprint.to_string();
-    tokio::task::spawn_blocking(move || store.get(&key, &fingerprint))
-        .await
-        .map_err(|join_error| anyhow::anyhow!("the verdict lookup task panicked: {join_error}"))?
-        .map(|stored| stored.map(|stored| stored.verdict))
-}
 
 async fn stored_why_id(
     store: &Arc<VerdictStore>,

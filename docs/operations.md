@@ -466,6 +466,17 @@ that appears in the index response is *admitted*, and not fully scanned. It
 cleared CVE and either AI review or a cargo-vet audit. Only a version that was
 also downloaded has had the plugins run against it.
 
+**The `.crate` route serves only an admitted version.** A download for a version
+the index gate never admitted is refused with a `not-index-approved` reason,
+without fetching the bytes and without running a plugin. The gate reads the
+stored verdict as the proof of admission: the cascade writes one for every
+version it forwards, so a version with no verdict is one the cascade never
+reached. That version was never CVE-filtered, never age-checked, and never
+reviewed. Serving it on a plugin pass would substitute one check for the other
+three. An `[[allowlist]]` entry still overrides this, the same way it overrides
+a stored block, and the bytes still have to match the `cksum` the index
+declared.
+
 The split also decides how a refusal reaches a person. Cargo's sparse-index
 protocol gives an index-time refusal no place to put a reason phrase. A blocked
 version is therefore simply absent from a successful response, and cargo reports

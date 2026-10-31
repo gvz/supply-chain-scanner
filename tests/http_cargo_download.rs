@@ -20,7 +20,9 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use supply_chain_scanner::artifact_cache::ArtifactCache;
-use supply_chain_scanner::config::{Config, ConfigHandle, CveLine, PluginConfig, UnknownSeverity};
+use supply_chain_scanner::config::{
+    AllowEntry, Config, ConfigHandle, CveLine, PluginConfig, UnknownSeverity,
+};
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::db::cargo_vet::CargoVetStore;
 use supply_chain_scanner::db::verdict::VerdictStore;
@@ -268,6 +270,17 @@ struct Harness {
 
 impl Harness {
     async fn start(name: &str, versions: &[&Version], behaviour: Behaviour) -> Harness {
+        Harness::start_with(name, versions, behaviour, |_| {}).await
+    }
+
+    /// Starts the router with a chance to adjust the config first: an
+    /// allowlist entry, an extra plugin, a different CVE line.
+    async fn start_with(
+        name: &str,
+        versions: &[&Version],
+        behaviour: Behaviour,
+        configure: impl FnOnce(&mut Config),
+    ) -> Harness {
         let server = MockServer::start().await;
         mount(&server, name, versions).await;
 
@@ -277,7 +290,8 @@ impl Harness {
         let plugin_binary = plugin_dir.path().join("yara");
         std::fs::write(&plugin_binary, b"pretend plugin binary").expect("write plugin binary");
 
-        let cfg = base_config(plugin_binary);
+        let mut cfg = base_config(plugin_binary);
+        configure(&mut cfg);
         let policy = Policy::build(Arc::new(cfg.clone())).expect("build policy");
         let fingerprint = policy.fingerprint().to_string();
         let config_handle = Arc::new(ConfigHandle::new(cfg));
@@ -425,6 +439,32 @@ impl Harness {
             .count()
     }
 
+    /// Starts a harness in which every one of `versions` already carries
+    /// the `Clean` verdict the index gate stores when its cascade admits
+    /// the version. This is the state a real `.crate` download runs in: a
+    /// version is only downloadable here because the index gate admitted
+    /// it first.
+    async fn start_index_approved(
+        name: &str,
+        versions: &[&Version],
+        behaviour: Behaviour,
+    ) -> Harness {
+        let harness = Harness::start(name, versions, behaviour).await;
+        for v in versions {
+            harness.seed_clean_verdict(&key(name, &v.vers, &v.declared_cksum));
+        }
+        harness
+    }
+
+    /// Stores the `Clean` verdict the index cascade stores for a version
+    /// it admitted, without the plugin-checked flag: exactly the state the
+    /// download gate has to run the plugins against.
+    fn seed_clean_verdict(&self, key: &ArtifactKey) {
+        VerdictStore::new(self.db.clone())
+            .put(key, &Verdict::Clean, &self.fingerprint)
+            .expect("seed the index gate's clean verdict");
+    }
+
     /// The verdict stored for one artifact, under this harness's policy
     /// fingerprint.
     fn stored_verdict(&self, key: &ArtifactKey) -> Option<Verdict> {
@@ -467,7 +507,7 @@ fn upstream_download_path(name: &str, vers: &str) -> String {
 #[tokio::test]
 async fn the_first_download_of_a_clean_artifact_runs_plugins_and_serves_the_bytes() {
     let v = version("demo-crate", "1.0.0");
-    let harness = Harness::start("demo-crate", &[&v], Behaviour::Clean).await;
+    let harness = Harness::start_index_approved("demo-crate", &[&v], Behaviour::Clean).await;
     harness.server.reset().await;
     mount(&harness.server, "demo-crate", &[&v]).await;
 
@@ -513,7 +553,7 @@ async fn the_download_route_takes_precedence_over_the_catch_all_index_route() {
     // a 400 (the path is not a valid index path) and would never reach the
     // plugin gate.
     let v = version("demo-crate", "1.0.0");
-    let harness = Harness::start("demo-crate", &[&v], Behaviour::Clean).await;
+    let harness = Harness::start_index_approved("demo-crate", &[&v], Behaviour::Clean).await;
 
     let (download_status, download_type, _, _) =
         harness.get(&download_target("demo-crate", "1.0.0")).await;
@@ -539,7 +579,7 @@ async fn the_download_route_takes_precedence_over_the_catch_all_index_route() {
 #[tokio::test]
 async fn a_plugin_refusal_is_a_403_with_a_reason_phrase_and_a_why_link() {
     let v = version("demo-crate", "1.0.0");
-    let harness = Harness::start(
+    let harness = Harness::start_index_approved(
         "demo-crate",
         &[&v],
         Behaviour::Block("malware found".to_string()),
@@ -583,7 +623,7 @@ async fn a_plugin_refusal_is_a_403_with_a_reason_phrase_and_a_why_link() {
 #[tokio::test]
 async fn a_second_download_of_the_same_artifact_does_not_re_run_plugins() {
     let v = version("demo-crate", "1.0.0");
-    let harness = Harness::start("demo-crate", &[&v], Behaviour::Clean).await;
+    let harness = Harness::start_index_approved("demo-crate", &[&v], Behaviour::Clean).await;
     let target = download_target("demo-crate", "1.0.0");
 
     let (first_status, _, _, first_body) = harness.get(&target).await;
@@ -617,7 +657,7 @@ async fn two_concurrent_first_downloads_of_the_same_artifact_only_run_the_plugin
     // once, rather than the first completing (and caching its verdict)
     // before the second even starts.
     let v = version("demo-crate", "1.0.0");
-    let harness = Harness::start(
+    let harness = Harness::start_index_approved(
         "demo-crate",
         &[&v],
         Behaviour::SlowThenClean(Duration::from_millis(200)),
@@ -663,7 +703,7 @@ async fn two_concurrent_first_downloads_of_the_same_artifact_only_run_the_plugin
 #[tokio::test]
 async fn a_second_download_re_verifies_the_hash_when_the_cache_entry_is_gone() {
     let v = version("demo-crate", "1.0.0");
-    let harness = Harness::start("demo-crate", &[&v], Behaviour::Clean).await;
+    let harness = Harness::start_index_approved("demo-crate", &[&v], Behaviour::Clean).await;
     let target = download_target("demo-crate", "1.0.0");
 
     let (first_status, _, _, _) = harness.get(&target).await;
@@ -707,7 +747,16 @@ async fn a_second_download_re_verifies_the_hash_when_the_cache_entry_is_gone() {
 async fn a_hash_mismatch_is_refused_and_nothing_is_stored() {
     let good = version("demo-crate", "1.0.0");
     let lying = with_wrong_cksum(version("demo-crate", "1.0.0"));
-    let harness = Harness::start("demo-crate", &[&lying], Behaviour::Clean).await;
+    // Allowlisted, so the request reaches the integrity check on the
+    // allowlist override rather than on a stored verdict. A seeded verdict
+    // would make the "nothing is stored" assertion below vacuous.
+    let harness = Harness::start_with("demo-crate", &[&lying], Behaviour::Clean, |cfg| {
+        cfg.allowlist = vec![AllowEntry {
+            package: "demo-crate".to_string(),
+            version: "1.0.0".to_string(),
+        }];
+    })
+    .await;
 
     let (status, _, _, body) = harness.get(&download_target("demo-crate", "1.0.0")).await;
     assert_eq!(
@@ -738,10 +787,18 @@ async fn a_hash_mismatch_is_refused_and_nothing_is_stored() {
 #[tokio::test]
 async fn a_plugin_that_could_not_run_is_a_503_not_a_stored_block() {
     let v = version("demo-crate", "1.0.0");
-    let harness = Harness::start(
+    // Allowlisted: this test is about what a plugin check that could not
+    // run leaves in the store, so it must start with no stored verdict.
+    let harness = Harness::start_with(
         "demo-crate",
         &[&v],
         Behaviour::CannotRun("no such sandbox namespace".to_string()),
+        |cfg| {
+            cfg.allowlist = vec![AllowEntry {
+                package: "demo-crate".to_string(),
+                version: "1.0.0".to_string(),
+            }];
+        },
     )
     .await;
     let target = download_target("demo-crate", "1.0.0");
@@ -811,4 +868,148 @@ async fn an_invalid_crate_name_is_400() {
     let (status, _, _, _) = harness.get("/crates/..%2Fetc/1.0.0/download").await;
     assert_eq!(status, 400, "a malformed crate name must be a 400");
     assert_eq!(harness.sandbox.calls(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The index gate is the admission (Task 12)
+// ---------------------------------------------------------------------------
+
+/// A version the sparse-index cascade never admitted has no stored
+/// verdict, so nothing has CVE-filtered it, age-checked it, or reviewed
+/// it. Downloading it and serving it on plugin-pass alone would hand a
+/// developer an artifact only one of the four checks ever saw.
+#[tokio::test]
+async fn a_version_the_index_cascade_never_approved_is_refused_without_a_download() {
+    let v = version("demo-crate", "1.0.0");
+    // Deliberately not `start_index_approved`: this is the version the
+    // cascade never reached, so there is no stored verdict for it.
+    let harness = Harness::start("demo-crate", &[&v], Behaviour::Clean).await;
+
+    let (status, _, _, body) = harness.get(&download_target("demo-crate", "1.0.0")).await;
+    assert_eq!(
+        status, 403,
+        "a version the index gate never admitted must be refused"
+    );
+    let body = String::from_utf8(body).expect("the refusal body is UTF-8");
+    assert!(
+        body.contains("not-index-approved"),
+        "the refusal must name the missing index-gate admission: {body}"
+    );
+
+    let status_line = harness
+        .status_line(&download_target("demo-crate", "1.0.0"))
+        .await;
+    assert!(
+        status_line.starts_with("HTTP/1.1 403 "),
+        "expected a 403 status line, got {status_line:?}"
+    );
+    assert!(
+        status_line.contains("not-index-approved"),
+        "the reason phrase must name the missing admission: {status_line:?}"
+    );
+
+    assert_eq!(
+        harness
+            .upstream_hits(&upstream_download_path("demo-crate", "1.0.0"))
+            .await,
+        0,
+        "a version with no stored verdict must not have its bytes fetched at all"
+    );
+    assert_eq!(
+        harness.sandbox.calls(),
+        0,
+        "the plugins must not run for a version the index gate never admitted"
+    );
+    assert_eq!(
+        harness.stored_verdict(&key("demo-crate", "1.0.0", &v.declared_cksum)),
+        None,
+        "a refused download must not leave a stored verdict"
+    );
+}
+
+/// The happy path: a version the cascade admitted has a stored `Clean`
+/// verdict, so it still reaches the plugins and is served.
+#[tokio::test]
+async fn an_index_approved_version_still_runs_the_plugins_and_is_served() {
+    let v = version("demo-crate", "1.0.0");
+    let harness = Harness::start_index_approved("demo-crate", &[&v], Behaviour::Clean).await;
+
+    let (status, content_type, _, body) =
+        harness.get(&download_target("demo-crate", "1.0.0")).await;
+    assert_eq!(
+        status, 200,
+        "an admitted, plugin-passing artifact is served"
+    );
+    assert_eq!(content_type.as_deref(), Some("application/gzip"));
+    assert_eq!(body, v.bytes, "the served bytes are upstream's .crate");
+    assert_eq!(
+        harness.sandbox.calls(),
+        1,
+        "the plugin gate still runs for an admitted but not yet plugin-checked artifact"
+    );
+    assert!(
+        harness.plugin_checked(&key("demo-crate", "1.0.0", &v.declared_cksum)),
+        "the served artifact's verdict must be marked plugin-checked"
+    );
+}
+
+/// The allowlist is an operator's explicit decision in the config. It
+/// stands in for the index gate's judgement checks, so a version with no
+/// stored verdict is still served when it is allowlisted — and the bytes
+/// still have to match the index `cksum`.
+#[tokio::test]
+async fn an_allowlisted_version_is_still_served_without_a_stored_verdict() {
+    let v = version("demo-crate", "1.0.0");
+    let harness = Harness::start_with("demo-crate", &[&v], Behaviour::Clean, |cfg| {
+        cfg.allowlist = vec![AllowEntry {
+            package: "demo-crate".to_string(),
+            version: "1.0.0".to_string(),
+        }];
+    })
+    .await;
+
+    assert_eq!(
+        harness.stored_verdict(&key("demo-crate", "1.0.0", &v.declared_cksum)),
+        None,
+        "this test only means something without a stored verdict to fall back on"
+    );
+
+    let (status, content_type, _, body) =
+        harness.get(&download_target("demo-crate", "1.0.0")).await;
+    assert_eq!(
+        status, 200,
+        "the allowlist override must still serve a version the index gate never admitted"
+    );
+    assert_eq!(content_type.as_deref(), Some("application/gzip"));
+    assert_eq!(body, v.bytes, "the served bytes are upstream's .crate");
+    assert_eq!(
+        harness.sandbox.calls(),
+        1,
+        "the allowlist lifts the judgement checks, never the plugin gate"
+    );
+}
+
+/// A version the index does not list is a 404 even when the crate is
+/// allowlisted: the allowlist cannot invent a `cksum` to verify against.
+#[tokio::test]
+async fn an_allowlisted_version_the_index_never_published_is_404() {
+    let v = version("demo-crate", "1.0.0");
+    let harness = Harness::start_with("demo-crate", &[&v], Behaviour::Clean, |cfg| {
+        cfg.allowlist = vec![AllowEntry {
+            package: "demo-crate".to_string(),
+            version: "9.9.9".to_string(),
+        }];
+    })
+    .await;
+
+    let (status, _, _, _) = harness.get(&download_target("demo-crate", "9.9.9")).await;
+    assert_eq!(status, 404);
+    assert_eq!(harness.sandbox.calls(), 0);
+    assert_eq!(
+        harness
+            .upstream_hits(&upstream_download_path("demo-crate", "9.9.9"))
+            .await,
+        0,
+        "a version the index does not list is never downloaded"
+    );
 }

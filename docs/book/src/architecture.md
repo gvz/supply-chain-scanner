@@ -2,7 +2,9 @@
 
 One Rust crate, one process, one SQLite file. This chapter gives the tour. The following chapters go deep on each part.
 
-Editable draw.io diagrams of everything below live in [`docs/diagrams/`](../../diagrams/). They are the fastest way to see the shape of the system, and they are kept in step with the code: start with `01-system-overview.drawio`.
+![System overview](diagrams/png/01-system-overview.png)
+
+Editable draw.io diagrams of everything below live in [`docs/diagrams/`](../../diagrams/). They are the fastest way to see the shape of the system, and they are kept in step with the code: start with `01-system-overview.drawio`. Rendered copies of all eight are collected in [Appendix D — Diagrams](./diagrams.md).
 
 ## The crate
 
@@ -39,6 +41,8 @@ src/
 Schema changes go through ordered migrations in `src/db/migrations.rs`. Each migration runs exactly once, inside a transaction, tracked by a `schema_version` table. Appending is a one-line change. Applied migrations are never edited.
 
 All stores run inside `spawn_blocking` on the caller side — the async runtime never stalls on SQLite.
+
+![Data model](diagrams/png/06-data-model.png)
 
 ## The decision path
 

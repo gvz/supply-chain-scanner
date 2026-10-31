@@ -54,3 +54,14 @@ for src in "${sources[@]}"; do
         "$src" 2>&1 | grep -v 'dbus\|Failed to connect' || true
     echo "built png/$name.png"
 done
+
+# The book serves its own copy of every image. mdbook copies assets out of a
+# book's `src/` directory and will not follow a symlink to them, so the bytes
+# have to exist there. Copying here rather than by hand keeps the two in step:
+# a rebuild can never leave the book showing an older render.
+book_dir="$here/../book/src/diagrams/png"
+if [ -d "$here/../book/src" ]; then
+    mkdir -p "$book_dir"
+    cp "$out"/*.png "$book_dir"/
+    echo "copied $(ls "$out"/*.png | wc -l) images into docs/book/src/diagrams/png"
+fi

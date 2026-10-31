@@ -2,6 +2,8 @@
 
 `src/ecosystem/pypi/` — everything that speaks PyPI's protocols. This is the code that later sits behind an `Ecosystem` trait so npm and cargo can be added without touching the rest of the system.
 
+![PyPI request flow](diagrams/png/03-flow-pypi.png)
+
 ## The simple index (PEP 503)
 
 `src/ecosystem/pypi/index.rs` parses and renders **PEP 503 "simple" index pages**: plain HTML, one `<a>` tag per artifact file.

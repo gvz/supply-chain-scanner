@@ -27,3 +27,4 @@
 - [A. Configuration reference](./config-reference.md)
 - [B. The plugin contract](./plugin-contract.md)
 - [C. Roadmap](./roadmap.md)
+- [D. Diagrams](./diagrams.md)

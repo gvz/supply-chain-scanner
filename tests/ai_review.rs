@@ -916,3 +916,140 @@ fn the_collector_cannot_reach_the_network_from_inside_the_sandbox() {
         "the collector spec must not weaken the sandbox's network isolation"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 7: the install-commands section of the review request
+// ---------------------------------------------------------------------------
+//
+// These exercise `build_request` directly rather than through the
+// reviewer: the section's placement and wording is a property of the
+// request builder, independent of the sandbox or the provider.
+
+/// A payload with the given install commands and files, and coverage
+/// figures derived from the files alone (the install commands never
+/// contribute to them).
+fn payload_with(
+    install_commands: Vec<supply_chain_scanner::ecosystem::install_surface::InstallCommand>,
+    files: Vec<supply_chain_scanner::ai::collect::CollectedFile>,
+) -> supply_chain_scanner::ai::collect::CollectedPayload {
+    let total: u64 = files.iter().map(|f| f.content.len() as u64).sum();
+    supply_chain_scanner::ai::collect::CollectedPayload {
+        collector_version: supply_chain_scanner::ai::collect::COLLECTOR_VERSION.to_string(),
+        install_commands,
+        files,
+        reviewable_bytes_total: total,
+        reviewable_bytes_sent: total,
+        skipped_reviewable: Vec::new(),
+        opaque_executables: Vec::new(),
+        opaque_data_bytes: 0,
+        install_surface_complete: true,
+    }
+}
+
+fn install_command(
+    hook: &str,
+    command: &str,
+) -> supply_chain_scanner::ecosystem::install_surface::InstallCommand {
+    supply_chain_scanner::ecosystem::install_surface::InstallCommand {
+        hook: hook.to_string(),
+        command: command.to_string(),
+    }
+}
+
+fn request_user_content(request: &serde_json::Value) -> &str {
+    request["messages"][1]["content"]
+        .as_str()
+        .expect("the user message content is a string")
+}
+
+fn request_system_content(request: &serde_json::Value) -> &str {
+    request["messages"][0]["content"]
+        .as_str()
+        .expect("the system message content is a string")
+}
+
+#[test]
+fn the_request_flags_install_commands_ahead_of_the_file_blocks() {
+    use supply_chain_scanner::ai::collect::CollectedFile;
+    use supply_chain_scanner::ai::prompt::build_request;
+
+    let payload = payload_with(
+        vec![install_command("postinstall", "node post.js")],
+        vec![CollectedFile {
+            path: "package/index.js".to_string(),
+            install_surface: true,
+            content: "module.exports = 1;\n".to_string(),
+        }],
+    );
+
+    let request = build_request("test-model", 512, &key(), &payload);
+    let user = request_user_content(&request);
+    let nonce = user
+        .lines()
+        .find_map(|line| line.strip_prefix("File block nonce for this review: "))
+        .expect("the user message must state a file block nonce");
+
+    let hook_pos = user
+        .find("postinstall: node post.js")
+        .expect("the hook name and its literal command text must appear in the request");
+    let begin_install_pos = user
+        .find(&format!("BEGIN INSTALL COMMANDS {nonce}"))
+        .expect("a real install-commands boundary must appear");
+    let file_pos = user
+        .find(&format!("BEGIN FILE {nonce}"))
+        .expect("a real file block must still follow");
+    assert!(
+        begin_install_pos < file_pos && hook_pos < file_pos,
+        "the install-commands section must appear ahead of the file blocks"
+    );
+    assert!(
+        user.to_lowercase().contains("automatically"),
+        "the section must say the commands run automatically at install time"
+    );
+}
+
+#[test]
+fn the_request_omits_the_section_when_there_are_no_install_commands() {
+    use supply_chain_scanner::ai::collect::CollectedFile;
+    use supply_chain_scanner::ai::prompt::build_request;
+
+    let payload = payload_with(
+        Vec::new(),
+        vec![CollectedFile {
+            path: "demo/__init__.py".to_string(),
+            install_surface: false,
+            content: "VERSION = '1.0.0'\n".to_string(),
+        }],
+    );
+
+    let request = build_request("test-model", 512, &key(), &payload);
+    let user = request_user_content(&request);
+    let nonce = user
+        .lines()
+        .find_map(|line| line.strip_prefix("File block nonce for this review: "))
+        .expect("the user message must state a file block nonce");
+
+    assert!(
+        !user.contains(&format!("BEGIN INSTALL COMMANDS {nonce}")),
+        "an empty install_commands list must produce no section boundary at all"
+    );
+    assert!(
+        !user.contains("Install commands."),
+        "an empty install_commands list must produce no section heading"
+    );
+}
+
+#[test]
+fn the_system_prompt_tells_the_model_install_commands_run_automatically() {
+    use supply_chain_scanner::ai::prompt::build_request;
+
+    let payload = payload_with(Vec::new(), Vec::new());
+    let request = build_request("test-model", 512, &key(), &payload);
+    let system = request_system_content(&request);
+
+    assert!(
+        system.to_lowercase().contains("install")
+            && system.to_lowercase().contains("automatically"),
+        "the system prompt must tell the model install commands run automatically, got {system:?}"
+    );
+}

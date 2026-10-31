@@ -748,6 +748,7 @@ mod tests {
     fn parse_collector_output_accepts_a_valid_payload() {
         let payload = collect::CollectedPayload {
             collector_version: collect::COLLECTOR_VERSION.to_string(),
+            install_commands: Vec::new(),
             files: vec![collect::CollectedFile {
                 path: "setup.py".to_string(),
                 install_surface: true,

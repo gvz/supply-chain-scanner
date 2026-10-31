@@ -15,11 +15,11 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ecosystem::install_surface::InstallSurface;
+use crate::ecosystem::install_surface::{InstallCommand, InstallSurface};
 
 /// Version of the collector's file-selection logic. It joins the policy
 /// fingerprint, so any change here re-reviews every artifact.
-pub const COLLECTOR_VERSION: &str = "2";
+pub const COLLECTOR_VERSION: &str = "3";
 
 /// What the collector can do with one file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +273,17 @@ pub struct FileSize {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CollectedPayload {
     pub collector_version: String,
+    /// Commands the package declares that run automatically at install
+    /// time (currently populated for npm only, from `package.json`'s
+    /// `scripts`), in the ecosystem's own execution order. Unlike
+    /// `files`, this list is never subject to `max_payload_bytes`: it
+    /// is small and it is the highest-signal content in the review, so
+    /// it is always collected and sent in full. Its bytes play no part
+    /// in `reviewable_bytes_total` or `reviewable_bytes_sent` -- those
+    /// figures describe file content only, and folding a non-file
+    /// section into them would corrupt the coverage the reviewer's
+    /// threshold gate depends on.
+    pub install_commands: Vec<InstallCommand>,
     /// The reviewable files in send order: install-surface files first,
     /// then the remainder by descending suspicion score.
     pub files: Vec<CollectedFile>,
@@ -321,11 +332,14 @@ impl Entry {
 /// Builds the size-capped review payload for one unpacked package.
 ///
 /// `root` is the package root as the sandbox mounts it. `surface`
-/// decides which paths run at install or import time. Selection takes
-/// install-surface files first, then the remainder by descending
-/// suspicion score, and sends each chosen file whole while the running
-/// total of content bytes stays within `max_payload_bytes`. A file that
-/// never arrives whole is never read at all.
+/// decides which paths run at install or import time, and which
+/// commands (if any) run automatically at install time regardless of
+/// path. Selection takes install-surface files first, then the
+/// remainder by descending suspicion score, and sends each chosen file
+/// whole while the running total of content bytes stays within
+/// `max_payload_bytes`. A file that never arrives whole is never read
+/// at all. `surface.install_commands` is collected separately and is
+/// never subject to that cap.
 ///
 /// Returns an error only when the walk itself fails, for example on a
 /// unreadable directory. A package with no reviewable source yields an
@@ -431,6 +445,7 @@ pub fn collect(
 
     Ok(CollectedPayload {
         collector_version: COLLECTOR_VERSION.to_string(),
+        install_commands: surface.install_commands(root),
         files,
         reviewable_bytes_total: total,
         reviewable_bytes_sent: sent as u64,

@@ -1,0 +1,98 @@
+<mxfile host="app.diagrams.net" agent="supply-chain-scanner" version="24.0.0">
+  <diagram id="data-model" name="6. Data Model">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1150" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="Durable State — SQLite Schema" style="text;html=1;align=left;verticalAlign=middle;fontSize=22;fontStyle=1;fontColor=#1a1a1a;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="800" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" value="One SQLite file holds every table. Migrations are numbered and applied in order; schema_version tracks progress." style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="58" width="1100" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="verdicts" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;verticalAlign=top;align=left;fontStyle=1;fontSize=12;spacingLeft=10;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="60" y="110" width="420" height="250" as="geometry" />
+        </mxCell>
+        <mxCell id="verdicts_t" value="verdicts — the cache that makes a scan happen once" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#375623;" vertex="1" parent="1">
+          <mxGeometry x="72" y="118" width="400" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="verdicts_c" value="why_id          TEXT PRIMARY KEY&#10;ecosystem       TEXT&#10;package         TEXT&#10;version         TEXT&#10;filename        TEXT&#10;sha256          TEXT      (declared digest, any algorithm)&#10;blocked         INTEGER&#10;reason_code     TEXT&#10;reason_detail   TEXT&#10;fingerprint     TEXT      (policy fingerprint it was decided under)&#10;scanned_at      INTEGER&#10;plugin_checked  INTEGER   (migration 5: admitted vs fully scanned)&#10;&#10;UNIQUE(ecosystem, package, version, filename, sha256)" style="text;html=1;align=left;verticalAlign=top;fontFamily=Courier New;fontSize=10;fontColor=#1a1a1a;spacingLeft=2;" vertex="1" parent="1">
+          <mxGeometry x="72" y="146" width="400" height="200" as="geometry" />
+        </mxCell>
+
+        <mxCell id="reviews" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;verticalAlign=top;align=left;spacingLeft=10;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="520" y="110" width="420" height="250" as="geometry" />
+        </mxCell>
+        <mxCell id="reviews_t" value="reviews — the AI audit trail, read by /api/reviews and /why" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#375623;" vertex="1" parent="1">
+          <mxGeometry x="532" y="118" width="400" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="reviews_c" value="id                      INTEGER PRIMARY KEY&#10;ecosystem, package, version, filename, sha256&#10;fingerprint             TEXT&#10;verdict                 TEXT&#10;blocked                 INTEGER&#10;summary                 TEXT&#10;findings_json           TEXT&#10;coverage                REAL&#10;reviewable_bytes_total  INTEGER&#10;reviewable_bytes_sent   INTEGER&#10;opaque_json             TEXT&#10;reviewed_paths_json     TEXT&#10;model                   TEXT&#10;prompt_version          TEXT&#10;collector_version       TEXT&#10;reviewed_at             INTEGER" style="text;html=1;align=left;verticalAlign=top;fontFamily=Courier New;fontSize=10;fontColor=#1a1a1a;spacingLeft=2;" vertex="1" parent="1">
+          <mxGeometry x="532" y="146" width="400" height="200" as="geometry" />
+        </mxCell>
+
+        <mxCell id="advisories" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;strokeWidth=2;verticalAlign=top;align=left;spacingLeft=10;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="60" y="400" width="420" height="270" as="geometry" />
+        </mxCell>
+        <mxCell id="advisories_t" value="advisories + children — the local OSV mirror" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#9c2b25;" vertex="1" parent="1">
+          <mxGeometry x="72" y="408" width="400" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="advisories_c" value="advisories&#10;  ecosystem, id, package        PRIMARY KEY&#10;  summary, severity, fixed_versions&#10;&#10;advisory_versions          (enumerated affected versions)&#10;  ecosystem, advisory_id, package, version&#10;&#10;advisory_ranges            (introduced / fixed bounds)&#10;  ecosystem, advisory_id, package, introduced, fixed&#10;&#10;Both children carry&#10;  FOREIGN KEY ... ON DELETE CASCADE&#10;so a withdrawn advisory's versions and ranges&#10;never outlive the advisory itself." style="text;html=1;align=left;verticalAlign=top;fontFamily=Courier New;fontSize=10;fontColor=#1a1a1a;spacingLeft=2;" vertex="1" parent="1">
+          <mxGeometry x="72" y="436" width="400" height="220" as="geometry" />
+        </mxCell>
+
+        <mxCell id="cargovet" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;strokeWidth=2;verticalAlign=top;align=left;spacingLeft=10;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="520" y="400" width="420" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="cargovet_t" value="cargo_vet_audits — the cargo fast path's proof store" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#9c2b25;" vertex="1" parent="1">
+          <mxGeometry x="532" y="408" width="400" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="cargovet_c" value="source         TEXT&#10;package        TEXT&#10;version        TEXT&#10;who_json       TEXT&#10;criteria_json  TEXT&#10;&#10;PRIMARY KEY(source, package, version, who_json)&#10;&#10;One row per full audit per source. The key includes&#10;the auditor, because covers() filters on who signed it.&#10;Delta audits are dropped rather than stored: resolving&#10;a delta chain back to a full audit is out of scope." style="text;html=1;align=left;verticalAlign=top;fontFamily=Courier New;fontSize=10;fontColor=#1a1a1a;spacingLeft=2;" vertex="1" parent="1">
+          <mxGeometry x="532" y="436" width="400" height="140" as="geometry" />
+        </mxCell>
+
+        <mxCell id="caches" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;verticalAlign=top;align=left;spacingLeft=10;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="520" y="620" width="420" height="200" as="geometry" />
+        </mxCell>
+        <mxCell id="caches_t" value="Caches — performance only, never a decision" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#1f4e79;" vertex="1" parent="1">
+          <mxGeometry x="532" y="628" width="400" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="caches_c" value="artifact_cache   (metadata only; bytes live on disk)&#10;  sha256  PRIMARY KEY   -- content-addressed, not per package&#10;  ecosystem, package, version, filename, bytes, last_access&#10;&#10;index_cache       (PyPI simple index pages)&#10;  package PRIMARY KEY, body, fetched_at&#10;&#10;A cache hit is only as good as the hash that admitted it.&#10;A cache read error is never fatal: it falls through to a&#10;fresh download. Cache failure cannot change a verdict." style="text;html=1;align=left;verticalAlign=top;fontFamily=Courier New;fontSize=10;fontColor=#1a1a1a;spacingLeft=2;" vertex="1" parent="1">
+          <mxGeometry x="532" y="656" width="400" height="160" as="geometry" />
+        </mxCell>
+
+        <mxCell id="note_fp" value="The fingerprint column is the invalidation mechanism. Every verdict records the policy fingerprint it was decided under, so changing the CVE line, the plugins, the AI model, the prompt or collector version, or an ecosystem's release-age threshold re-keys every row and forces a rescan. Changing the allowlist deliberately does NOT change the fingerprint: it narrows trust rather than changing what is checked." style="text;html=1;align=left;verticalAlign=top;fontSize=11;fontColor=#666666;whiteSpace=wrap;" vertex="1" parent="1">
+          <mxGeometry x="60" y="860" width="880" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="legend" value="Legend" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="1000" y="620" width="200" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="lg1" value="decision state" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1000" y="650" width="150" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="lg2" value="check input" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1000" y="696" width="150" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="lg3" value="cache" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1000" y="742" width="150" height="36" as="geometry" />
+        </mxCell>
+
+        <mxCell id="rel1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#82b366;strokeWidth=2;endArrow=block;endFill=1;dashed=1;" edge="1" parent="1" source="verdicts" target="reviews">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="rel1_l" value="same artifact&#10;identity columns" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#375623;" vertex="1" connectable="0" parent="rel1">
+          <mxGeometry x="0.1" relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="rel2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="advisories" target="reviews">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="rel2_l" value="advisory lookup decides&#10;a CVE block before review" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#9c2b25;" vertex="1" connectable="0" parent="rel2">
+          <mxGeometry x="0.1" relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

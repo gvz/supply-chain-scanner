@@ -1,0 +1,128 @@
+<mxfile host="app.diagrams.net" agent="supply-chain-scanner" version="24.0.0">
+  <diagram id="deployment" name="8. Deployment and Startup">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1250" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="Deployment, Startup and Ongoing Work" style="text;html=1;align=left;verticalAlign=middle;fontSize=22;fontStyle=1;fontColor=#1a1a1a;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="900" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" value="One binary, three deployments. Startup is fail-closed: any error returns Err instead of a process running fewer checks than the config asked for." style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="58" width="1250" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="cfg" value="config file" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;align=center;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="60" y="130" width="150" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="validate" value="Config::load + validate&#10;rejects more than one&#10;ecosystem table, naming both" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="260" y="120" width="190" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="dispatch" value="three-way dispatch on&#10;(npm_registry, cargo_registry)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;align=center;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="500" y="120" width="230" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#333333;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="cfg" target="validate">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#333333;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="validate" target="dispatch">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="deploy_pypi" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;strokeWidth=2;verticalAlign=top;align=left;spacingLeft=10;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="60" y="260" width="340" height="300" as="geometry" />
+        </mxCell>
+        <mxCell id="deploy_pypi_t" value="PyPI — neither table present" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#1f4e79;" vertex="1" parent="1">
+          <mxGeometry x="72" y="268" width="300" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="deploy_pypi_c" value="bootstrap()&#10;&#10;SIGHUP reload SUPPORTED:&#10;watch_for_reload spawns a handler&#10;that rebuilds the policy, plugins,&#10;sandbox and AI reviewer atomically.&#10;A reload touching a restart-only&#10;field is rejected in full, naming&#10;the field.&#10;&#10;Reloadable: cve, plugins, allowlist,&#10;public_url, scan_budget, ai_review&#10;Restart-only: bind, db_path, cache_dir,&#10;upstream_url, advisory_source_url,&#10;advisory_sync_interval, cache_ttl,&#10;download, max_concurrent_scans" style="text;html=1;align=left;verticalAlign=top;fontFamily=Courier New;fontSize=10;fontColor=#1a1a1a;spacingLeft=2;" vertex="1" parent="1">
+          <mxGeometry x="72" y="296" width="320" height="250" as="geometry" />
+        </mxCell>
+
+        <mxCell id="deploy_cargo" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;verticalAlign=top;align=left;spacingLeft=10;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="430" y="260" width="340" height="300" as="geometry" />
+        </mxCell>
+        <mxCell id="deploy_cargo_t" value="cargo — [cargo_registry]" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#375623;" vertex="1" parent="1">
+          <mxGeometry x="442" y="268" width="300" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="deploy_cargo_c" value="bootstrap_cargo()&#10;&#10;Fail-closed order:&#10;  Db::open (migrations inside)&#10;  Policy::build  (plugin binary readable)&#10;  sandbox factory (bwrap present)&#10;  PluginRunner&#10;  build_ai_reviewer&#10;  ArtifactCache&#10;  two CargoUpstream clients&#10;  initial OSV sync for crates.io&#10;  initial cargo-vet sync_all&#10;  CargoScanner, state, router&#10;&#10;NO SIGHUP: logs a warning and&#10;installs no signal handler.&#10;&#10;Tickers: advisory, cargo-vet, cache eviction" style="text;html=1;align=left;verticalAlign=top;fontFamily=Courier New;fontSize=10;fontColor=#1a1a1a;spacingLeft=2;" vertex="1" parent="1">
+          <mxGeometry x="442" y="296" width="320" height="250" as="geometry" />
+        </mxCell>
+
+        <mxCell id="deploy_npm" value="" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;strokeWidth=2;verticalAlign=top;align=left;spacingLeft=10;spacingTop=6;" vertex="1" parent="1">
+          <mxGeometry x="800" y="260" width="360" height="300" as="geometry" />
+        </mxCell>
+        <mxCell id="deploy_npm_t" value="npm — [npm_registry]" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#9c5a00;" vertex="1" parent="1">
+          <mxGeometry x="812" y="268" width="300" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="deploy_npm_c" value="bootstrap_npm()&#10;&#10;Same fail-closed order as cargo, plus:&#10;  REQUIRES a usable [ai_review].&#10;  Absent OR present-but-disabled both&#10;  refuse startup, because npm has no&#10;  cargo-vet-shaped fast path, so&#10;  nothing could ever be forwarded.&#10;  Logs error! naming that, then bails.&#10;&#10;  -> NpmScanner, NpmAppState, npm_router&#10;&#10;NO SIGHUP: logs a warning and&#10;installs no signal handler.&#10;&#10;Tickers: npm OSV advisory, cache eviction" style="text;html=1;align=left;verticalAlign=top;fontFamily=Courier New;fontSize=10;fontColor=#1a1a1a;spacingLeft=2;" vertex="1" parent="1">
+          <mxGeometry x="812" y="296" width="340" height="250" as="geometry" />
+        </mxCell>
+
+        <mxCell id="ed_npm" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#d79b00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="dispatch" target="deploy_npm">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="ed_cargo" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#82b366;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="dispatch" target="deploy_cargo">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="ed_pypi" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#6c8ebf;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="dispatch" target="deploy_pypi">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="serve" value="serve(bind, router)&#10;axum::serve, HTTP/1.1 only" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=center;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="600" y="620" width="300" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="es1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#9673a6;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="deploy_pypi" target="serve">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="es2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#9673a6;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="deploy_cargo" target="serve">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="es3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#9673a6;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="deploy_npm" target="serve">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="tickers_t" value="BACKGROUND TICKERS (spawned after a successful bootstrap, before serving)" style="text;html=1;align=left;verticalAlign=middle;fontSize=13;fontStyle=1;fontColor=#1a1a1a;" vertex="1" parent="1">
+          <mxGeometry x="60" y="720" width="800" height="28" as="geometry" />
+        </mxCell>
+        <mxCell id="t1" value="advisory sync&#10;every advisory_sync_interval&#10;A failed sync keeps the existing mirror" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="60" y="760" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="t2" value="cargo-vet sync&#10;every cargo_vet_sync_interval&#10;One source failing keeps the others" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="320" y="760" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="t3" value="cache eviction&#10;every cache_ttl&#10;Sweeps expired artifact rows" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="580" y="760" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="t4" value="collector child process&#10;NOT a ticker: the same binary is&#10;re-executed inside the sandbox with&#10;the `collect` subcommand, and writes&#10;the payload JSON to stdout only" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="840" y="760" width="300" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="advisory_note" value="Why tickers exist at all: the advisory re-check runs on every request for an already-clean artifact, so an upstream outage must not become a proxy outage. On the intended startup order both stores sync before the listener binds, so a cold start already includes that download." style="text;html=1;align=left;verticalAlign=top;fontSize=11;fontColor=#666666;whiteSpace=wrap;" vertex="1" parent="1">
+          <mxGeometry x="60" y="860" width="880" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="failnote" value="Fail-closed in practice: a missing plugin binary, a non-executable plugin (Policy checks readable only, a known defect), an absent bwrap while plugins or AI review are configured, an unreachable advisory feed at first sync, or an npm deployment without a reviewer all stop startup rather than degrade it." style="text;html=1;align=left;verticalAlign=top;fontSize=11;fontColor=#b85450;whiteSpace=wrap;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="60" y="940" width="1080" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="legend" value="Legend" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="60" y="1020" width="200" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="lg1" value="PyPI deployment" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="60" y="1050" width="160" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="lg2" value="cargo deployment" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="235" y="1050" width="160" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="lg3" value="npm deployment" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="410" y="1050" width="160" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="lg4" value="periodic work" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="585" y="1050" width="160" height="36" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

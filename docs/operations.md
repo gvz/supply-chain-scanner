@@ -66,6 +66,13 @@ Turning the reviewer off changes the fingerprint too. It then matches the
 fingerprint of an unconfigured deployment, so each artifact needs a full
 rescan without a review step.
 
+An upgrade that bumps the collector or prompt version is therefore a one-off
+cost across every ecosystem at once, not just the one that motivated the bump.
+The npm support added JavaScript and TypeScript collection and an install-script
+section to the reviewer's request, and both bumps invalidate every stored
+verdict on every deployment. Expect one fresh provider call per artifact on the
+first request after such an upgrade, for PyPI, cargo and npm alike.
+
 **Restart-only** — a reload that changes any of these is *rejected by name* rather
 than silently ignored: `bind`, `db_path`, `cache_dir`, `upstream_url`,
 `advisory_source_url`, `advisory_sync_interval`, `cache_ttl`, `download`,
@@ -303,6 +310,13 @@ to `cache_dir` can replace a cached artifact's bytes and the proxy will serve th
 under a clean verdict. Plugins cannot do this — the sandbox binds nothing writable
 from the host — but the directory needs host-level protection.
 
+The cache holds a registry-declared digest of any algorithm this proxy verifies,
+not sha256 alone. The digest's own length distinguishes them: 40 hex characters
+is SHA-1, 64 is SHA-256, and 128 is SHA-512. npm publishes SHA-512 or SHA-1 and
+never SHA-256, so the npm deployment depends on this. The value is still a
+filesystem-path boundary. A digest of any other length, or one carrying an
+uppercase or non-hex byte, is rejected before it can reach a path.
+
 PEP 658 `.metadata` sidecars are passed through **unverified**, by design: they are
 inert metadata and the artifact itself is still gated. The proxy does not check the
 `data-core-metadata` hash it re-emits.
@@ -327,9 +341,11 @@ outage must not become a proxy outage.
 ## A minimum release age
 
 `min_release_age_days` (top-level, for the PyPI deployment; `cargo_registry.
-min_release_age_days` for a cargo deployment) refuses a file younger than the
-configured number of days since it was published. Unset (the default) turns
-the gate off entirely.
+min_release_age_days` for a cargo deployment; `npm_registry.min_release_age_days`
+for an npm deployment) refuses a file younger than the configured number of days
+since it was published. Unset (the default) turns the gate off entirely. Each
+deployment sets its own, so the three ecosystems can run different thresholds,
+or one with the gate on and another with it off.
 
 It is independent of CVE filtering and AI review/cargo-vet, and it is
 best-effort rather than fail-closed: see "What a reload invalidates" under
@@ -337,7 +353,10 @@ best-effort rather than fail-closed: see "What a reload invalidates" under
 why. On the PyPI side, the publish time comes from the PEP 700 JSON simple
 index (`Accept: application/vnd.pypi.simple.v1+json` against the same
 `upstream_url` already configured) — an index that predates PEP 700 never
-supplies it, and that file is simply never checked against this gate.
+supplies it, and that file is simply never checked against this gate. On the
+npm side, the publish time comes from the packument's own `time` map, which is
+one reason this proxy always fetches the full packument rather than the
+abbreviated one npm asks for.
 
 The gate is checked once, before CVE filtering, for a version with no stored
 verdict. It is never re-checked for a version that already has one: age only
@@ -573,6 +592,100 @@ decision, recorded in the config, and that is the right place for it.
 A cargo deployment has no reload, so an `[[allowlist]]` entry added for step 3
 takes effect at the next restart. Plan for that: a developer who hits the pin
 before the restart still cannot resolve it.
+
+## Running an npm deployment
+
+An npm deployment is this same binary with a different config file. One process
+serves one ecosystem. A config file that carries an `[npm_registry]` table is
+therefore the npm deployment. A config that carries `[cargo_registry]` is the
+cargo deployment, and a config that carries neither is the PyPI deployment. A
+config that carries both is rejected at load, naming both tables, because one
+process cannot be two deployments.
+
+**Settings and defaults.** Every default below comes from `src/config.rs`.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `upstream_registry_url` | required | The registry this proxy fetches package metadata from. Normally `https://registry.npmjs.org/`. |
+| `scan_budget` | 120s | How long one package metadata fetch may take, covering the whole cascade for that package. Deliberately far looser than the PyPI deployment's budget: npm's own client retries a 429 only twice, so a PyPI-shaped deadline would turn ordinary slowness into a hard install failure. npm's own `fetch-timeout` is 300s, so 120s leaves headroom. |
+| `max_packument_bytes` | 67108864 (64 MiB) | Hard cap on one packument's downloaded size. A body over the cap is refused before any parsing, against `Content-Length` when upstream supplies it and against the running byte total either way. |
+| `min_release_age_days` | unset (off) | The youngest a published version may be and still be forwarded, in days since npm published it. Independent of the top-level setting and of the cargo deployment's own. |
+
+The table is additive. The base fields stay required in an npm deployment,
+because one `Config` type parses every deployment. The npm path does not read
+`upstream_url`, but the field must still be present and valid.
+
+Set `advisory_source_url` to OSV's npm feed in an npm deployment. The default
+points at the PyPI feed. The mirrors are per ecosystem, so an npm deployment
+that keeps the default syncs the wrong advisory data.
+
+**`[ai_review]` is mandatory here.** There is no fast path past AI review on
+this deployment. The cargo path has a substitute, a qualifying cargo-vet audit
+signed by a trusted reviewer. npm has no equivalent, and the design leaves none
+open on purpose. An npm deployment configured without `[ai_review]` therefore
+cannot forward any version at all, and it refuses to start rather than serve a
+registry that can never answer.
+
+**The two gates.** A version reaches a forwarded packument only when all of the
+following hold. It is CVE-clean under `[cve]`. It is past the release-age
+threshold, or the operator allowlisted it. And AI review passed it, or the
+operator allowlisted it. The packument gate then forwards the newest such
+version per major line, newest line first, so ordinary resolution finds a
+candidate in each major. Deprecated versions are not excluded, because npm
+installs them routinely and excluding them would break ordinary resolution.
+
+The tarball gate runs after that, at the download. It admits a version only when
+the packument gate stored a passing verdict for it, and then it runs the org's
+plugin binaries over the unpacked tree. A version with no stored verdict is
+refused with a reason naming that the packument gate never admitted it. The
+download path never reviews inline. No tarball bytes are served for an artifact
+that has not passed CVE filtering, the release-age gate, AI review, and the
+plugins.
+
+**Where the gate sits.** Both gates are reached through the same `/{*path}`
+catch-all as the packument, which dispatches internally. The proxy's router
+library permits a catch-all only as the final path segment, so a tarball cannot
+have a route of its own. An operator reading request logs sees both kinds of
+artifact under one route prefix, and that is expected.
+
+**What a developer's machine needs.** Point npm at the proxy:
+
+```bash
+npm config set registry https://npm.scanner.example.internal/
+```
+
+Use this deployment's `public_url`. npm then resolves every package through the
+proxy and believes it is talking to the public registry. Scoped packages follow
+the same setting unless the org sets a scope-specific registry, and a
+scope-specific entry pointing at the public registry bypasses this proxy for
+that scope.
+
+The proxy always answers with the full packument shape, even when npm asks for
+the abbreviated one, because the release-age gate needs the `time` map the
+abbreviated form omits. A real npm client was verified to parse the full shape.
+
+**The audit endpoints answer 404.** npm's bulk-advisory and quick-audit requests
+are answered 404 and never forwarded. Proxying either would ship the org's entire
+dependency tree to the public registry on every install. npm treats the 404 as
+"no audit summary available" and continues. This deployment's own CVE gate blocks
+rather than reports, which is stronger coverage for the same purpose.
+
+**Shared routes.** `/healthz`, `/why/<id>`, `/api/reviews` and `/refusals` are
+served here as they are on the PyPI path, from the same code. `/-/ping` answers
+unconditionally and reads no state.
+
+## The npm lockfile the proxy cannot see
+
+A lockfile generated before the org adopted the proxy pins each package's
+`resolved` URL at the public registry. `npm ci` fetches those tarballs directly
+from that URL, so no gate applies to them. The proxy cannot intercept a request
+that is never sent to it.
+
+The operational fix is to regenerate the lockfile with the registry pointed at
+the proxy, and to commit that lockfile so every install uses it. The converse is
+worth knowing too. A lockfile made behind the proxy carries internal URLs, so it
+does not work for anyone outside the network. That is the intended trade, and it
+is why a lockfile is not portable across the boundary in either direction.
 
 ## Known defects, not yet fixed
 

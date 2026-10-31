@@ -129,3 +129,51 @@ max_artifact_bytes = 2147483648
 # Restart-only: this is baked into the scanner's internal semaphore once
 # at startup and cannot be changed by a SIGHUP reload.
 # max_concurrent_scans = 8
+
+# ---------------------------------------------------------------------------
+# npm registry deployment
+# ---------------------------------------------------------------------------
+#
+# A config file that carries an [npm_registry] table is the npm deployment.
+# One process serves one ecosystem, so [npm_registry] and [cargo_registry]
+# must never both be present; a config with both is rejected at load, naming
+# both tables.
+#
+# Every field below is optional except upstream_registry_url. The base fields
+# stay required, because one Config type parses every deployment: the npm path
+# does not read upstream_url, but the field must still be present and valid.
+#
+# [ai_review] is mandatory on this deployment. npm has no equivalent of
+# cargo-vet's audit fast path, so a version can only be forwarded after AI
+# review passes it. A deployment configured without a reviewer can forward
+# nothing, and it refuses to start rather than serve a registry that can never
+# answer.
+#
+# Set advisory_source_url to OSV's npm feed in a deployment that carries this
+# table. The default above points at the PyPI feed, and the mirrors are per
+# ecosystem.
+#
+# [npm_registry]
+# # The registry this proxy fetches package metadata from. Required.
+# upstream_registry_url = "https://registry.npmjs.org/"
+#
+# # How long one package metadata fetch may take, covering the whole cascade
+# # for that package. Optional — defaults to 120s. Deliberately looser than
+# # the top-level scan_budget: npm's client retries a 429 only twice, so a
+# # PyPI-shaped deadline would turn ordinary slowness into a hard install
+# # failure. npm's own fetch-timeout is 300s, so this leaves headroom.
+# scan_budget = "120s"
+#
+# # Hard cap, in bytes, on one packument's downloaded size. Optional —
+# # defaults to 67108864 (64 MiB). A body over the cap is refused before any
+# # parsing, against Content-Length when upstream supplies one and against the
+# # running byte total either way, because a truncated parse would drop
+# # versions indistinguishably from the gate removing them.
+# max_packument_bytes = 67108864
+#
+# # The youngest a published version may be and still be forwarded, in days
+# # since npm published it. Optional — omit it (or leave it unset) to turn
+# # this gate off. Best-effort, not a security gate like [cve] or AI review.
+# # Independent of the top-level setting and of the cargo deployment's own, so
+# # the three ecosystems can run different thresholds.
+# min_release_age_days = 7

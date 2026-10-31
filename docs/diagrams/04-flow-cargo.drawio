@@ -1,0 +1,300 @@
+<mxfile host="app.diagrams.net" agent="supply-chain-scanner" version="24.0.0">
+  <diagram id="cargo-flow" name="4. Cargo Two-Gate Flow">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1250" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="Supply Chain Scanner — The Cargo Two-Gate Flow" style="text;html=1;align=left;verticalAlign=middle;fontSize=22;fontStyle=1;fontColor=#1a1a1a;" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="900" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" value="A crate passes two gates, not one: the sparse index admits a version on metadata, and the .crate download admits bytes only for a version the index already admitted." style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="58" width="1300" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="clients" value="CARGO ON A DEVELOPER MACHINE" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#d6d6d6;verticalAlign=top;align=left;fontStyle=1;fontSize=12;fontColor=#666666;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="40" y="100" width="300" height="200" as="geometry" />
+        </mxCell>
+        <mxCell id="cargo_add" value="cargo add&#10;= metadata request only" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;align=center;" vertex="1" parent="1">
+          <mxGeometry x="70" y="135" width="240" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="cargo_build" value="cargo build / crate check&#10;= metadata, then bytes" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;align=center;" vertex="1" parent="1">
+          <mxGeometry x="70" y="215" width="240" height="55" as="geometry" />
+        </mxCell>
+
+        <mxCell id="routes" value="ROUTES THE PROXY ANSWERS" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="330" width="400" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="r_config" value="GET /config.json" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=center;" vertex="1" parent="1">
+          <mxGeometry x="40" y="360" width="290" height="38" as="geometry" />
+        </mxCell>
+        <mxCell id="r_index" value="GET /{*path}   (sparse index)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;align=center;" vertex="1" parent="1">
+          <mxGeometry x="40" y="406" width="290" height="38" as="geometry" />
+        </mxCell>
+        <mxCell id="r_refusals" value="/refusals" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;align=center;" vertex="1" parent="1">
+          <mxGeometry x="40" y="452" width="290" height="38" as="geometry" />
+        </mxCell>
+        <mxCell id="r_why" value="/why/{id}" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;align=center;" vertex="1" parent="1">
+          <mxGeometry x="40" y="498" width="290" height="38" as="geometry" />
+        </mxCell>
+        <mxCell id="r_reviews" value="/api/reviews" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;align=center;" vertex="1" parent="1">
+          <mxGeometry x="40" y="544" width="290" height="38" as="geometry" />
+        </mxCell>
+        <mxCell id="r_healthz" value="/healthz" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;align=center;" vertex="1" parent="1">
+          <mxGeometry x="40" y="590" width="290" height="38" as="geometry" />
+        </mxCell>
+        <mxCell id="routes_note" value="The three yellow routes are the compensating channel:&#10;they are where a reason lives, because the sparse-index&#10;protocol has nowhere to put one." style="text;html=1;align=left;verticalAlign=top;fontSize=11;fontColor=#666666;spacingLeft=2;" vertex="1" parent="1">
+          <mxGeometry x="40" y="645" width="290" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="phase1" value="PHASE 1 — SPARSE INDEX (exercised by cargo add)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#333333;strokeWidth=2;verticalAlign=top;align=left;fontStyle=1;fontSize=13;spacingLeft=12;" vertex="1" parent="1">
+          <mxGeometry x="390" y="100" width="830" height="470" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_step1" value="1. cargo asks /config.json&#10;Proxy advertises its OWN dl template,&#10;so .crate downloads come back to it" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="410" y="145" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_step2" value="2. cargo requests the crate's&#10;sparse index path&#10;GET /{*path}" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="680" y="145" width="240" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_step3" value="3. cascade (src/scan/cargo_cascade.rs + cargo.rs)&#10;runs the metadata gates over every candidate version" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="950" y="145" width="250" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p1_cve" value="CVE filter&#10;(OSV mirror, fail-closed)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="410" y="270" width="175" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_age" value="Release-age filter&#10;(best effort, off by default)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="605" y="270" width="175" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_allow" value="Allowlist override&#10;(narrows, never widens the cksum)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="800" y="270" width="175" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_ai" value="AI review&#10;OR a cargo-vet audit&#10;as substitute" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="995" y="270" width="205" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_pick" value="newest-per-major&#10;(one version chosen per major line)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="580" y="365" width="300" height="55" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p1_response" value="4. Response returns the surviving versions.&#10;Blocked versions are simply ABSENT — no row, no reason,&#10;no annotation. The sparse-index protocol has no place for a&#10;reason phrase, so cargo prints its own &quot;no matching version&quot;." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="410" y="440" width="480" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="p1_consequence" value="/refusals exists for exactly this.&#10;The index cannot carry the why, so the&#10;proxy publishes it on a separate route:&#10;code, package, version, filename, why_id." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="915" y="440" width="285" height="110" as="geometry" />
+        </mxCell>
+
+        <mxCell id="phase2" value="PHASE 2 — .crate DOWNLOAD (exercised by cargo build / check)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#333333;strokeWidth=2;verticalAlign=top;align=left;fontStyle=1;fontSize=13;spacingLeft=12;" vertex="1" parent="1">
+          <mxGeometry x="390" y="600" width="830" height="470" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_meta" value="METADATA APPROVAL FIRST&#10;CargoScanner::approved_for_download" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="410" y="645" width="250" height="65" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_meta_q" value="Does this exact version have an admitting&#10;index verdict, or an allowlist entry?" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="690" y="645" width="260" height="65" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_refuse" value="REFUSED: not-index-approved&#10;ZERO upstream fetches. ZERO plugin runs.&#10;A download is never a place to review inline." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="980" y="645" width="225" height="65" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p2_cksum" value="Digest verify&#10;against the index cksum" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="410" y="745" width="175" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_unpack" value="Unpack&#10;into the scan sandbox" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="605" y="745" width="175" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_plugins" value="Org plugins&#10;(fail-closed, sandboxed)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="800" y="745" width="175" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_coord" value="plugin_run_coordinator&#10;dedup by artifact sha256,&#10;FinishGuard taken first, so&#10;concurrent first downloads&#10;share ONE plugin run" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="995" y="730" width="205" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="p2_cache_q" value="Stored Clean verdict already marked plugin_checked?" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="410" y="840" width="290" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_serve" value="Serve from cache&#10;plugins are NOT re-run" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="410" y="930" width="290" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_fullscan" value="Full scan runs, verdict stored&#10;with plugin_checked set, then served" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="740" y="845" width="290" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="p2_bytes" value="artifact_cache&#10;verified bytes on disk" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="740" y="930" width="290" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="vetlane" value="cargo-vet FAST PATH (substitutes for AI review only)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;verticalAlign=top;align=left;fontStyle=1;fontSize=12;fontColor=#8a6d1b;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="1260" y="100" width="310" height="470" as="geometry" />
+        </mxCell>
+        <mxCell id="vet_q" value="A trusted source recorded an audit&#10;of THIS crate and version against&#10;required_criterion (default safe-to-deploy),&#10;and trusted_reviewers accepts the auditor?" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1280" y="145" width="270" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="vet_yes" value="YES → skip AI review.&#10;A human already read it.&#10;A qualifying audit from a trusted&#10;reviewer substitutes for the model." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1280" y="255" width="270" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="vet_never" value="NEVER substitutes for the CVE line.&#10;NEVER substitutes for the plugins.&#10;Those check different things from&#10;&quot;a person read this source&quot;, and a&#10;static trust database answers neither." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="1280" y="355" width="270" height="105" as="geometry" />
+        </mxCell>
+        <mxCell id="vet_note" value="The audit store is refreshed every&#10;cargo_vet_sync_interval (default 1h)&#10;from every configured source.&#10;Empty sources leave the fast path&#10;with no proof to consult." style="text;html=1;align=left;verticalAlign=top;fontSize=11;fontColor=#666666;spacingLeft=2;" vertex="1" parent="1">
+          <mxGeometry x="1280" y="475" width="270" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="notes" value="TWO THINGS THE SHAPE HIDES" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="740" width="320" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="note_flag" value="THE plugin_checked COLUMN&#10;A stored Clean row can mean either &quot;the index&#10;admitted this version&quot; or &quot;the plugins were run&#10;and passed over these bytes&quot;. Only the&#10;plugin_checked flag means the second. Without it&#10;a Clean row is an admission, not a scan — and it&#10;still owes the Phase 2 gates." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="770" width="320" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="note_allow" value="THE ALLOWLIST OVERRIDES&#10;CVE, release age, AI review and plugin blocks.&#10;It never overrides the cksum.&#10;Digest verification is not policy that an&#10;operator can waive: it answers whether these&#10;bytes are the bytes the index described." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;align=left;spacingLeft=8;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="905" width="320" height="120" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_add" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#333333;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="cargo_add" target="p1_step2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_add_label" value="sparse index&#10;request" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#333333;" vertex="1" connectable="0" parent="e_add">
+          <mxGeometry x="-0.2" relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_build" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#333333;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="cargo_build" target="p1_step2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_cfg" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#9673a6;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_step1" target="p1_step2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_cfg_label" value="dl points&#10;back here" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#9673a6;" vertex="1" connectable="0" parent="e_cfg">
+          <mxGeometry x="-0.1" relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_cascade" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_step2" target="p1_step3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_g1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_step3" target="p1_cve">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_g2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_cve" target="p1_age">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_g3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_age" target="p1_allow">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_g4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_allow" target="p1_ai">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_g5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_ai" target="p1_pick">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_resp" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#82b366;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_pick" target="p1_response">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_resp_label" value="only the survivors" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#82b366;" vertex="1" connectable="0" parent="e_resp">
+          <mxGeometry x="-0.1" relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_compensate" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#d6b656;strokeWidth=2;endArrow=block;endFill=1;dashed=1;" edge="1" parent="1" source="p1_response" target="p1_consequence">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_compensate_label" value="the why is&#10;published here" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#d6b656;" vertex="1" connectable="0" parent="e_compensate">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_to_refusals" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#d6b656;strokeWidth=2;endArrow=block;endFill=1;dashed=1;" edge="1" parent="1" source="p1_consequence" target="r_refusals">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_vet" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#d6b656;strokeWidth=2;endArrow=block;endFill=1;dashed=1;" edge="1" parent="1" source="p1_ai" target="vet_q">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_vet_label" value="consult&#10;audit store" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#d6b656;" vertex="1" connectable="0" parent="e_vet">
+          <mxGeometry x="-0.2" relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_vet_yes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#82b366;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="vet_q" target="vet_yes">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_vet_never" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=2;endArrow=block;endFill=1;endArrow=open;" edge="1" parent="1" source="vet_yes" target="vet_never">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e_phase" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#333333;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p1_step3" target="p2_meta">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_phase_label" value="cargo build asks for the .crate" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#333333;" vertex="1" connectable="0" parent="e_phase">
+          <mxGeometry x="-0.75" relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_meta" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_meta" target="p2_meta_q">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_refuse" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_meta_q" target="p2_refuse">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_refuse_label" value="NO" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#b85450;fontStyle=1;" vertex="1" connectable="0" parent="e_refuse">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_refuse_why" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#d6b656;strokeWidth=2;endArrow=block;endFill=1;dashed=1;" edge="1" parent="1" source="p2_refuse" target="r_why">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_approved" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#82b366;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_meta_q" target="p2_cksum">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_approved_label" value="YES" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#82b366;fontStyle=1;" vertex="1" connectable="0" parent="e_approved">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_unpack" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_cksum" target="p2_unpack">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_plugins" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_unpack" target="p2_plugins">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_coord" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#9673a6;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_plugins" target="p2_coord">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_cacheq" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_coord" target="p2_cache_q">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_cacheq_label" value="check the stored verdict" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#b85450;" vertex="1" connectable="0" parent="e_cacheq">
+          <mxGeometry x="-0.35" relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_serve" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#82b366;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_cache_q" target="p2_serve">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_serve_label" value="YES&#10;(Clean + plugin_checked)" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#82b366;" vertex="1" connectable="0" parent="e_serve">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_fullscan" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#b85450;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_cache_q" target="p2_fullscan">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_fullscan_label" value="NO / Clean without the flag" style="edgeLabel;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#b85450;" vertex="1" connectable="0" parent="e_fullscan">
+          <mxGeometry x="-0.1" relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_bytes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#82b366;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_fullscan" target="p2_bytes">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_serve_bytes" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#82b366;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="p2_serve" target="p2_bytes">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_reviews" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#d6b656;strokeWidth=2;endArrow=block;endFill=1;dashed=1;" edge="1" parent="1" source="p2_fullscan" target="r_reviews">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="legend" value="Legend" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1060" width="200" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="lg1" value="gate / refusal path" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1090" width="150" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="lg2" value="durable store / clean" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="205" y="1090" width="150" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="lg3" value="code layer" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="370" y="1090" width="150" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="lg4" value="note / operator page" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="535" y="1090" width="150" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="lg5" value="client / upstream protocol" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="700" y="1090" width="170" height="36" as="geometry" />
+        </mxCell>
+
+        <mxCell id="rule" value="The invariant: no .crate bytes are served for a version the index gate did not admit, and no version is admitted until CVE, release age and AI review (or a qualifying cargo-vet audit) have all passed it." style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1155" width="1300" height="30" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

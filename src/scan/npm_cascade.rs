@@ -18,10 +18,20 @@
 //!    `cargo_cascade::sort_newest_first`, which sorts such a version last
 //!    and keeps it — it cannot be grouped and is excluded from the
 //!    survivor set entirely.
-//! 2. Group survivors by semver major. `0.x` versions group by minor
-//!    instead, matching npm's caret semantics: `^0.2.0` does not accept
-//!    `0.3.0`, so `0.2.0` and `0.1.0` are effectively different "major"
-//!    lines.
+//! 2. Group survivors by semver major, except npm's caret operator does
+//!    not treat every version this way, so neither does this grouping:
+//!    - `major > 0`: group by major. `^1.2.3` means `>=1.2.3 <2.0.0`, so
+//!      every `1.x` version belongs together.
+//!    - `major == 0, minor > 0`: group by minor instead. `^0.2.3` means
+//!      `>=0.2.3 <0.3.0` — it spans patches within a minor but not across
+//!      one — so `0.2.0` and `0.1.0` are effectively different "major"
+//!      lines.
+//!    - `major == 0, minor == 0`: group by patch. `^0.0.3` means
+//!      `>=0.0.3 <0.0.4` — it accepts *only* `0.0.3`, nothing else — so
+//!      every `0.0.x` version is its own line; grouping these by minor
+//!      (i.e. all lumped into one `0.0` line) would let a newer `0.0.x`
+//!      patch silently shadow an older one that some dependent's
+//!      `^0.0.x` range needs and nothing else on the registry satisfies.
 //! 3. A survivor is *forwardable* if an operator allowlisted it or AI
 //!    review passed it. The allowlist is consulted first, the same
 //!    precedence the PyPI and cargo paths give a human sign-off: it
@@ -83,19 +93,33 @@ pub enum NpmNextStep {
     NeedsReview(String),
 }
 
-/// A major-version grouping key. `0.x` lines group by minor instead of
-/// major, matching npm's caret semantics.
+/// A major-version grouping key, matching npm's three-tier caret
+/// semantics (see the module docs, rule 2): non-zero majors group by
+/// major, `0.y` (`y > 0`) lines group by minor, and `0.0.z` lines group
+/// by patch — because `^0.0.z` accepts only that exact patch, so without
+/// this third tier every `0.0.x` version would wrongly share one line.
+///
+/// Each variant's payload is always drawn directly from the matching
+/// version's own major, minor, or patch field, and the three variants
+/// correspond to disjoint `(major, minor)` conditions. That is what keeps
+/// group ordering deterministic: two distinct keys can never describe
+/// groups whose newest members compare equal under [`Version::cmp`] (see
+/// [`plan_npm_cascade`]'s ordering comment for the full argument), so
+/// sorting lines by their newest member is a strict total order.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum MajorLine {
     Major(u64),
     ZeroMinor(u64),
+    ZeroPatch(u64),
 }
 
 fn major_line(version: &Version) -> MajorLine {
-    if version.major == 0 {
+    if version.major != 0 {
+        MajorLine::Major(version.major)
+    } else if version.minor != 0 {
         MajorLine::ZeroMinor(version.minor)
     } else {
-        MajorLine::Major(version.major)
+        MajorLine::ZeroPatch(version.patch)
     }
 }
 
@@ -126,10 +150,20 @@ pub fn plan_npm_cascade(input: &NpmCascadeInput) -> NpmNextStep {
     }
 
     // Visit major lines newest-first. Ordering by each line's own newest
-    // member is deterministic: two distinct lines can never share the
-    // same newest semver value, since that value's major (and, for a
-    // zero major, its minor) is exactly what makes the lines distinct in
-    // the first place — so this never depends on hash iteration order.
+    // member is deterministic even with three `MajorLine` variants in
+    // play: every member of a line was *assigned* to that line because
+    // its own major/minor/patch matched the key, so the line's newest
+    // member always carries the key's defining field(s) verbatim. Two
+    // distinct keys therefore always disagree on some field that
+    // `Version::cmp` consults before any field they might share —
+    // `Major(m)` vs `Major(m')` disagree on major; a `Major(m)` with
+    // `m > 0` outranks every zero-major key on major alone; `ZeroMinor`
+    // keys disagree on minor (and that minor is always non-zero, so it
+    // can never match a `ZeroPatch` line's minor of zero); `ZeroPatch`
+    // keys share major 0 and minor 0 but disagree on patch. So no two
+    // distinct lines can ever produce newest-member values that compare
+    // equal, which makes this sort a strict total order that never
+    // depends on `HashMap` iteration order.
     let mut ordered_lines: Vec<&Vec<(Version, String)>> = lines.values().collect();
     ordered_lines.sort_by(|a, b| b[0].0.cmp(&a[0].0));
 
@@ -364,6 +398,82 @@ mod tests {
             plan_npm_cascade(&input),
             NpmNextStep::Forward(vec!["0.2.0".to_string(), "0.1.0".to_string()]),
             "0.2.0 and 0.1.0 must both be forwarded as separate minor-keyed lines"
+        );
+    }
+
+    #[test]
+    fn a_zero_zero_patch_line_is_its_own_group() {
+        // ^0.0.3 means >=0.0.3 <0.0.4 — it accepts *only* 0.0.3. If
+        // 0.0.3 and 0.0.4 shared one "0.0" line the way 0.2.x shares one
+        // minor line, only 0.0.4 (the newest) would ever be forwarded,
+        // and a dependent on ^0.0.3 would find nothing — the exact
+        // whole-install failure this cascade exists to avoid. Grouping
+        // by patch for a zero major and zero minor keeps them separate.
+        let input = NpmCascadeInput {
+            versions: vec!["0.0.4".to_string(), "0.0.3".to_string()],
+            cve_blocked: HashSet::new(),
+            too_new: HashSet::new(),
+            review_status: HashMap::from([
+                ("0.0.4".to_string(), ReviewStatus::Passed),
+                ("0.0.3".to_string(), ReviewStatus::Passed),
+            ]),
+            allowlisted: HashSet::new(),
+        };
+        assert_eq!(
+            plan_npm_cascade(&input),
+            NpmNextStep::Forward(vec!["0.0.4".to_string(), "0.0.3".to_string()]),
+            "0.0.3 and 0.0.4 must both be forwarded as separate patch-keyed lines"
+        );
+    }
+
+    #[test]
+    fn a_prerelease_version_can_be_the_review_candidate() {
+        // A genuine prerelease tag (not just a low patch number) is not
+        // excluded from candidacy: with no release in its line at all,
+        // it is offered for review like any other unreviewed survivor.
+        let input = input(&["2.0.0-beta.1"]);
+        assert_eq!(
+            plan_npm_cascade(&input),
+            NpmNextStep::NeedsReview("2.0.0-beta.1".to_string())
+        );
+    }
+
+    #[test]
+    fn a_prerelease_shares_its_release_line_and_is_tried_after_it_fails_review() {
+        // 2.0.0-beta.1 and 2.0.0 share one major line (both major 2).
+        // semver orders the final release above its prerelease, so once
+        // 2.0.0 fails review the cascade falls through to the
+        // prerelease next, within the same line, rather than reporting
+        // the line exhausted.
+        let input = NpmCascadeInput {
+            versions: vec!["2.0.0".to_string(), "2.0.0-beta.1".to_string()],
+            cve_blocked: HashSet::new(),
+            too_new: HashSet::new(),
+            review_status: HashMap::from([("2.0.0".to_string(), ReviewStatus::Failed)]),
+            allowlisted: HashSet::new(),
+        };
+        assert_eq!(
+            plan_npm_cascade(&input),
+            NpmNextStep::NeedsReview("2.0.0-beta.1".to_string()),
+            "a prerelease must share its release's major line and be tried next within it"
+        );
+    }
+
+    #[test]
+    fn a_prerelease_version_can_be_forwarded_when_it_passes_review() {
+        // A prerelease is not barred from forwarding either: as the
+        // newest (and only) forwardable survivor in its line, it is
+        // forwarded exactly like a final release would be.
+        let input = NpmCascadeInput {
+            versions: vec!["2.0.0-beta.1".to_string()],
+            cve_blocked: HashSet::new(),
+            too_new: HashSet::new(),
+            review_status: HashMap::from([("2.0.0-beta.1".to_string(), ReviewStatus::Passed)]),
+            allowlisted: HashSet::new(),
+        };
+        assert_eq!(
+            plan_npm_cascade(&input),
+            NpmNextStep::Forward(vec!["2.0.0-beta.1".to_string()])
         );
     }
 

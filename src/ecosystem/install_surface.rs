@@ -193,6 +193,61 @@ const NPM_INSTALL_FILE_NAMES: &[&str] = &[
 /// local-path dependency.
 const NPM_INSTALL_HOOKS: &[&str] = &["preinstall", "install", "postinstall", "prepare"];
 
+/// Upper bound on how much of `package.json` [`NpmInstallSurface::
+/// install_commands`] will read looking for install scripts.
+///
+/// This section carries no cap of its own further downstream -- it is
+/// exempt from `max_payload_bytes` on purpose, so it can never lose to
+/// file content for space -- so the read itself must be the bound.
+/// A real `package.json`, even for a package with hundreds of
+/// dependencies, runs a few to a few tens of kilobytes; this leaves
+/// generous headroom for that while bounding a manifest crafted to be
+/// enormous for no reason but to make this read expensive. A file over
+/// this size is treated exactly like an unreadable one: no install
+/// commands are reported for it. That is no different in kind from what
+/// the ordinary file walk already does to an oversized file, which it
+/// also skips rather than reads (see `collect::collect`).
+const MAX_PACKAGE_JSON_READ_BYTES: u64 = 256 * 1024;
+
+/// Upper bound on one extracted command's length as it reaches the
+/// payload.
+///
+/// A real npm script is one shell line, well under a kilobyte even for
+/// an elaborate build step; this is generous enough that no honest
+/// script is ever cut, while bounding how much of a pathologically long
+/// script this cap-exempt, always-sent-in-full section can carry. A
+/// command longer than this is cut at the boundary and has
+/// [`truncation_marker`] appended, never cut silently: an attacker who
+/// put the interesting part of a command past this length must not get
+/// to hide it from the model by making the command long enough to run
+/// past an unmarked cut.
+const MAX_INSTALL_COMMAND_BYTES: usize = 4 * 1024;
+
+/// Appended to a command's text when [`MAX_INSTALL_COMMAND_BYTES`] cuts
+/// it short, naming how many bytes were removed. Its presence is what
+/// tells the model the command it is looking at is not the whole
+/// string, so a truncated tail reads as "there was more", never as a
+/// complete, shorter command.
+fn truncation_marker(removed_bytes: usize) -> String {
+    format!(" ...[truncated, {removed_bytes} more bytes removed]")
+}
+
+/// Returns `command` unchanged when it fits within
+/// [`MAX_INSTALL_COMMAND_BYTES`], or cut to that length (at a valid
+/// UTF-8 boundary, never mid-character) plus [`truncation_marker`]
+/// otherwise.
+fn truncate_command(command: &str) -> String {
+    if command.len() <= MAX_INSTALL_COMMAND_BYTES {
+        return command.to_string();
+    }
+    let mut cut = MAX_INSTALL_COMMAND_BYTES;
+    while cut > 0 && !command.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let removed = command.len() - cut;
+    format!("{}{}", &command[..cut], truncation_marker(removed))
+}
+
 /// The npm rules. `relative_path` must be relative to the unpacked
 /// tarball root, which always carries npm's own top-level `package/`
 /// wrapper; a path that is absolute or escapes the root answers
@@ -229,11 +284,23 @@ impl InstallSurface for NpmInstallSurface {
     }
 
     fn install_commands(&self, root: &Path) -> Vec<InstallCommand> {
-        // A missing file, a read error, unparseable JSON, a `scripts`
-        // field of the wrong shape, or no `scripts` field at all: every
-        // one of these is the ordinary case of a package with nothing
-        // to report here, not a reason to error out of the scan.
-        let Ok(text) = fs::read_to_string(root.join("package/package.json")) else {
+        let path = root.join("package/package.json");
+
+        // A size check before the read, exactly like the ordinary file
+        // walk's own cap: a file over the bound is skipped rather than
+        // read, so an oversized manifest never reaches memory here. A
+        // missing file reads as `Err` too, and falls into the same
+        // empty result as every other benign or malformed case below.
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.len() <= MAX_PACKAGE_JSON_READ_BYTES => {}
+            _ => return Vec::new(),
+        }
+
+        // A read error, unparseable JSON, a `scripts` field of the
+        // wrong shape, or no `scripts` field at all: every one of these
+        // is the ordinary case of a package with nothing to report
+        // here, not a reason to error out of the scan.
+        let Ok(text) = fs::read_to_string(&path) else {
             return Vec::new();
         };
         let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -255,7 +322,7 @@ impl InstallSurface for NpmInstallSurface {
                     .and_then(|command| command.as_str())
                     .map(|command| InstallCommand {
                         hook: hook.to_string(),
-                        command: command.to_string(),
+                        command: truncate_command(command),
                     })
             })
             .collect()

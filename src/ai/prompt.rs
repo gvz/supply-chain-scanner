@@ -142,7 +142,11 @@ fn file_delimiter_nonce() -> String {
 /// form as a file block, for the same reason: `payload` is
 /// package-authored and therefore untrusted, and only the fresh,
 /// unguessable nonce stops it from forging a section boundary of its
-/// own. File content and install-command text appear in the user
+/// own. Within that section, each command is rendered as a quoted,
+/// escaped JSON string rather than as raw text, so an embedded newline
+/// cannot turn one command into what reads as a second, forged line --
+/// a forged hook entry or a forged section boundary alike. File content
+/// and install-command text appear in the user
 /// message only, never in the system message, so package text can
 /// never override the instructions.
 pub fn build_request(
@@ -205,10 +209,20 @@ pub fn build_request(
 
     if !payload.install_commands.is_empty() {
         user.push_str(&format!(
-            "\nInstall commands. Each one runs automatically when the package is installed, without the developer invoking it, and needs the closest scrutiny in this review.\nBEGIN INSTALL COMMANDS {nonce}\n"
+            "\nInstall commands. Each one runs automatically when the package is installed, without the developer invoking it, and needs the closest scrutiny in this review. Each command is shown as a quoted, escaped JSON string, so an embedded newline in it cannot be mistaken for a new line of this message.\nBEGIN INSTALL COMMANDS {nonce}\n"
         ));
         for cmd in &payload.install_commands {
-            user.push_str(&format!("{}: {}\n", cmd.hook, cmd.command));
+            // The command is package-authored and therefore untrusted.
+            // Rendering it as one JSON-string literal, rather than as
+            // raw text after "hook: ", escapes any embedded newline (or
+            // quote, or control byte) into a literal "\n" and the like:
+            // it can never turn into a second line that reads as a
+            // forged hook entry or a forged section boundary, because
+            // the whole command stays on this one line no matter what
+            // bytes it contains.
+            let escaped = serde_json::to_string(&cmd.command)
+                .expect("a String always serializes to a JSON string");
+            user.push_str(&format!("{}: {escaped}\n", cmd.hook));
         }
         user.push_str(&format!("END INSTALL COMMANDS {nonce}\n"));
     }

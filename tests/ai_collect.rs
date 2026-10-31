@@ -524,3 +524,52 @@ fn collect_populates_install_commands_from_the_surface() {
         payload.reviewable_bytes_total
     );
 }
+
+#[test]
+fn npm_install_commands_is_empty_for_a_package_json_far_over_the_read_cap() {
+    let root = tempfile::tempdir().unwrap();
+    // Padding well beyond any reasonable read cap, in a field that has
+    // nothing to do with the scripts table itself, which stays
+    // perfectly ordinary.
+    let padding = "x".repeat(2 * 1024 * 1024);
+    write_file(
+        root.path(),
+        "package/package.json",
+        &format!(
+            r#"{{"name": "demo", "version": "1.0.0", "description": "{padding}", "scripts": {{"postinstall": "node post.js"}}}}"#
+        ),
+    );
+
+    assert!(
+        NpmInstallSurface.install_commands(root.path()).is_empty(),
+        "a package.json engineered to be enormous must not have its scripts read in full"
+    );
+}
+
+#[test]
+fn npm_install_commands_truncates_an_oversized_command_and_marks_it_visibly() {
+    let root = tempfile::tempdir().unwrap();
+    let huge_command = format!("node {}", "A".repeat(50_000));
+    write_package_json(
+        root.path(),
+        &format!(r#"{{"postinstall": "{huge_command}"}}"#),
+    );
+
+    let commands = NpmInstallSurface.install_commands(root.path());
+
+    assert_eq!(commands.len(), 1);
+    let rendered = &commands[0].command;
+    assert!(
+        rendered.len() < huge_command.len(),
+        "an oversized command must be cut, not carried in full"
+    );
+    let marker_pos = rendered
+        .find(" ...[truncated")
+        .expect("a cut command must say so explicitly rather than silently losing its tail");
+    let kept = &rendered[..marker_pos];
+    assert!(
+        huge_command.starts_with(kept),
+        "the kept text must be an unmodified prefix of the real command, got {kept:?}"
+    );
+    assert!(kept.len() < huge_command.len());
+}

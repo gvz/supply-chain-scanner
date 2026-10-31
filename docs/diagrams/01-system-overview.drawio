@@ -43,27 +43,27 @@
           <mxGeometry x="800" y="160" width="280" height="70" as="geometry" />
         </mxCell>
 
-        <mxCell id="gates" value="THE FIVE GATES, IN ORDER" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#666666;" vertex="1" parent="1">
-          <mxGeometry x="500" y="255" width="300" height="24" as="geometry" />
+        <mxCell id="gates" value="THE FIVE GATES, IN ORDER (PyPI full scan)" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="500" y="255" width="360" height="24" as="geometry" />
         </mxCell>
 
-        <mxCell id="g1" value="1. CVE line&#10;(OSV local mirror)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
-          <mxGeometry x="500" y="285" width="130" height="60" as="geometry" />
+        <mxCell id="g1" value="1. Release age&#10;(best effort)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="500" y="285" width="112" height="62" as="geometry" />
         </mxCell>
-        <mxCell id="g2" value="2. Release age&#10;(best effort)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
-          <mxGeometry x="645" y="285" width="130" height="60" as="geometry" />
+        <mxCell id="g2" value="2. CVE line&#10;(OSV mirror)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="622" y="285" width="112" height="62" as="geometry" />
         </mxCell>
-        <mxCell id="g3" value="3. AI review&#10;(optional, no fast path on npm)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
-          <mxGeometry x="790" y="285" width="140" height="60" as="geometry" />
+        <mxCell id="g3" value="3. Digest verify&#10;(before unpack)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="744" y="285" width="112" height="62" as="geometry" />
         </mxCell>
-        <mxCell id="g4" value="4. Digest verify&#10;(declared vs downloaded)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
-          <mxGeometry x="945" y="285" width="150" height="60" as="geometry" />
+        <mxCell id="g4" value="4. Org plugins&#10;(after unpack)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="866" y="285" width="112" height="62" as="geometry" />
         </mxCell>
-        <mxCell id="g5" value="5. Org plugins&#10;(sandboxed binaries)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
-          <mxGeometry x="500" y="360" width="130" height="60" as="geometry" />
+        <mxCell id="g5" value="5. AI review&#10;(optional, last)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+          <mxGeometry x="988" y="285" width="112" height="62" as="geometry" />
         </mxCell>
-        <mxCell id="gateend" value="Every gate is fail-closed. A check that&#10;cannot run is Unverifiable, never a serve." style="text;html=1;align=left;verticalAlign=middle;fontSize=11;fontColor=#b85450;fontStyle=1;" vertex="1" parent="1">
-          <mxGeometry x="645" y="370" width="450" height="40" as="geometry" />
+        <mxCell id="gateend" value="Every gate is fail-closed: a check that cannot run is Unverifiable, never a serve.&#10;This order is the PyPI path, where one full scan runs all five.&#10;cargo and npm split it: CVE, release age and AI review at the metadata gate (sparse index /&#10;packument), then the plugins at the download, which also requires that earlier admission." style="text;html=1;align=left;verticalAlign=top;fontSize=10;fontColor=#b85450;whiteSpace=wrap;" vertex="1" parent="1">
+          <mxGeometry x="500" y="360" width="600" height="60" as="geometry" />
         </mxCell>
 
         <mxCell id="stores" value="DURABLE STATE (SQLite)" style="text;html=1;align=left;verticalAlign=middle;fontSize=12;fontStyle=1;fontColor=#666666;" vertex="1" parent="1">

@@ -174,12 +174,25 @@ pub fn plan_npm_cascade(input: &NpmCascadeInput) -> NpmNextStep {
     let review_failed =
         |vers: &str| matches!(input.review_status.get(vers), Some(ReviewStatus::Failed));
 
+    // Within a line, walk newest-first and stop at the first forwardable
+    // entry — do not skip past it to an older one. A line whose newest
+    // survivor already passed (or was allowlisted) has nothing left to
+    // review in that line at all; only a line whose newest survivors are
+    // all review-failed falls through to an older, still-unreviewed entry.
+    // Without the `break`, a line of several unreviewed versions would
+    // offer every one of them as a candidate in turn, one iteration (one
+    // AI review and one tarball download) per version, instead of
+    // stopping the moment the newest one passes.
     for entries in &ordered_lines {
-        if let Some((_, vers)) = entries
-            .iter()
-            .find(|(_, vers)| !forwardable(vers) && !review_failed(vers))
-        {
-            return NpmNextStep::NeedsReview(vers.clone());
+        for (_, vers) in entries.iter() {
+            if forwardable(vers) {
+                break;
+            }
+            if !review_failed(vers) {
+                return NpmNextStep::NeedsReview(vers.clone());
+            }
+            // Already review-failed: try the next-older entry in this
+            // same line.
         }
     }
 
@@ -379,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_major_prerelease_line_is_its_own_group() {
+    fn a_zero_minor_line_is_its_own_group() {
         // 0.2.0 and 0.1.0 are different "majors" for npm's caret
         // semantics, so each gets its own forwarded slot rather than
         // being merged into one "0.x" group that would forward only the
@@ -474,6 +487,41 @@ mod tests {
         assert_eq!(
             plan_npm_cascade(&input),
             NpmNextStep::Forward(vec!["2.0.0-beta.1".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_line_stops_at_the_first_forwardable_entry_rather_than_skipping_past_it() {
+        // Regression for I1: `find` used to scan past a forwardable entry
+        // to an older, still-unreviewed one in the same line instead of
+        // stopping. For a line of several unreviewed versions that meant
+        // one candidate (one AI review, one tarball download) per version
+        // in the line, rather than stopping the moment the newest one
+        // passes.
+        let input = NpmCascadeInput {
+            versions: vec!["2.4.0".to_string(), "2.3.0".to_string()],
+            cve_blocked: HashSet::new(),
+            too_new: HashSet::new(),
+            review_status: HashMap::new(),
+            allowlisted: HashSet::new(),
+        };
+        assert_eq!(
+            plan_npm_cascade(&input),
+            NpmNextStep::NeedsReview("2.4.0".to_string()),
+            "the newest unreviewed version in the line is the only candidate"
+        );
+
+        // 2.4.0 passes review. The cascade must stop at that forwardable
+        // entry and never ask to review 2.3.0 too.
+        let mut passed = input;
+        passed
+            .review_status
+            .insert("2.4.0".to_string(), ReviewStatus::Passed);
+        assert_eq!(
+            plan_npm_cascade(&passed),
+            NpmNextStep::Forward(vec!["2.4.0".to_string()]),
+            "once the newest version in a line passes, the cascade must forward it \
+             without ever asking to review an older version in the same line"
         );
     }
 

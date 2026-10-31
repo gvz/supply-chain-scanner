@@ -39,6 +39,16 @@ fn invalid(reason: &str) -> InvalidName {
     }
 }
 
+/// Whether `c` is a character npm permits inside a name's body (the part
+/// after an optional leading `@` and scope separator): lowercase ASCII
+/// letters, digits, and `-` `_` `.` `~`. Nothing else is a legal npm
+/// package name character, so anything outside this set is also not
+/// URL-safe as a path segment — `?` `#` `%` `&` `=` `:` space and every
+/// other ASCII punctuation character are all excluded.
+fn is_npm_name_char(c: char) -> bool {
+    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.' | '~')
+}
+
 /// Validates a package name from untrusted input and returns it unchanged on
 /// success.
 ///
@@ -54,6 +64,16 @@ fn invalid(reason: &str) -> InvalidName {
 /// - a bare `@` without a scope, or an empty scope in a scoped name
 /// - any `/` except the single scope separator in a scoped name (one starting
 ///   with `@`)
+/// - any character in the name or scope body outside npm's own legal set:
+///   lowercase ASCII letters, digits, `-`, `_`, `.`, `~` (see
+///   [`is_npm_name_char`]). This is what stops a name like `lodash?x` or
+///   `http:evil.example.com` from reaching [`crate::ecosystem::npm::upstream::NpmUpstream::packument`]'s
+///   `Url::join`, where a character such as `?`, `#`, or a `:`-led scheme
+///   would be interpreted by the URL parser rather than treated as a
+///   literal path segment. An uppercase letter is rejected here too,
+///   deliberately: npm names are lowercase at the registry, but this
+///   function's contract is to return the name unchanged, not to fold it —
+///   that is [`normalize_name`]'s job, kept separate on purpose.
 ///
 /// The name is returned as given, not normalized. Normalize it separately
 /// with [`normalize_name`] when you need the canonical form.
@@ -119,6 +139,20 @@ pub fn validate_name(name: &str) -> Result<String, InvalidName> {
         if pkg_name.starts_with('.') || pkg_name.starts_with('_') {
             return Err(invalid("package name starts with . or _"));
         }
+
+        // Charset check last: every more specific check above gives a
+        // precise reason first, so a traversal or leading-dot name is
+        // never reported as merely "disallowed character".
+        if let Some(c) = scope.chars().find(|c| !is_npm_name_char(*c)) {
+            return Err(invalid(&format!(
+                "scope contains a character npm does not allow in a package name: {c:?}"
+            )));
+        }
+        if let Some(c) = pkg_name.chars().find(|c| !is_npm_name_char(*c)) {
+            return Err(invalid(&format!(
+                "package name contains a character npm does not allow in a package name: {c:?}"
+            )));
+        }
     } else {
         // Unscoped name: must not contain / and can't start with . or _
         if name.contains('/') {
@@ -127,6 +161,14 @@ pub fn validate_name(name: &str) -> Result<String, InvalidName> {
 
         if name.starts_with('.') || name.starts_with('_') {
             return Err(invalid("name starts with . or _"));
+        }
+
+        // Charset check last, for the same reason as the scoped branch
+        // above.
+        if let Some(c) = name.chars().find(|c| !is_npm_name_char(*c)) {
+            return Err(invalid(&format!(
+                "name contains a character npm does not allow in a package name: {c:?}"
+            )));
         }
     }
 
@@ -153,6 +195,15 @@ pub fn normalize_name(name: &str) -> String {
 /// `/@scope%2fname` for scoped packages and `/lodash` for unscoped packages.
 /// The `/` in the scope separator must be percent-encoded as `%2f` in URLs
 /// and filesystem paths.
+///
+/// Requires `name` to have already passed [`validate_name`]. This function
+/// does nothing to confirm that: it only replaces `/`, and the result is
+/// joined onto the registry base as a relative URL reference by
+/// [`crate::ecosystem::npm::upstream::NpmUpstream::packument`], not treated
+/// as an opaque path segment. A `name` carrying `?`, `#`, a `:`-led scheme,
+/// or any other character [`validate_name`]'s charset check would reject
+/// can therefore change the request's query, fragment, or host entirely.
+/// Callers must validate first.
 pub fn packument_path(name: &str) -> String {
     name.replace('/', "%2f")
 }
@@ -162,6 +213,13 @@ pub fn packument_path(name: &str) -> String {
 /// npm tarballs are addressed as `{name}/-/{unscoped}-{version}.tgz`, where
 /// `unscoped` is the package name with any `@scope/` prefix removed. For
 /// example, `@babel/core@7.0.0` is at `@babel/core/-/core-7.0.0.tgz`.
+///
+/// Requires `name` to have already passed [`validate_name`]. The result is
+/// concatenated, unescaped, into the `dist.tarball` URL
+/// [`crate::ecosystem::npm::packument::filter_packument`] serves back to
+/// npm, so an unvalidated `name` carrying `?`, `#`, or other URL-structural
+/// characters could alter that URL's query or fragment rather than merely
+/// naming a bad path.
 pub fn tarball_path(name: &str, version: &str) -> String {
     // Remove @scope/ prefix if present
     let unscoped = if let Some(slash_pos) = name.find('/') {

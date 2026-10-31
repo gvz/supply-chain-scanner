@@ -46,6 +46,57 @@ fn validate_rejects_a_bare_at_or_empty_scope() {
     assert!(validate_name("@/name").is_err());
 }
 
+// Regression coverage for the C1 finding: `validate_name` enforced no
+// character set at all, so a name carrying a URL-structural character
+// passed every other check. Confirmed empirically against the WHATWG URL
+// implementation `url` implements: "lodash?x" and "lodash#x" both resolve
+// upstream against the real registry host (the query/fragment is simply
+// ignored, so the CVE-gate keys on the wrong, unblocked name), and a
+// `scheme:host`-shaped name such as "http:evil.example.com" resolves to a
+// request against that other host entirely when joined as a relative URL
+// reference.
+#[test]
+fn validate_rejects_a_query_string_appended_to_the_name() {
+    assert!(validate_name("lodash?x").is_err());
+}
+
+#[test]
+fn validate_rejects_a_fragment_appended_to_the_name() {
+    assert!(validate_name("lodash#x").is_err());
+}
+
+#[test]
+fn validate_rejects_a_scheme_shaped_name_that_would_escape_the_registry_host() {
+    assert!(validate_name("http:evil.example.com").is_err());
+}
+
+#[test]
+fn validate_rejects_an_embedded_space() {
+    assert!(validate_name("a b").is_err());
+}
+
+#[test]
+fn validate_rejects_a_percent_encoded_slash() {
+    assert!(validate_name("lodash%2fx").is_err());
+}
+
+#[test]
+fn validate_rejects_an_embedded_at_sign() {
+    // Only a single, leading `@` introducing a scope is legal. An `@`
+    // anywhere else (here, read by a careless caller as a version pin) is
+    // not a character npm permits in a name.
+    assert!(validate_name("lodash@1.2.3").is_err());
+}
+
+#[test]
+fn validate_rejects_an_uppercase_letter() {
+    // npm names are lowercase at the registry. `validate_name`'s contract
+    // is to return the name unchanged, not to fold it, so an uppercase
+    // letter in a *requested* name is a rejection, not a silent lowercase.
+    assert!(validate_name("Lodash").is_err());
+    assert!(validate_name("@Babel/core").is_err());
+}
+
 #[test]
 fn normalize_lowercases_but_folds_nothing() {
     assert_eq!(normalize_name("Lodash"), "lodash");

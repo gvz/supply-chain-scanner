@@ -959,3 +959,34 @@ Run: `cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test
 git add docs/operations.md config.example.toml
 git commit -m "docs: document the npm deployment and its known limitations"
 ```
+
+---
+
+## Post-plan gap closure
+
+An audit against the design spec after all 14 tasks landed found four gaps that
+no task owned. Three are closed; the fourth is a test that was added separately.
+
+- **Write and auth endpoints were unhandled by design, and untested.** The
+  spec requires `npm publish`, `npm login`, `npm token` and `npm dist-tag` to
+  answer a clear error. The catch-all was `GET`-only, so they got the router's
+  bare method-not-allowed answer by accident. Now `PUT`, `POST`, `PATCH` and
+  `DELETE` on any path answer 403 with a sentence naming that this is a
+  read-only gateway. Two tests pin it: every write method is refused without
+  reaching upstream, and the audit stubs keep their own `POST` routes.
+  Commit `cbb98ea`.
+- **The packument cache is in memory, not the SQLite-backed `IndexCache` the
+  spec named.** Task 5 chose this deliberately. The consequence is now written
+  down rather than left to be discovered: the stale fallback only knows
+  packages this process fetched since it started, so a cold start during an
+  upstream outage answers with an empty packument. Commit `cbb98ea`.
+- **The `Ecosystem` trait seam is still unrealized.** The spec said npm gets
+  "its own `Ecosystem` implementation". Only `PyPi` implements it; npm holds a
+  concrete `NpmUpstream` and `NpmScanner`, mirroring cargo. `docs/operations.md`
+  now says so instead of implying the seam was finished. Commit `cbb98ea`.
+- **No lockfile test.** The spec asked for a test that a real lockfile's
+  `resolved` URLs point at the proxy. Task 14 documented the hazard in prose
+  only. Covered by `tests/npm_lockfile.rs`, which pins both directions: a
+  lockfile written behind the proxy records exactly the URLs `filter_packument`
+  forwards, and a lockfile written without the proxy names hosts the proxy never
+  serves.

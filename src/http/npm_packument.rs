@@ -172,7 +172,20 @@ pub fn npm_router(state: NpmAppState) -> Router {
         .route("/why/{id}", get(npm_why_handler))
         .route("/api/reviews", get(npm_reviews_handler))
         .route("/healthz", get(super::healthz))
-        .route("/{*path}", get(npm_packument_handler))
+        // npm's write and auth endpoints (`npm publish`, `npm login`,
+        // `npm token`, `npm dist-tag`) all speak PUT or POST. This is a
+        // read-only gateway to the public registry, so they are refused
+        // explicitly rather than left to axum's bare 405: an operator who
+        // tries to publish gets a sentence naming why, instead of a
+        // status with no explanation. See `npm_write_refused_handler`.
+        .route(
+            "/{*path}",
+            get(npm_packument_handler)
+                .put(npm_write_refused_handler)
+                .post(npm_write_refused_handler)
+                .patch(npm_write_refused_handler)
+                .delete(npm_write_refused_handler),
+        )
         .with_state(state)
 }
 
@@ -227,6 +240,36 @@ pub async fn npm_ping_handler() -> Response {
 /// every install.
 pub async fn npm_audit_stub_handler() -> Response {
     not_found_response()
+}
+
+/// `PUT`, `POST`, `PATCH` and `DELETE` on any path: npm's write and auth
+/// endpoints, refused with an explanation.
+///
+/// This proxy is a read-only gateway to the public registry. `npm
+/// publish`, `npm login`, `npm token` and `npm dist-tag` are out of scope
+/// together with private-registry support, and the design requires them
+/// to answer a clear error rather than a confusing partial success, so an
+/// operator learns it immediately instead of from a half-completed
+/// publish.
+///
+/// The audit stubs are registered on their own paths and are not
+/// affected: a `POST` to either still reaches
+/// [`npm_audit_stub_handler`], because `matchit` resolves a static
+/// segment before this wildcard.
+pub async fn npm_write_refused_handler() -> Response {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(axum::body::Body::from(
+            "this proxy is a read-only gateway to the public registry; \
+             publishing, logging in, token management and dist-tag changes \
+             are not supported\n",
+        ))
+        .unwrap_or_else(|_| {
+            let mut response = Response::new(axum::body::Body::from("write refused\n"));
+            *response.status_mut() = StatusCode::FORBIDDEN;
+            response
+        })
 }
 
 /// `GET /<name>` (or the decoded form of a scoped name): one package's

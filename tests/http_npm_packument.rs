@@ -656,3 +656,62 @@ async fn healthz_refusals_why_and_api_reviews_all_resolve_on_this_router() {
     assert_eq!(reviews_ct.as_deref(), Some("text/plain; charset=utf-8"));
     assert!(reviews_body.contains("not found"));
 }
+
+// ---------------------------------------------------------------------------
+// Write and auth endpoints
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn every_write_method_is_refused_with_an_explanation_and_never_reaches_upstream() {
+    let server = MockServer::start().await;
+    let cfg = base_config(&server, Duration::from_secs(10));
+    let (harness, _db) = Harness::without_reviewer(server, cfg).await;
+
+    // The shapes `npm publish`, `npm login`, `npm token` and `npm dist-tag`
+    // actually send.
+    for (method, target) in [
+        ("PUT", "/demo"),
+        ("PUT", "/@babel/core"),
+        ("POST", "/demo"),
+        ("PATCH", "/demo"),
+        ("DELETE", "/demo"),
+    ] {
+        let (status, content_type, body) = harness.request(method, target).await;
+        assert_eq!(
+            status, 403,
+            "{method} {target} must be refused, got {body:?}"
+        );
+        assert_eq!(
+            content_type.as_deref(),
+            Some("text/plain; charset=utf-8"),
+            "{method} {target} must answer a readable explanation"
+        );
+        assert!(
+            body.contains("read-only"),
+            "{method} {target} must say this is a read-only gateway, got {body:?}"
+        );
+    }
+
+    assert_eq!(
+        harness.total_upstream_hits().await,
+        0,
+        "a write request must never reach the public registry; a proxied \
+         publish would be a data-egress change nobody asked for"
+    );
+}
+
+#[tokio::test]
+async fn the_audit_stubs_still_answer_post_despite_the_write_refusal() {
+    let server = MockServer::start().await;
+    let cfg = base_config(&server, Duration::from_secs(10));
+    let (harness, _db) = Harness::without_reviewer(server, cfg).await;
+
+    // A static route must beat the wildcard, so these keep their 404 stub
+    // rather than inheriting the write refusal.
+    let (bulk_status, _ct, _body) = harness.post("/-/npm/v1/security/advisories/bulk").await;
+    let (quick_status, _ct, _body) = harness.post("/-/npm/v1/security/audits/quick").await;
+
+    assert_eq!(bulk_status, 404);
+    assert_eq!(quick_status, 404);
+    assert_eq!(harness.total_upstream_hits().await, 0);
+}

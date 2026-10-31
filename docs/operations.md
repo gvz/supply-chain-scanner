@@ -648,6 +648,25 @@ library permits a catch-all only as the final path segment, so a tarball cannot
 have a route of its own. An operator reading request logs sees both kinds of
 artifact under one route prefix, and that is expected.
 
+**Write and auth endpoints are refused.** `npm publish`, `npm login`,
+`npm token` and `npm dist-tag` all speak `PUT` or `POST`. This is a read-only
+gateway to the public registry, so those methods answer 403 with a sentence
+saying so, on every path. The refusal is explicit rather than left to the
+router's own method-not-allowed answer, so an operator learns why immediately
+instead of from a half-completed publish. The two audit stubs keep their own
+`POST` routes and are unaffected.
+
+**The packument cache is in memory, not on disk.** The design named the
+SQLite-backed `IndexCache` as the model. What shipped instead is a bounded
+in-process ETag cache plus a last-good-packument map. The consequence is worth
+knowing: the stale fallback that answers a request during an upstream outage
+only knows packages this process has already fetched since it started. After a
+restart, the first request for a package during an outage gets an empty
+packument rather than the last good one. This is a deliberate simplification,
+not an oversight, because the alternative was a schema and a migration for a
+cache whose whole purpose is to make the common case cheap. A warm cache is the
+mitigation, exactly as it is for a first `npm install`.
+
 **What a developer's machine needs.** Point npm at the proxy:
 
 ```bash
@@ -723,7 +742,11 @@ Recorded honestly so nobody rediscovers them the hard way.
   honest state until it gets one.
 - The `Ecosystem` trait is a half-realized seam: the HTTP layer goes through it,
   but the scanner still holds a concrete `Upstream` and calls `unpack` directly.
-  Adding npm or cargo means finishing that first.
+  Only `PyPi` implements the trait. Both the cargo and the npm deployments
+  bypass it and hold their own concrete upstream clients, mirroring each other.
+  The design spec called for npm to get "its own `Ecosystem` implementation";
+  what shipped is a concrete `NpmUpstream` and `NpmScanner` instead. This is the
+  same gap cargo carries, and it is the honest state until the seam is finished.
 - **The AI review is not deterministic.** Two reviews of identical bytes can
   disagree. The stored verdict is whichever answer arrived first under the
   current policy fingerprint. Once a verdict is stored, later requests serve

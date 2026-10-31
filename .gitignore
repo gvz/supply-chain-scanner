@@ -1,2 +1,6 @@
 /target
 docs/book/book/
+
+# Core dumps: a headless drawio export can crash and leave one behind.
+/core
+core.*

@@ -700,6 +700,66 @@ async fn a_cve_blocked_npm_version_is_denied_with_the_lowest_advisory_id_sanitiz
          got {} chars: {detail:?}",
         detail.len()
     );
+    assert!(record.get("filename").is_none(), "npm decides per version");
+}
+
+/// A version that is simultaneously CVE-blocked and too-new is reported
+/// as CVE-denied, not too-new: `listing_audit`'s own `cve_blocked`-then-
+/// `too_new` chain matches the cascade's own filtering order (CVE first,
+/// per `plan_npm_cascade`'s module docs), and nothing currently pins that
+/// order, so a future edit that swapped the two `if`/`else if` arms would
+/// pass every other test in this file silently.
+#[tokio::test]
+async fn a_version_both_cve_blocked_and_too_new_is_denied_as_cve_not_too_new() {
+    let server = MockServer::start().await;
+    let name = "demo";
+
+    let entries = format!(
+        r#""2.0.0":{{"version":"2.0.0","dist":{{"tarball":"{uri}/{name}/-/{name}-2.0.0.tgz"}}}},"1.0.0":{{"version":"1.0.0","dist":{{"tarball":"{uri}/{name}/-/{name}-1.0.0.tgz"}}}}"#,
+        uri = server.uri(),
+    );
+    let now = chrono::Utc::now().to_rfc3339();
+    let body = format!(
+        r#"{{"name":"{name}","versions":{{{entries}}},"dist-tags":{{"latest":"2.0.0"}},"time":{{"1.0.0":"{now}"}}}}"#
+    );
+    mount_raw_packument(&server, name, body).await;
+
+    let plugin_dir = tempfile::tempdir().expect("plugin dir");
+    let plugin_binary = plugin_dir.path().join("yara");
+    std::fs::write(&plugin_binary, b"pretend plugin binary").expect("write plugin binary");
+
+    let mut cfg = base_config(&server, plugin_binary);
+    cfg.npm_registry.as_mut().unwrap().min_release_age_days = Some(30);
+    cfg.allowlist = vec![AllowEntry {
+        package: name.to_string(),
+        version: "2.0.0".to_string(),
+    }];
+
+    let (audit_dir, audit) = audit_log_over_tempdir();
+    let harness = start(server, cfg, audit).await;
+    // "1.0.0" is both too-new (seeded above via `time`) and CVE-blocked
+    // (seeded here): the cascade's own filtering order checks CVE first.
+    seed_cve(
+        &harness.db,
+        name,
+        "1.0.0",
+        "OSV-TEST-0002",
+        "a vulnerable version",
+    );
+
+    let (status, body) = get(harness.addr, &format!("/{name}")).await;
+    assert_eq!(status, 200, "got body {body}");
+
+    let lines = read_audit_lines(audit_dir.path(), "audit.jsonl");
+    let record = lines
+        .iter()
+        .find(|line| line["event"] == "listed" && line["version"] == "1.0.0")
+        .expect("a listed record for the doubly-blocked version was written");
+    assert_eq!(record["decision"], "denied");
+    assert_eq!(
+        record["reason_code"], "cve:OSV-TEST-0002",
+        "CVE must win over too-new, matching the cascade's own filtering order"
+    );
 }
 
 /// A version the cascade marked review-failed from a *real* stored
@@ -956,6 +1016,22 @@ async fn a_fresh_plugin_block_on_an_approved_npm_version_writes_a_refused_line()
     assert_eq!(record["reason_code"], "plugin:yara");
     assert!(record["why_id"].is_string());
 }
+
+// A hash-mismatch refusal (`download_and_verify`'s own
+// `actual != target.key.sha256` check, 403, `reason_code: "hash-mismatch"`)
+// has no test here on purpose: on npm, `NpmUpstream::download_tarball`
+// already verifies the downloaded bytes against the registry-declared
+// digest before `download_and_verify` ever runs, and every call site
+// builds `target.key` and `target.dist` from the same live packument
+// entry, so the two can never disagree over HTTP. Tampering with the
+// mocked bytes here (as `tests/http_npm_download.rs`'s own
+// `a_digest_mismatch_is_refused_even_for_an_approved_version` does) is
+// caught one layer up as an `unverifiable:upstream` 503 instead — which is
+// exactly why that test only asserts `status >= 400`, not `== 403`. The
+// `download_and_verify` branch itself is still covered, directly, by
+// `src/http/npm_download.rs`'s own
+// `download_and_verify_reports_a_mismatch_as_a_refused_hash_mismatch` unit
+// test, which can disagree the two values the way nothing over HTTP can.
 
 // ---------------------------------------------------------------------------
 // Non-events

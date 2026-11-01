@@ -438,7 +438,7 @@ async fn serve_verified_bytes(
             let dest = temp.path().join(&key.filename);
             match download_and_verify(state, entry, key, &dest).await {
                 Ok(local) => serve_cached(state, key, &local).await,
-                Err(response) => (response, DownloadOutcome::Silent),
+                Err((response, outcome)) => (response, outcome),
             }
         }
         Err(err) => (
@@ -545,7 +545,7 @@ async fn run_plugin_gate(
     let dest = temp.path().join(&key.filename);
     let local = match download_and_verify(state, entry, key, &dest).await {
         Ok(local) => local,
-        Err(response) => return (response, None, DownloadOutcome::Silent),
+        Err((response, outcome)) => return (response, None, outcome),
     };
 
     let unpacked = temp.path().join("unpacked");
@@ -684,30 +684,43 @@ fn is_allowlisted_crate(config: &crate::config::Config, name: &str, version: &st
 /// Downloads the `.crate` to `dest` and checks its SHA-256 against the
 /// index `cksum`.
 ///
-/// `Ok(path)` is a verified file at `path`. `Err(response)` is the refusal
-/// to send instead: unverifiable for an upstream failure, 403 for bytes
-/// that do not match the checksum (mirroring
-/// [`crate::http::artifact`]'s handling of the same condition).
+/// `Ok(path)` is a verified file at `path`. `Err((response, outcome))` is
+/// the refusal to send instead, paired with the fetch audit outcome it
+/// implies: `Silent` for an upstream failure (404/503 — nothing was
+/// verified, so there is nothing yet for a line to describe), and
+/// `Refused` for a hash mismatch (403): the proxy downloaded real bytes
+/// and found them tampered with relative to what the index declared —
+/// the shape of a tampered mirror, cache poisoning, or a compromised CDN
+/// edge, and a definite negative verdict this proxy actually reached, not
+/// a "could not check". Folding this into `Silent` the way an outage does
+/// would hide the highest-signal denial this log can carry; see
+/// `crate::http::npm_download::download_and_verify`'s identical fix for
+/// the npm path's own copy of this gap.
 async fn download_and_verify(
     state: &CargoAppState,
     entry: &CargoIndexEntry,
     key: &ArtifactKey,
     dest: &std::path::Path,
-) -> Result<std::path::PathBuf, Response> {
+) -> Result<std::path::PathBuf, (Response, DownloadOutcome)> {
     let actual = match state
         .upstream
         .download_crate(&entry.name, &entry.vers, dest)
         .await
     {
         Ok(hash) => hash.to_lowercase(),
-        Err(UpstreamError::NotFound) => return Err(not_found_response()),
+        Err(UpstreamError::NotFound) => {
+            return Err((not_found_response(), DownloadOutcome::Silent))
+        }
         Err(err) => {
-            return Err(unverifiable_response(&RefusalReason {
-                code: "unverifiable:upstream".to_string(),
-                detail: sanitize(&format!(
-                    "could not download this artifact right now: {err:#}"
-                )),
-            }))
+            return Err((
+                unverifiable_response(&RefusalReason {
+                    code: "unverifiable:upstream".to_string(),
+                    detail: sanitize(&format!(
+                        "could not download this artifact right now: {err:#}"
+                    )),
+                }),
+                DownloadOutcome::Silent,
+            ))
         }
     };
 
@@ -719,16 +732,24 @@ async fn download_and_verify(
             actual = %actual,
             "the downloaded .crate did not match the index checksum; refusing it"
         );
-        return Err(refusal_response(
-            &RefusalReason {
-                code: "hash-mismatch".to_string(),
-                detail: sanitize(&format!(
-                    "downloaded artifact sha256 {actual} does not match the \
-                     index-declared sha256 {}",
-                    key.sha256
-                )),
+        let reason = RefusalReason {
+            code: "hash-mismatch".to_string(),
+            detail: sanitize(&format!(
+                "downloaded artifact sha256 {actual} does not match the \
+                 index-declared sha256 {}",
+                key.sha256
+            )),
+        };
+        let response = refusal_response(&reason, None);
+        return Err((
+            response,
+            DownloadOutcome::Refused {
+                package: key.package.clone(),
+                version: key.version.clone(),
+                filename: Some(key.filename.clone()),
+                reason,
+                why_id: None,
             },
-            None,
         ));
     }
 

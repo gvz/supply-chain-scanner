@@ -711,6 +711,70 @@ async fn a_cargo_crate_download_writes_a_served_line() {
     assert_eq!(record["sha256"], cksum);
 }
 
+/// Bytes that do not match the index-declared checksum are a 403 the
+/// proxy actually reached a verdict about — a tampered mirror, cache
+/// poisoning, or a compromised CDN edge — not a "could not check". Unlike
+/// npm's equivalent upstream client, `CargoUpstream::download_crate`
+/// performs no self-verification of its own, so this is the *only* place
+/// a mismatch is ever caught, and the only place this exact refusal can
+/// be exercised end to end: `download_and_verify`'s own hash-mismatch
+/// branch must write a `refused` line exactly like any other 403, never
+/// fall silently into `DownloadOutcome::Silent` the way a 404 or an
+/// upstream outage correctly does.
+#[tokio::test]
+async fn a_hash_mismatch_cargo_download_writes_a_refused_line() {
+    let server = MockServer::start().await;
+    let name = "serde";
+    let good_bytes = crate_bytes(name, "1.0.0");
+    let declared_cksum = sha256_hex(&good_bytes);
+    // Upstream serves different bytes than the index declared for this
+    // version.
+    let mut tampered = good_bytes.clone();
+    tampered.extend_from_slice(b"tampered");
+    mount_index(&server, name, &[line("1.0.0", &declared_cksum, false)]).await;
+    mount_download(&server, name, "1.0.0", &tampered).await;
+
+    let cfg = base_config(&server);
+    let (audit_dir, audit) = audit_log_over_tempdir();
+    let harness = start(server, cfg, audit).await;
+
+    // The state a real download runs in: the index gate already admitted
+    // this version (a stored `Clean` verdict), not yet plugin-checked —
+    // exactly `a_cargo_crate_download_writes_a_served_line`'s own setup,
+    // so the only variable between the two tests is the bytes upstream
+    // actually serves.
+    let artifact_key = key(name, "1.0.0", &declared_cksum);
+    VerdictStore::new(harness.db.clone())
+        .put(&artifact_key, &Verdict::Clean, &harness.fingerprint)
+        .expect("seed the index gate's clean verdict");
+
+    let response = reqwest::get(format!(
+        "http://{}/crates/{name}/1.0.0/download",
+        harness.addr
+    ))
+    .await
+    .expect("request crate download");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "mismatched bytes must be refused"
+    );
+
+    let lines = read_audit_lines(audit_dir.path(), "audit.jsonl");
+    assert!(
+        lines.iter().all(|line| line["event"] != "served"),
+        "tampered bytes must never be logged served: {lines:?}"
+    );
+    let record = lines
+        .iter()
+        .find(|line| line["event"] == "refused")
+        .expect("a refused record was written for the hash mismatch");
+    assert_eq!(record["reason_code"], "hash-mismatch");
+    assert_eq!(record["package"], name);
+    assert_eq!(record["version"], "1.0.0");
+    assert_eq!(record["filename"], format!("{name}-1.0.0.crate"));
+}
+
 /// A `.crate` download refused on a pre-existing stored block writes a
 /// `refused` line carrying that block's reason and `why_id`.
 #[tokio::test]

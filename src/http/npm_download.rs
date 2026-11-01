@@ -505,7 +505,7 @@ async fn serve_verified_bytes(
             let dest = temp.path().join(&target.key.filename);
             match download_and_verify(state, target, &dest).await {
                 Ok(local) => serve_cached(state, &local, target).await,
-                Err(response) => (response, DownloadOutcome::Silent),
+                Err((response, outcome)) => (response, outcome),
             }
         }
         Err(err) => (
@@ -598,7 +598,7 @@ async fn run_plugin_gate(
     let dest = temp.path().join(&target.key.filename);
     let local = match download_and_verify(state, target, &dest).await {
         Ok(local) => local,
-        Err(response) => return (response, None, DownloadOutcome::Silent),
+        Err((response, outcome)) => return (response, None, outcome),
     };
 
     let unpacked = temp.path().join("unpacked");
@@ -725,25 +725,42 @@ fn scan_incomplete_reason() -> RefusalReason {
 
 /// Downloads the tarball to `dest` and checks it against the digest the
 /// packument declared, which is the same value the artifact key carries.
+///
+/// A hash mismatch is a 403 the same as any other refusal, and unlike a
+/// 404/503 outage it is a definite negative verdict this proxy actually
+/// reached: the proxy downloaded real bytes and found them tampered with
+/// relative to what the registry itself declared — the shape of a
+/// tampered mirror, cache poisoning, or a compromised CDN edge, and the
+/// highest-signal denial this log can carry. So the error carries its own
+/// [`DownloadOutcome`] alongside the response, rather than letting every
+/// caller fold it into `DownloadOutcome::Silent` the way a 404 or an
+/// upstream outage correctly does — correction 2's own rule applies here
+/// too: this must not copy cargo's identical gap in `cargo_download.rs`,
+/// which is fixed in the same change as this one.
 async fn download_and_verify(
     state: &NpmAppState,
     target: &Target<'_>,
     dest: &std::path::Path,
-) -> Result<std::path::PathBuf, Response> {
+) -> Result<std::path::PathBuf, (Response, DownloadOutcome)> {
     let actual = match state
         .upstream
         .download_tarball(target.name, target.version, target.dist, dest)
         .await
     {
         Ok(digest) => digest.hex.to_lowercase(),
-        Err(UpstreamError::NotFound) => return Err(not_found_response()),
+        Err(UpstreamError::NotFound) => {
+            return Err((not_found_response(), DownloadOutcome::Silent))
+        }
         Err(err) => {
-            return Err(unverifiable_response(&RefusalReason {
-                code: "unverifiable:upstream".to_string(),
-                detail: sanitize(&format!(
-                    "could not download this artifact right now: {err:#}"
-                )),
-            }))
+            return Err((
+                unverifiable_response(&RefusalReason {
+                    code: "unverifiable:upstream".to_string(),
+                    detail: sanitize(&format!(
+                        "could not download this artifact right now: {err:#}"
+                    )),
+                }),
+                DownloadOutcome::Silent,
+            ))
         }
     };
 
@@ -755,16 +772,24 @@ async fn download_and_verify(
             actual = %actual,
             "the downloaded npm tarball did not match the declared digest; refusing it"
         );
-        return Err(refusal_response(
-            &RefusalReason {
-                code: "hash-mismatch".to_string(),
-                detail: sanitize(&format!(
-                    "downloaded artifact digest {actual} does not match the \
-                     registry-declared digest {}",
-                    target.key.sha256
-                )),
+        let reason = RefusalReason {
+            code: "hash-mismatch".to_string(),
+            detail: sanitize(&format!(
+                "downloaded artifact digest {actual} does not match the \
+                 registry-declared digest {}",
+                target.key.sha256
+            )),
+        };
+        let response = refusal_response(&reason, None);
+        return Err((
+            response,
+            DownloadOutcome::Refused {
+                package: target.key.package.clone(),
+                version: target.key.version.clone(),
+                filename: Some(target.key.filename.clone()),
+                reason,
+                why_id: None,
             },
-            None,
         ));
     }
 
@@ -989,5 +1014,195 @@ mod tests {
     #[test]
     fn a_path_traversal_in_the_filename_is_rejected() {
         assert!(version_from_filename("lodash", "lodash-../../etc/passwd.tgz").is_err());
+    }
+
+    /// Reaches `download_and_verify` directly because no HTTP-level
+    /// scenario can exercise its own `actual != target.key.sha256`
+    /// branch: every call site builds `target.key` and `target.dist`
+    /// from the exact same live packument entry in the same scope (see
+    /// `approved_for_download`/`allowlisted_target`), so the two always
+    /// agree by construction — and `NpmUpstream::download_tarball`
+    /// itself already verifies the downloaded bytes against that same
+    /// declared digest before this function ever sees them, which is
+    /// why `tests/http_npm_download.rs`'s own
+    /// `a_digest_mismatch_is_refused_even_for_an_approved_version` only
+    /// asserts `status >= 400`, not `== 403` — on npm, a live tampered
+    /// tarball is actually caught one layer up, as an
+    /// `unverifiable:upstream` 503, not this function's own check.
+    ///
+    /// This test proves the belt-and-suspenders branch itself is
+    /// correct on its own terms: if `target.key.sha256` ever did
+    /// disagree with what was actually downloaded (a defect elsewhere,
+    /// not a scenario reachable today), this function still answers a
+    /// 403 `hash-mismatch` refusal with a `DownloadOutcome::Refused`
+    /// that `npm_download_handler` can turn into a `refused` audit
+    /// line — never a silent `DownloadOutcome::Silent` the way the
+    /// 404/upstream-outage arms correctly do. Mirrors
+    /// `crate::http::cargo_download`'s own identical fix and test for
+    /// the gate where this branch *is* the only check (cargo's
+    /// `download_crate` performs no self-verification).
+    #[tokio::test]
+    async fn download_and_verify_reports_a_mismatch_as_a_refused_hash_mismatch() {
+        use crate::artifact_cache::ArtifactCache;
+        use crate::audit::AuditLog;
+        use crate::config::{
+            AuditConfig, Config, ConfigHandle, CveLine, NpmRegistryConfig, UnknownSeverity,
+        };
+        use crate::db::advisory::AdvisoryStore;
+        use crate::db::review::ReviewStore;
+        use crate::db::Db;
+        use crate::ecosystem::npm::upstream::NpmUpstream;
+        use crate::plugin::{PluginRunner, SandboxOutcome, SandboxRunner, SandboxSpec};
+        use crate::policy::Policy;
+        use crate::scan::coordinator::ScanCoordinator;
+        use crate::scan::npm::NpmScanner;
+        use std::path::PathBuf;
+        use std::time::Duration;
+        use url::Url;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        struct NeverCalledSandbox;
+        impl SandboxRunner for NeverCalledSandbox {
+            fn run(&self, _spec: &SandboxSpec) -> anyhow::Result<SandboxOutcome> {
+                panic!("no plugin run is expected in this whitebox test");
+            }
+        }
+
+        let server = MockServer::start().await;
+        let real_bytes = b"the actual tarball bytes upstream serves".to_vec();
+        let real_sha1 = {
+            use sha1::{Digest, Sha1};
+            let mut hasher = Sha1::new();
+            hasher.update(&real_bytes);
+            hex::encode(hasher.finalize())
+        };
+        Mock::given(method("GET"))
+            .and(wm_path("/demo/-/demo-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(real_bytes))
+            .mount(&server)
+            .await;
+
+        let base = Url::parse(&format!("{}/", server.uri())).expect("valid base url");
+        let dist = Dist {
+            tarball: format!("{base}demo/-/demo-1.0.0.tgz"),
+            integrity: None,
+            shasum: Some(real_sha1.clone()),
+        };
+
+        let db_dir = tempfile::tempdir().expect("create db temp dir");
+        let db = Db::open(&db_dir.path().join("scanner.db")).expect("open db");
+        let cache_dir = tempfile::tempdir().expect("create cache temp dir");
+        let artifact_cache = ArtifactCache::new(db.clone(), cache_dir.path().join("artifacts"))
+            .expect("create artifact cache");
+
+        let cfg = Config {
+            bind: "127.0.0.1:8080".parse().unwrap(),
+            db_path: PathBuf::from("data/scanner.db"),
+            cache_dir: PathBuf::from("data/cache"),
+            upstream_url: "https://registry.npmjs.org/".parse().unwrap(),
+            public_url: "http://proxy.example:8080".parse().unwrap(),
+            scan_budget: Duration::from_secs(10),
+            cache_ttl: Duration::from_secs(24 * 60 * 60),
+            advisory_sync_interval: Duration::from_secs(60 * 60),
+            advisory_source_url: "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip"
+                .parse()
+                .unwrap(),
+            cve: CveLine {
+                min_severity: 7.0,
+                require_fix_available: false,
+                unknown_severity: UnknownSeverity::Allow,
+            },
+            min_release_age_days: None,
+            download: Default::default(),
+            allowlist: Vec::new(),
+            plugins: Vec::new(),
+            max_concurrent_scans: None,
+            ai_review: None,
+            cargo_registry: None,
+            npm_registry: Some(NpmRegistryConfig {
+                upstream_registry_url: base.clone(),
+                scan_budget: Duration::from_secs(10),
+                max_packument_bytes: 67_108_864,
+                min_release_age_days: None,
+            }),
+            audit: AuditConfig::default(),
+        };
+        let policy = Arc::new(Policy::build(Arc::new(cfg.clone())).expect("build policy"));
+        let config_handle = Arc::new(ConfigHandle::new(cfg));
+
+        let upstream = NpmUpstream::with_limits(base.clone(), 67_108_864, &Default::default())
+            .expect("npm upstream");
+        let scanner = NpmScanner::new(
+            upstream,
+            AdvisoryStore::new(db.clone()),
+            VerdictStore::new(db.clone()),
+            Arc::clone(&policy),
+            None,
+            Arc::clone(&config_handle),
+            Arc::new(ScanCoordinator::new()),
+            Arc::new(artifact_cache),
+        );
+        let state = NpmAppState {
+            npm_scanner: Arc::new(scanner),
+            config: config_handle,
+            upstream: Arc::new(
+                NpmUpstream::with_limits(base, 67_108_864, &Default::default())
+                    .expect("npm download upstream"),
+            ),
+            verdicts: Arc::new(VerdictStore::new(db.clone())),
+            plugins: Arc::new(PluginRunner::new(Arc::new(NeverCalledSandbox))),
+            artifact_cache: Arc::new(
+                ArtifactCache::new(db.clone(), cache_dir.path().join("download-artifacts"))
+                    .expect("create download artifact cache"),
+            ),
+            reviews: Arc::new(ReviewStore::new(db.clone())),
+            plugin_run_coordinator: Arc::new(ScanCoordinator::new()),
+            audit: Arc::new(AuditLog::with_writer(std::io::sink())),
+        };
+
+        // The key this test deliberately disagrees with the real,
+        // correctly-verified digest: the only way to exercise this
+        // function's own defensive check, since every live call site
+        // keeps the two in agreement by construction (see the doc
+        // comment above).
+        let key = ArtifactKey {
+            ecosystem: "npm".to_string(),
+            package: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            filename: "demo-1.0.0.tgz".to_string(),
+            sha256: "0".repeat(40),
+        };
+        let target = Target {
+            key: &key,
+            name: "demo",
+            version: "1.0.0",
+            dist: &dist,
+        };
+        let dest_dir = tempfile::tempdir().expect("create download dest dir");
+        let dest = dest_dir.path().join("demo-1.0.0.tgz");
+
+        let result = download_and_verify(&state, &target, &dest).await;
+        let Err((response, outcome)) = result else {
+            panic!("a disagreeing key must be refused, not served");
+        };
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        match outcome {
+            DownloadOutcome::Refused {
+                package,
+                version,
+                filename,
+                reason,
+                why_id,
+            } => {
+                assert_eq!(package, "demo");
+                assert_eq!(version, "1.0.0");
+                assert_eq!(filename, Some("demo-1.0.0.tgz".to_string()));
+                assert_eq!(reason.code, "hash-mismatch");
+                assert_eq!(why_id, None);
+            }
+            DownloadOutcome::Served { .. } => panic!("expected Refused, got Served"),
+            DownloadOutcome::Silent => panic!("expected Refused, got Silent"),
+        }
     }
 }

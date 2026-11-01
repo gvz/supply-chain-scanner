@@ -3,7 +3,7 @@
 //! withheld from which client and why.
 //!
 //! See `docs/superpowers/specs/2026-11-01-fetch-audit-log-design.md` for the
-//! full design. The two decisions that shape everything in this module:
+//! full design. The decisions that shape everything in this module:
 //!
 //! **This is not a `tracing` layer.** `tracing`'s macros (`info!`, `warn!`,
 //! ...) return `()`: a subscriber can drop, buffer, or fail to write an
@@ -41,8 +41,43 @@
 //! precisely the kind of quiet gap fail-closed exists to prevent. So this
 //! module does not depend on `tracing-appender` at all; [`RotatingFile`]
 //! below is a small hand-rolled replacement, built directly on
-//! `std::fs::OpenOptions::append`, whose `write()` returns any `io::Error`
-//! it hits while rolling over instead of falling back to a stale file.
+//! `std::fs::OpenOptions::append`, whose rotation returns any `io::Error`
+//! it hits instead of falling back to a stale file.
+//!
+//! **The rotation decision is made once per record, never once per token
+//! the JSON serializer happens to flush.** `serde_json::to_writer` drives
+//! a formatter that issues many small `write_all` calls per object — one
+//! for `{`, one per field name, one per value, and so on. A rotation
+//! check living inside a plain `io::Write::write` would be re-evaluated on
+//! every one of those calls, and could swap the underlying file *midway
+//! through serializing a single record* if the clock happened to cross a
+//! period boundary in between — splitting one record's bytes across two
+//! files, neither half parsing, with [`AuditLog::write`] still returning
+//! `Ok`. [`AuditLog::write`] avoids this by never streaming
+//! `serde_json::to_writer` straight into the locked writer: it serializes
+//! each record into a reused in-memory buffer first, appends the trailing
+//! `\n`, and hands the writer exactly one complete `<record>\n` buffer via
+//! a single `write_all` call. [`RotatingFile`] overrides `write_all`
+//! (rather than inheriting `Write`'s default implementation, which loops
+//! over `write`) specifically so that override is the only place the
+//! clock gets consulted — once per call, which this discipline makes once
+//! per record.
+//!
+//! **Pruning never touches the live file, and a vanished live file gets
+//! recreated.** [`RotatingFile::prune_old_files`] only ever considers a
+//! regular file named `"<prefix>.<suffix>"` whose `<suffix>` actually
+//! parses under the configured rotation — not a `.bak`, a `.gz`, a
+//! directory, or another deployment's differently-shaped log sharing the
+//! same prefix on disk — and it explicitly skips the file currently open
+//! no matter where it sorts (name order tracks chronological order only
+//! while the rotation granularity stays fixed; a reconfigured granularity
+//! or a clock stepping backward can break that). Separately, every write
+//! also checks whether the current file still exists on disk at all: an
+//! operator, `logrotate`, or a bug unlinking it would otherwise leave
+//! writes succeeding silently into a doomed, directory-entry-less inode
+//! (POSIX keeps it alive only until the descriptor closes) — so a missing
+//! file is treated exactly like a rotation and reopened before the write
+//! proceeds.
 
 use std::fs;
 use std::io::{self, Write as _};
@@ -217,6 +252,7 @@ impl AuditRecord {
 
 /// Per-request identity, built once per HTTP request and threaded through
 /// to every audit record that request produces.
+#[derive(Debug, Clone)]
 pub struct AuditContext {
     pub ecosystem: String,
     pub client_ip: IpAddr,
@@ -313,25 +349,61 @@ fn rotated_path(
     rotation: AuditRotation,
     now: chrono::DateTime<Utc>,
 ) -> PathBuf {
-    let suffix = match rotation {
-        AuditRotation::Daily => now.format("%Y-%m-%d").to_string(),
-        AuditRotation::Hourly => now.format("%Y-%m-%d-%H").to_string(),
-    };
-    directory.join(format!("{prefix}.{suffix}"))
+    directory.join(format!("{prefix}.{}", date_suffix(rotation, now)))
 }
 
+fn date_suffix(rotation: AuditRotation, now: chrono::DateTime<Utc>) -> String {
+    match rotation {
+        AuditRotation::Daily => now.format("%Y-%m-%d").to_string(),
+        AuditRotation::Hourly => now.format("%Y-%m-%d-%H").to_string(),
+    }
+}
+
+/// Whether `suffix` (the part of a sibling file's name after
+/// `"<prefix>."`) is a well-formed date suffix this writer could actually
+/// have produced under `rotation` — as opposed to a `.bak`, a `.gz`, an
+/// operator's manual copy, or another deployment's differently-shaped log
+/// sharing the same prefix on disk. Only files that pass this are ever
+/// candidates for [`RotatingFile::prune_old_files`].
+fn suffix_is_valid(rotation: AuditRotation, suffix: &str) -> bool {
+    match rotation {
+        AuditRotation::Daily => chrono::NaiveDate::parse_from_str(suffix, "%Y-%m-%d").is_ok(),
+        AuditRotation::Hourly => match suffix.rsplit_once('-') {
+            Some((date_part, hour_part)) => {
+                chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d").is_ok()
+                    && hour_part.len() == 2
+                    && hour_part.chars().all(|c| c.is_ascii_digit())
+                    && hour_part.parse::<u32>().is_ok_and(|hour| hour < 24)
+            }
+            None => false,
+        },
+    }
+}
+
+fn open_append(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new().create(true).append(true).open(path)
+}
+
+/// An injectable source of "now", so [`RotatingFile`]'s own tests can
+/// simulate crossing a rotation boundary (or a clock stepping backward)
+/// without sleeping across a real one. Production code only ever uses
+/// [`RotatingFile::open`], which wires up `Utc::now`.
+type ClockFn = Box<dyn Fn() -> chrono::DateTime<Utc> + Send>;
+
 /// A `std::io::Write` over a `std::fs::File` that rolls over to a new
-/// dated file as the configured period advances, pruning the oldest files
-/// past `max_files` on each rotation.
+/// dated file as the configured period advances, recreates that file if
+/// it vanishes underneath the writer, and prunes the oldest files past
+/// `max_files` on each rotation. See the module docs above for why each
+/// of these matters and what went wrong before each was true.
 ///
-/// Every fallible step — opening the new period's file, flushing and
-/// swapping in the old one — returns its `io::Error` straight out of
-/// `write()` rather than falling back silently, which is the property
-/// `tracing_appender::rolling::RollingFileAppender` does not have (see the
-/// module docs above). Pruning old files is best-effort: a failure to
-/// delete a stale file does not stop the record that triggered rotation
-/// from being written, since that record already landed safely in the new
-/// file by the time pruning runs.
+/// Every fallible step — opening the new period's file, flushing the old
+/// one before the swap — returns its `io::Error` straight out of the call
+/// rather than falling back silently, which is the property
+/// `tracing_appender::rolling::RollingFileAppender` does not have. That
+/// property only holds if the rotation decision itself happens at most
+/// once per logical write, which is why `write_all` is overridden below
+/// rather than left to `Write`'s default implementation (which loops over
+/// `write` once per internal token a caller happens to flush).
 struct RotatingFile {
     directory: PathBuf,
     prefix: String,
@@ -339,10 +411,17 @@ struct RotatingFile {
     max_files: usize,
     current_path: PathBuf,
     file: fs::File,
+    now: ClockFn,
 }
 
 impl RotatingFile {
     fn open(config: &AuditConfig) -> anyhow::Result<Self> {
+        Self::open_with_clock(config, Box::new(Utc::now))
+    }
+
+    /// Same as [`RotatingFile::open`], but with an injectable clock. Only
+    /// this module's own tests call this directly.
+    fn open_with_clock(config: &AuditConfig, now: ClockFn) -> anyhow::Result<Self> {
         let (directory, prefix) = directory_and_prefix(&config.path)?;
         fs::create_dir_all(&directory).with_context(|| {
             format!(
@@ -351,7 +430,7 @@ impl RotatingFile {
             )
         })?;
 
-        let current_path = rotated_path(&directory, &prefix, config.rotation, Utc::now());
+        let current_path = rotated_path(&directory, &prefix, config.rotation, now());
         let file = open_append(&current_path)
             .with_context(|| format!("failed to open audit log at {}", config.path.display()))?;
 
@@ -362,16 +441,53 @@ impl RotatingFile {
             max_files: config.max_files,
             current_path,
             file,
+            now,
         };
         rotating.prune_old_files();
         Ok(rotating)
     }
 
-    /// Deletes the oldest sibling audit files past `max_files`, keeping
-    /// the current one. File names of the same rotation granularity sort
-    /// lexicographically in chronological order (the date suffix is
-    /// zero-padded, most-significant component first), so a plain name
-    /// sort is enough to find the oldest ones.
+    /// Rotates to the current period's file if the clock has moved past
+    /// it, or if the file this writer was using has vanished underneath
+    /// it (an operator, `logrotate`, or a bug removed it). Either way the
+    /// next write must land somewhere a reader can actually find it, not
+    /// invisibly into an orphaned inode. The existence check runs on
+    /// every call, not just when the computed path changes, so a deleted
+    /// file is caught even mid-period.
+    fn rotate_if_needed(&mut self) -> io::Result<()> {
+        let wanted_path = rotated_path(&self.directory, &self.prefix, self.rotation, (self.now)());
+        let current_is_missing = fs::metadata(&self.current_path).is_err();
+        if wanted_path != self.current_path || current_is_missing {
+            let mut new_file = open_append(&wanted_path)?;
+            self.file.flush()?;
+            std::mem::swap(&mut self.file, &mut new_file);
+            self.current_path = wanted_path;
+            self.prune_old_files();
+        }
+        Ok(())
+    }
+
+    /// Deletes the oldest sibling audit files past `max_files`, among
+    /// only the files this writer could itself have produced: a regular
+    /// file directly inside the configured directory, named
+    /// `"<prefix>.<date-suffix>"` where the suffix actually parses under
+    /// the configured rotation (see [`suffix_is_valid`]). That excludes
+    /// an ops-side `.bak`/`.gz` copy, another deployment's differently
+    /// prefixed log, and any directory — none of those are ours to
+    /// delete, and matching on the prefix alone would otherwise let any
+    /// of them consume a slot in `max_files` and crowd out real audit
+    /// history.
+    ///
+    /// The file currently open (`self.current_path`) is never deleted,
+    /// regardless of where it sorts: name order tracks chronological
+    /// order only while the rotation granularity stays the same, so a
+    /// reconfigured granularity (or a clock that stepped backward) can
+    /// put a leftover ahead of the live file in sorted order. Skipping it
+    /// explicitly, rather than relying on it to sort last, is what keeps
+    /// that true under either kind of surprise — at the cost of
+    /// `max_files` being a best-effort cap rather than a hard one in that
+    /// pathological case: the live file is always kept even if that means
+    /// one file over the configured limit until it ages out naturally.
     fn prune_old_files(&self) {
         if self.max_files == 0 {
             return;
@@ -380,13 +496,16 @@ impl RotatingFile {
             return;
         };
         let dotted_prefix = format!("{}.", self.prefix);
+        let rotation = self.rotation;
         let mut siblings: Vec<PathBuf> = entries
             .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_file()))
             .map(|entry| entry.path())
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(&dotted_prefix))
+                    .and_then(|name| name.strip_prefix(&dotted_prefix))
+                    .is_some_and(|suffix| suffix_is_valid(rotation, suffix))
             })
             .collect();
         siblings.sort();
@@ -395,6 +514,9 @@ impl RotatingFile {
             return;
         }
         for stale in &siblings[..siblings.len() - self.max_files] {
+            if *stale == self.current_path {
+                continue;
+            }
             if let Err(err) = fs::remove_file(stale) {
                 tracing::warn!(path = %stale.display(), %err, "failed to prune old audit log file");
             }
@@ -404,24 +526,24 @@ impl RotatingFile {
 
 impl io::Write for RotatingFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let wanted_path = rotated_path(&self.directory, &self.prefix, self.rotation, Utc::now());
-        if wanted_path != self.current_path {
-            let mut new_file = open_append(&wanted_path)?;
-            self.file.flush()?;
-            std::mem::swap(&mut self.file, &mut new_file);
-            self.current_path = wanted_path;
-            self.prune_old_files();
-        }
+        self.rotate_if_needed()?;
         self.file.write(buf)
+    }
+
+    /// Overridden (rather than inheriting `Write`'s default, which loops
+    /// over `write`) so that one call is exactly one rotation decision.
+    /// [`AuditLog::write`] relies on this: it hands over one
+    /// fully-assembled `<record>\n` buffer per record in a single
+    /// `write_all` call, so the clock is consulted once per record, never
+    /// once per token the JSON serializer happens to flush.
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.rotate_if_needed()?;
+        self.file.write_all(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.file.flush()
     }
-}
-
-fn open_append(path: &Path) -> io::Result<fs::File> {
-    fs::OpenOptions::new().create(true).append(true).open(path)
 }
 
 /// The audit log's write side: one fallible, lockable `Write` behind a
@@ -455,8 +577,12 @@ impl AuditLog {
         }
     }
 
-    /// Serializes each record as one JSON line, under a single lock held
-    /// for the whole slice, and flushes once at the end. Any error —
+    /// Serializes each record into a reused buffer first, under a single
+    /// lock held for the whole slice, and hands the writer one complete
+    /// `<record>\n` buffer per record via a single `write_all` call —
+    /// never `serde_json::to_writer` streamed straight into the locked
+    /// writer, which is what let a rotation decision land mid-record (see
+    /// the module docs). Flushes once at the end. Any error —
     /// serialization, the write itself, the flush, or a poisoned lock
     /// from an earlier panic — is returned, never swallowed.
     pub fn write(&self, records: &[AuditRecord]) -> anyhow::Result<()> {
@@ -465,11 +591,14 @@ impl AuditLog {
             .lock()
             .map_err(|_| anyhow!("audit log lock was poisoned by an earlier panic"))?;
 
+        let mut line = Vec::new();
         for record in records {
-            serde_json::to_writer(&mut *guard, record)
+            line.clear();
+            serde_json::to_writer(&mut line, record)
                 .context("failed to serialize an audit record")?;
+            line.push(b'\n');
             guard
-                .write_all(b"\n")
+                .write_all(&line)
                 .context("failed to write an audit record")?;
         }
         guard.flush().context("failed to flush the audit log")?;
@@ -480,6 +609,19 @@ impl AuditLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+    use std::sync::Arc;
+
+    /// A clock whose value the test can move forward (or backward)
+    /// between calls, without sleeping across a real rotation boundary.
+    fn shared_clock(
+        initial: chrono::DateTime<Utc>,
+    ) -> (Arc<Mutex<chrono::DateTime<Utc>>>, ClockFn) {
+        let cell = Arc::new(Mutex::new(initial));
+        let reader = Arc::clone(&cell);
+        let clock: ClockFn = Box::new(move || *reader.lock().expect("clock mutex"));
+        (cell, clock)
+    }
 
     /// `directory_and_prefix` must not be fooled by a bare filename with
     /// no directory component into trying to create an empty directory.
@@ -528,6 +670,225 @@ mod tests {
         assert_eq!(
             AuditRecord::refused(&ctx, "p", "1.0.0", None, &reason, None).event,
             AuditEvent::Refused
+        );
+    }
+
+    // --- RotatingFile: the hand-rolled rotation this task's authorized
+    // deviation made the project's own, so it carries its own tests
+    // rather than relying only on the brief's ten (which predate it). ---
+
+    #[test]
+    fn a_rollover_crossing_a_boundary_writes_two_separate_terminated_files() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config = AuditConfig {
+            path: dir.path().join("audit.jsonl"),
+            rotation: AuditRotation::Daily,
+            max_files: 14,
+        };
+        let day_one = Utc
+            .with_ymd_and_hms(2026, 11, 1, 23, 59, 59)
+            .single()
+            .expect("valid datetime");
+        let (clock_cell, clock) = shared_clock(day_one);
+        let mut rotating = RotatingFile::open_with_clock(&config, clock).expect("open succeeds");
+
+        rotating
+            .write_all(b"{\"a\":1}\n")
+            .expect("first write succeeds");
+
+        let day_two = Utc
+            .with_ymd_and_hms(2026, 11, 2, 0, 0, 1)
+            .single()
+            .expect("valid datetime");
+        *clock_cell.lock().expect("clock mutex") = day_two;
+        rotating
+            .write_all(b"{\"a\":2}\n")
+            .expect("second write succeeds after rollover");
+
+        let first = std::fs::read_to_string(dir.path().join("audit.jsonl.2026-11-01"))
+            .expect("first file readable");
+        let second = std::fs::read_to_string(dir.path().join("audit.jsonl.2026-11-02"))
+            .expect("second file readable");
+        assert_eq!(
+            first, "{\"a\":1}\n",
+            "the first file must hold exactly its own complete record"
+        );
+        assert_eq!(
+            second, "{\"a\":2}\n",
+            "the second file must hold exactly its own complete record, not a fragment of the first"
+        );
+    }
+
+    #[test]
+    fn a_rollover_whose_new_file_cannot_be_opened_returns_err_instead_of_falling_back() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config = AuditConfig {
+            path: dir.path().join("audit.jsonl"),
+            rotation: AuditRotation::Daily,
+            max_files: 14,
+        };
+        let day_one = Utc
+            .with_ymd_and_hms(2026, 11, 1, 12, 0, 0)
+            .single()
+            .expect("valid datetime");
+        let (clock_cell, clock) = shared_clock(day_one);
+        let mut rotating = RotatingFile::open_with_clock(&config, clock).expect("open succeeds");
+        rotating
+            .write_all(b"{\"a\":1}\n")
+            .expect("first write succeeds");
+
+        let day_two = Utc
+            .with_ymd_and_hms(2026, 11, 2, 0, 0, 1)
+            .single()
+            .expect("valid datetime");
+        *clock_cell.lock().expect("clock mutex") = day_two;
+        // Block the next period's path with a directory, so opening it as
+        // a file fails rather than succeeding.
+        std::fs::create_dir(dir.path().join("audit.jsonl.2026-11-02"))
+            .expect("create blocking directory");
+
+        rotating.write_all(b"{\"a\":2}\n").expect_err(
+            "a rollover that can't open its new file must fail, not fall back silently",
+        );
+
+        let first = std::fs::read_to_string(dir.path().join("audit.jsonl.2026-11-01"))
+            .expect("first file still readable");
+        assert_eq!(
+            first, "{\"a\":1}\n",
+            "the failed rollover must not have written the second record into the old file either"
+        );
+    }
+
+    #[test]
+    fn a_write_after_the_current_file_is_deleted_underneath_recreates_it() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config = AuditConfig {
+            path: dir.path().join("audit.jsonl"),
+            rotation: AuditRotation::Daily,
+            max_files: 14,
+        };
+        let now = Utc
+            .with_ymd_and_hms(2026, 11, 1, 12, 0, 0)
+            .single()
+            .expect("valid datetime");
+        let (_clock_cell, clock) = shared_clock(now);
+        let mut rotating = RotatingFile::open_with_clock(&config, clock).expect("open succeeds");
+        rotating
+            .write_all(b"{\"a\":1}\n")
+            .expect("first write succeeds");
+
+        std::fs::remove_file(dir.path().join("audit.jsonl.2026-11-01"))
+            .expect("remove the live file");
+
+        rotating
+            .write_all(b"{\"a\":2}\n")
+            .expect("write after the file vanished must still succeed");
+
+        let contents = std::fs::read_to_string(dir.path().join("audit.jsonl.2026-11-01"))
+            .expect("the file must be visible on disk again, not written into an orphaned inode");
+        assert_eq!(contents, "{\"a\":2}\n");
+    }
+
+    #[test]
+    fn pruning_only_considers_files_this_writer_could_have_produced() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let prefix = "audit.jsonl";
+        std::fs::write(dir.path().join(format!("{prefix}.bak")), b"irrelevant\n")
+            .expect("write sibling");
+        std::fs::write(
+            dir.path().join(format!("{prefix}.2026-10-31.gz")),
+            b"irrelevant\n",
+        )
+        .expect("write sibling");
+        std::fs::write(
+            dir.path().join(format!("{prefix}.npm.2026-11-01")),
+            b"irrelevant\n",
+        )
+        .expect("write sibling");
+        std::fs::create_dir(dir.path().join(format!("{prefix}.2026-10-20")))
+            .expect("create directory sibling");
+
+        let config = AuditConfig {
+            path: dir.path().join(prefix),
+            rotation: AuditRotation::Daily,
+            max_files: 1,
+        };
+        let now = Utc
+            .with_ymd_and_hms(2026, 11, 2, 0, 0, 0)
+            .single()
+            .expect("valid datetime");
+        let (_clock_cell, clock) = shared_clock(now);
+        let _rotating = RotatingFile::open_with_clock(&config, clock).expect("open succeeds");
+
+        // None of these lookalikes were ever valid candidates, so pruning
+        // (with max_files = 1, which would otherwise be very aggressive)
+        // must have left every one of them untouched.
+        assert!(dir.path().join(format!("{prefix}.bak")).exists());
+        assert!(dir.path().join(format!("{prefix}.2026-10-31.gz")).exists());
+        assert!(dir.path().join(format!("{prefix}.npm.2026-11-01")).exists());
+        assert!(dir.path().join(format!("{prefix}.2026-10-20")).exists());
+    }
+
+    #[test]
+    fn pruning_deletes_the_oldest_files_past_max_files_but_keeps_the_current_one() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let prefix = "audit.jsonl";
+        for day in 20..=25 {
+            std::fs::write(dir.path().join(format!("{prefix}.2026-10-{day}")), b"old\n")
+                .expect("write old file");
+        }
+
+        let config = AuditConfig {
+            path: dir.path().join(prefix),
+            rotation: AuditRotation::Daily,
+            max_files: 3,
+        };
+        let now = Utc
+            .with_ymd_and_hms(2026, 10, 27, 12, 0, 0)
+            .single()
+            .expect("valid datetime");
+        let (_clock_cell, clock) = shared_clock(now);
+        let _rotating = RotatingFile::open_with_clock(&config, clock).expect("open succeeds");
+
+        assert!(
+            dir.path().join(format!("{prefix}.2026-10-27")).exists(),
+            "the current file must survive"
+        );
+        let old_survivors = (20..=25)
+            .filter(|day| dir.path().join(format!("{prefix}.2026-10-{day}")).exists())
+            .count();
+        assert_eq!(
+            old_survivors, 2,
+            "with max_files = 3 and the current file counted as one slot, only 2 of the 6 old files should remain"
+        );
+    }
+
+    #[test]
+    fn the_current_file_survives_pruning_even_when_it_sorts_oldest() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let prefix = "audit.jsonl";
+        std::fs::write(dir.path().join(format!("{prefix}.2026-11-05")), b"old\n")
+            .expect("write sibling");
+        std::fs::write(dir.path().join(format!("{prefix}.2026-11-06")), b"old\n")
+            .expect("write sibling");
+
+        let config = AuditConfig {
+            path: dir.path().join(prefix),
+            rotation: AuditRotation::Daily,
+            max_files: 1,
+        };
+        // A clock behind the leftover files' dates (e.g. an NTP step
+        // backward), so the live file sorts first rather than last.
+        let now = Utc
+            .with_ymd_and_hms(2026, 11, 1, 0, 0, 0)
+            .single()
+            .expect("valid datetime");
+        let (_clock_cell, clock) = shared_clock(now);
+        let _rotating = RotatingFile::open_with_clock(&config, clock).expect("open succeeds");
+
+        assert!(
+            dir.path().join(format!("{prefix}.2026-11-01")).exists(),
+            "the live file must never be pruned, regardless of sort position"
         );
     }
 }

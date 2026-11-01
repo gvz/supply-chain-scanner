@@ -9,6 +9,7 @@
 pub mod advisory;
 pub mod ai;
 pub mod artifact_cache;
+pub mod audit;
 pub mod cargovet;
 pub mod config;
 pub mod db;

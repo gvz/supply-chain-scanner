@@ -22,6 +22,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use supply_chain_scanner::ai::provider::{ChatProvider, ProviderError};
 use supply_chain_scanner::ai::AiReviewer;
 use supply_chain_scanner::artifact_cache::ArtifactCache;
+use supply_chain_scanner::audit::AuditLog;
 use supply_chain_scanner::cargovet::parse::AuditEntry;
 use supply_chain_scanner::config::{
     AiReviewConfig, AuditConfig, BlockOn, Config, ConfigHandle, CveLine, UnknownSeverity,
@@ -268,6 +269,10 @@ impl Harness {
                 db.clone(),
             )),
             plugin_run_coordinator: Arc::new(ScanCoordinator::new()),
+            // These tests are about the index surface's own behaviour,
+            // not the fetch audit log (that is `tests/http_audit_cargo.rs`),
+            // so a discarding writer is enough.
+            audit: Arc::new(AuditLog::with_writer(std::io::sink())),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

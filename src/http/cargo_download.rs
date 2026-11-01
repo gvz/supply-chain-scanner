@@ -90,13 +90,15 @@
 //! the `application/octet-stream` the PyPI path uses for wheels and sdists.
 //! A caller must not depend on cargo rejecting an incorrect header.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::Response;
 
+use crate::audit::{AuditContext, AuditRecord};
 use crate::db::verdict::VerdictStore;
 use crate::ecosystem::cargo::index::{validate_name, CargoIndexEntry};
 use crate::ecosystem::cargo::normalize_name;
@@ -107,9 +109,9 @@ use crate::scan::cargo::CargoDownloadApproval;
 use crate::scan::coordinator::{self, FinishGuard};
 use crate::scan::is_allowlisted;
 
-use super::cargo_index::CargoAppState;
+use super::cargo_index::{CargoAppState, CARGO_ECOSYSTEM};
 use super::refusal::{refusal_response, unverifiable_response};
-use super::{bad_request_response, not_found_response, why_url};
+use super::{audit_or_500, bad_request_response, not_found_response, why_url};
 
 /// The `Content-Type` sent for a `.crate` body. See the module docs.
 const CRATE_CONTENT_TYPE: &str = "application/gzip";
@@ -120,13 +122,101 @@ const CRATE_CONTENT_TYPE: &str = "application/gzip";
 /// unbounded.
 const MAX_VERSION_LEN: usize = 128;
 
+/// What one `.crate` download request actually did, carried up from
+/// whichever gate decided it so [`cargo_download_handler`] writes exactly
+/// one fetch audit record at the point the response is finalized — never
+/// earlier.
+///
+/// This matters because an index-approved version
+/// ([`CargoDownloadApproval::Approved`]) is not yet a *decided* download:
+/// the plugin gate still has to run, and it can still refuse the
+/// artifact. Writing a `served` record as soon as the index gate's
+/// admission is matched, before the plugin gate has had its say, would
+/// log a request as served that the very same request later refused —
+/// exactly the kind of record this feature exists to never produce. So
+/// every function between the index-approval match and the final
+/// `Response` threads this type back up instead of writing audit records
+/// itself, and [`cargo_download_handler`] is the only place that calls
+/// [`audit_or_500`] for a download.
+enum DownloadOutcome {
+    /// Bytes were served for this artifact key.
+    Served { key: ArtifactKey },
+    /// A refusal response was built from a durable reason. `why_id` is
+    /// `Some` only when storing the verdict that produced this refusal
+    /// actually succeeded.
+    Refused {
+        key: ArtifactKey,
+        reason: RefusalReason,
+        why_id: Option<String>,
+    },
+    /// No definite verdict was reached (a 404, an upstream outage, a
+    /// plugin that could not run, an internal I/O failure): there is
+    /// nothing yet for an audit line to describe, exactly as
+    /// `Decision::Unverifiable`/`Decision::InProgress` write nothing on
+    /// the PyPI path.
+    Silent,
+}
+
+impl DownloadOutcome {
+    /// The records [`AuditLog::write`](crate::audit::AuditLog::write)
+    /// needs for this outcome: zero or one.
+    fn into_records(self, ctx: &AuditContext) -> Vec<AuditRecord> {
+        match self {
+            DownloadOutcome::Served { key } => vec![AuditRecord::served(
+                ctx,
+                &key.package,
+                &key.version,
+                &key.filename,
+                &key.sha256,
+            )],
+            DownloadOutcome::Refused {
+                key,
+                reason,
+                why_id,
+            } => vec![AuditRecord::refused(
+                ctx,
+                &key.package,
+                &key.version,
+                Some(key.filename.as_str()),
+                &reason,
+                why_id.as_deref(),
+            )],
+            DownloadOutcome::Silent => Vec::new(),
+        }
+    }
+}
+
+/// Writes the fetch audit record `outcome` implies (if any) and returns
+/// either `response` unchanged or the 500 [`audit_or_500`] substitutes
+/// for it on a write failure.
+fn finish_with_audit(
+    state: &CargoAppState,
+    ctx: &AuditContext,
+    response: Response,
+    outcome: DownloadOutcome,
+) -> Response {
+    let records = outcome.into_records(ctx);
+    if records.is_empty() {
+        return response;
+    }
+    match audit_or_500(&state.audit, &records) {
+        Some(failure) => failure,
+        None => response,
+    }
+}
+
 /// `GET /crates/{crate}/{version}/download`: the `.crate` bytes, gated on
 /// the organization's plugins, and only for a version the index gate
 /// admitted or the operator allowlisted.
 pub async fn cargo_download_handler(
     State(state): State<CargoAppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path((raw_name, raw_version)): Path<(String, String)>,
 ) -> Response {
+    // Built from the real TCP peer, never a client-supplied header — see
+    // `crate::http::artifact::artifact_handler`'s own doc comment for why.
+    let ctx = AuditContext::new(CARGO_ECOSYSTEM, peer);
+
     let name = match validate_name(&raw_name) {
         Ok(name) => name,
         Err(err) => return bad_request_response(&format!("invalid crate name: {err}")),
@@ -151,7 +241,10 @@ pub async fn cargo_download_handler(
     // itself: `approved_for_download` fetches it on every other path.
     if is_allowlisted_crate(&state.config.current(), &name, &raw_version) {
         return match allowlisted_entry(&state, &name, &raw_version).await {
-            Ok((key, entry)) => serve_gated(&state, &key, &entry, true).await,
+            Ok((key, entry)) => {
+                let (response, outcome) = serve_gated(&state, &key, &entry, true).await;
+                finish_with_audit(&state, &ctx, response, outcome)
+            }
             Err(response) => response,
         };
     }
@@ -163,17 +256,39 @@ pub async fn cargo_download_handler(
     {
         CargoDownloadApproval::Approved { key, entry } => {
             let fingerprint = state.cargo_scanner.fingerprint();
-            if plugin_checked(&state.verdicts, &key, &fingerprint).await {
-                return serve_gated(&state, &key, &entry, false).await;
-            }
-            serve_gated(&state, &key, &entry, true).await
+            let run_plugins = !plugin_checked(&state.verdicts, &key, &fingerprint).await;
+            let (response, outcome) = serve_gated(&state, &key, &entry, run_plugins).await;
+            finish_with_audit(&state, &ctx, response, outcome)
         }
-        CargoDownloadApproval::Refused(reason, why_id) => {
+        CargoDownloadApproval::Refused {
+            key,
+            reason,
+            why_id,
+        } => {
             // A stored block carries its own `/why` id, fetched the same
-            // way the PyPI path fetches it.
-            let link = why_id.and_then(|id| why_url(&state.config.current(), &id));
-            refusal_response(&reason, link.as_deref())
+            // way the PyPI path fetches it. Already a fully decided
+            // outcome — no plugin gate left to run — so the audit record
+            // is built right here rather than threaded any further.
+            let link = why_id
+                .clone()
+                .and_then(|id| why_url(&state.config.current(), &id));
+            let response = refusal_response(&reason, link.as_deref());
+            finish_with_audit(
+                &state,
+                &ctx,
+                response,
+                DownloadOutcome::Refused {
+                    key,
+                    reason,
+                    why_id,
+                },
+            )
         }
+        // Per the fetch audit log's own "only evaluated versions get a
+        // record" rule (see `crate::scan::cargo::CargoScanner::listing_audit`'s
+        // doc comment): a version with no stored verdict was never
+        // admitted by the index gate, so nothing was ever evaluated about
+        // it. No audit record either.
         CargoDownloadApproval::NotApproved => {
             refusal_response(&not_index_approved_reason(&name, &raw_version), None)
         }
@@ -244,7 +359,7 @@ async fn serve_gated(
     key: &ArtifactKey,
     entry: &CargoIndexEntry,
     run_plugins: bool,
-) -> Response {
+) -> (Response, DownloadOutcome) {
     if !run_plugins {
         return serve_verified_bytes(state, key, entry).await;
     }
@@ -260,13 +375,19 @@ async fn serve_verified_bytes(
     state: &CargoAppState,
     key: &ArtifactKey,
     entry: &CargoIndexEntry,
-) -> Response {
+) -> (Response, DownloadOutcome) {
     match cache_get(state, key).await {
         Ok(Some(path)) => match tokio::fs::read(&path).await {
-            Ok(bytes) => crate_response(bytes),
-            Err(err) => unverifiable_response(&internal_reason(&format!(
-                "reading the cached artifact: {err}"
-            ))),
+            Ok(bytes) => (
+                crate_response(bytes),
+                DownloadOutcome::Served { key: key.clone() },
+            ),
+            Err(err) => (
+                unverifiable_response(&internal_reason(&format!(
+                    "reading the cached artifact: {err}"
+                ))),
+                DownloadOutcome::Silent,
+            ),
         },
         Ok(None) => {
             // The cache entry is gone. Re-download and re-verify, but no
@@ -275,20 +396,26 @@ async fn serve_verified_bytes(
             let temp = match tempfile::tempdir() {
                 Ok(dir) => dir,
                 Err(err) => {
-                    return unverifiable_response(&internal_reason(&format!(
-                        "creating a temporary download directory: {err}"
-                    )))
+                    return (
+                        unverifiable_response(&internal_reason(&format!(
+                            "creating a temporary download directory: {err}"
+                        ))),
+                        DownloadOutcome::Silent,
+                    )
                 }
             };
             let dest = temp.path().join(&key.filename);
             match download_and_verify(state, entry, key, &dest).await {
                 Ok(local) => serve_cached(state, key, &local).await,
-                Err(response) => response,
+                Err(response) => (response, DownloadOutcome::Silent),
             }
         }
-        Err(err) => unverifiable_response(&internal_reason(&format!(
-            "reading the artifact cache: {err:#}"
-        ))),
+        Err(err) => (
+            unverifiable_response(&internal_reason(&format!(
+                "reading the artifact cache: {err:#}"
+            ))),
+            DownloadOutcome::Silent,
+        ),
     }
 }
 
@@ -314,7 +441,7 @@ async fn serve_with_plugin_dedup(
     state: &CargoAppState,
     key: &ArtifactKey,
     entry: &CargoIndexEntry,
-) -> Response {
+) -> (Response, DownloadOutcome) {
     match state.plugin_run_coordinator.start_or_join(&key.sha256) {
         Ok(tx) => {
             // Constructed first, exactly as `Scanner::scan_with_budget`'s
@@ -327,20 +454,31 @@ async fn serve_with_plugin_dedup(
                 Arc::clone(&state.plugin_run_coordinator),
                 key.sha256.clone(),
             );
-            let (response, verdict) = run_plugin_gate(state, key, entry).await;
+            let (response, verdict, outcome) = run_plugin_gate(state, key, entry).await;
             let _ = tx.send(verdict);
-            response
+            (response, outcome)
         }
         Err(rx) => match coordinator::wait_for_verdict(rx).await {
             Some(Verdict::Clean) => serve_verified_bytes(state, key, entry).await,
             Some(Verdict::Blocked(reason)) => {
                 let fingerprint = state.cargo_scanner.fingerprint();
-                let link = stored_why_id(&state.verdicts, key, &fingerprint)
-                    .await
+                let why_id = stored_why_id(&state.verdicts, key, &fingerprint).await;
+                let link = why_id
+                    .clone()
                     .and_then(|id| why_url(&state.config.current(), &id));
-                refusal_response(&reason, link.as_deref())
+                (
+                    refusal_response(&reason, link.as_deref()),
+                    DownloadOutcome::Refused {
+                        key: key.clone(),
+                        reason,
+                        why_id,
+                    },
+                )
             }
-            None => unverifiable_response(&scan_incomplete_reason()),
+            None => (
+                unverifiable_response(&scan_incomplete_reason()),
+                DownloadOutcome::Silent,
+            ),
         },
     }
 }
@@ -356,7 +494,7 @@ async fn run_plugin_gate(
     state: &CargoAppState,
     key: &ArtifactKey,
     entry: &CargoIndexEntry,
-) -> (Response, Option<Verdict>) {
+) -> (Response, Option<Verdict>, DownloadOutcome) {
     let fingerprint = state.cargo_scanner.fingerprint();
 
     let temp = match tempfile::tempdir() {
@@ -367,13 +505,14 @@ async fn run_plugin_gate(
                     "creating a temporary download directory: {err}"
                 ))),
                 None,
+                DownloadOutcome::Silent,
             )
         }
     };
     let dest = temp.path().join(&key.filename);
     let local = match download_and_verify(state, entry, key, &dest).await {
         Ok(local) => local,
-        Err(response) => return (response, None),
+        Err(response) => return (response, None, DownloadOutcome::Silent),
     };
 
     let unpacked = temp.path().join("unpacked");
@@ -387,6 +526,7 @@ async fn run_plugin_gate(
                     "unpacking the downloaded .crate: {err:#}"
                 ))),
                 None,
+                DownloadOutcome::Silent,
             )
         }
         Err(join_error) => {
@@ -395,6 +535,7 @@ async fn run_plugin_gate(
                     "the unpack task did not complete: {join_error}"
                 ))),
                 None,
+                DownloadOutcome::Silent,
             )
         }
     }
@@ -414,6 +555,7 @@ async fn run_plugin_gate(
                         "storing the clean verdict: {err:#}"
                     ))),
                     None,
+                    DownloadOutcome::Silent,
                 );
             }
             if let Err(err) = mark_plugin_checked(state, key, &fingerprint).await {
@@ -422,10 +564,11 @@ async fn run_plugin_gate(
                         "marking the verdict plugin-checked: {err:#}"
                     ))),
                     None,
+                    DownloadOutcome::Silent,
                 );
             }
-            let response = serve_cached(state, key, &local).await;
-            (response, Some(Verdict::Clean))
+            let (response, outcome) = serve_cached(state, key, &local).await;
+            (response, Some(Verdict::Clean), outcome)
         }
         Some(reason) => {
             if is_check_failure(&reason) {
@@ -440,7 +583,11 @@ async fn run_plugin_gate(
                     code = %reason.code,
                     "a cargo plugin could not run; answering unverifiable and storing nothing"
                 );
-                return (unverifiable_response(&reason), None);
+                return (
+                    unverifiable_response(&reason),
+                    None,
+                    DownloadOutcome::Silent,
+                );
             }
             let stored =
                 store_verdict(state, key, &Verdict::Blocked(reason.clone()), &fingerprint).await;
@@ -456,14 +603,24 @@ async fn run_plugin_gate(
                     (None, None)
                 }
             };
-            let link = why_id.and_then(|id| why_url(&state.config.current(), &id));
+            let link = why_id
+                .clone()
+                .and_then(|id| why_url(&state.config.current(), &id));
             tracing::warn!(
                 package = %key.package,
                 version = %key.version,
                 code = %reason.code,
                 "a cargo plugin blocked this artifact"
             );
-            (refusal_response(&reason, link.as_deref()), broadcast)
+            (
+                refusal_response(&reason, link.as_deref()),
+                broadcast,
+                DownloadOutcome::Refused {
+                    key: key.clone(),
+                    reason,
+                    why_id,
+                },
+            )
         }
     }
 }
@@ -554,7 +711,7 @@ async fn serve_cached(
     state: &CargoAppState,
     key: &ArtifactKey,
     local: &std::path::Path,
-) -> Response {
+) -> (Response, DownloadOutcome) {
     let cache = Arc::clone(&state.artifact_cache);
     let key_owned = key.clone();
     let file = local.to_path_buf();
@@ -584,10 +741,16 @@ async fn serve_cached(
     };
 
     match tokio::fs::read(&path).await {
-        Ok(bytes) => crate_response(bytes),
-        Err(err) => unverifiable_response(&internal_reason(&format!(
-            "reading the verified artifact: {err}"
-        ))),
+        Ok(bytes) => (
+            crate_response(bytes),
+            DownloadOutcome::Served { key: key.clone() },
+        ),
+        Err(err) => (
+            unverifiable_response(&internal_reason(&format!(
+                "reading the verified artifact: {err}"
+            ))),
+            DownloadOutcome::Silent,
+        ),
     }
 }
 

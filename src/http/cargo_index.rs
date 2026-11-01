@@ -55,15 +55,17 @@
 //! conditional-request support to the builder, and this task does not
 //! require it. Every index response is a full body.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
 
 use crate::artifact_cache::ArtifactCache;
+use crate::audit::{AuditContext, AuditLog};
 use crate::config::ConfigHandle;
 use crate::db::review::ReviewStore;
 use crate::db::verdict::VerdictStore;
@@ -73,9 +75,9 @@ use crate::ecosystem::cargo::upstream::CargoUpstream;
 use crate::plugin::PluginRunner;
 use crate::scan::cargo::{CargoIndexDecision, CargoScanner};
 
-use super::bad_request_response;
 use super::cargo_download::cargo_download_handler;
 use super::refusal::in_progress_response;
+use super::{audit_or_500, bad_request_response};
 
 /// Shared state for every handler in this module and for
 /// [`super::cargo_download`].
@@ -135,6 +137,13 @@ pub struct CargoAppState {
     /// Single-flight dedup for the `.crate` download's plugin run, keyed
     /// by artifact sha256. See the field's own doc line above.
     pub plugin_run_coordinator: Arc<crate::scan::coordinator::ScanCoordinator>,
+    /// The fetch audit log. [`cargo_index_handler`] and
+    /// [`super::cargo_download::cargo_download_handler`] both write to
+    /// this directly (via [`audit_or_500`]), for the same reason
+    /// [`super::AppState::audit`] does on the PyPI path: the client
+    /// address this log exists to record is an HTTP concept, and
+    /// [`CargoScanner`] must never see a `SocketAddr`.
+    pub audit: Arc<AuditLog>,
 }
 
 /// Builds the cargo deployment's router: `/config.json`, the `.crate`
@@ -181,8 +190,10 @@ pub fn cargo_router(state: CargoAppState) -> Router {
 /// id [`super::refusals`] queries for on this deployment. It is
 /// [`crate::scan::cargo`]'s own constant value; repeated here because
 /// that constant is private and this is the one place the HTTP layer has
-/// to name the ecosystem itself.
-const CARGO_ECOSYSTEM: &str = "cargo";
+/// to name the ecosystem itself. `pub(crate)` so
+/// [`super::cargo_download`] builds its own [`AuditContext`] under the
+/// same id rather than a second copy of this string.
+pub(crate) const CARGO_ECOSYSTEM: &str = "cargo";
 
 /// `GET /refusals` on a cargo deployment: the same listing
 /// [`super::refusals::refusals_handler`] serves on the PyPI path, read
@@ -252,8 +263,13 @@ pub async fn cargo_config_handler(State(state): State<CargoAppState>) -> Respons
 /// only the full-path comparison rejects it.
 pub async fn cargo_index_handler(
     State(state): State<CargoAppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(path): Path<String>,
 ) -> Response {
+    // Built from the real TCP peer, never a client-supplied header — see
+    // `crate::http::artifact::artifact_handler`'s own doc comment for why.
+    let ctx = AuditContext::new(CARGO_ECOSYSTEM, peer);
+
     let segments: Vec<&str> = path.split('/').collect();
     let Some(name) = segments.last() else {
         return bad_request_response("invalid crate name: the path has no segments");
@@ -277,10 +293,21 @@ pub async fn cargo_index_handler(
     }
 
     match state.cargo_scanner.decide_index(&name).await {
-        CargoIndexDecision::Entries(entries) => index_response(&entries),
+        CargoIndexDecision::Entries { entries, audit } => {
+            // Written before the index body is rendered: a write failure
+            // must become a 500 with no entries, never a response that
+            // implies this listing was recorded when it was not. See
+            // `audit_or_500`'s own doc comment.
+            let records = audit.records(&ctx, &name);
+            if let Some(failure) = audit_or_500(&state.audit, &records) {
+                return failure;
+            }
+            index_response(&entries)
+        }
         // The same retryable status the PyPI path uses for a scan still
         // running. See `super::refusal`'s module docs for why it is 429
-        // and not 503.
+        // and not 503. No fetch audit record either: no verdict was
+        // reached, so there is nothing yet to describe.
         CargoIndexDecision::InProgress => in_progress_response(),
     }
 }

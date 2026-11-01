@@ -24,6 +24,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use supply_chain_scanner::ai::provider::{ChatProvider, ProviderError};
 use supply_chain_scanner::ai::AiReviewer;
+use supply_chain_scanner::audit::ListingAudit;
 use supply_chain_scanner::config::{
     AiReviewConfig, AuditConfig, BlockOn, CargoRegistryConfig, Config, ConfigHandle, CveLine,
     UnknownSeverity,
@@ -444,7 +445,7 @@ fn key(name: &str, vers: &str, cksum: &str) -> ArtifactKey {
 
 fn versions_of(decision: &CargoIndexDecision) -> Vec<String> {
     match decision {
-        CargoIndexDecision::Entries(entries) => {
+        CargoIndexDecision::Entries { entries, .. } => {
             entries.iter().map(|entry| entry.vers.clone()).collect()
         }
         CargoIndexDecision::InProgress => panic!("expected entries, got InProgress"),
@@ -477,14 +478,17 @@ async fn a_never_before_seen_crate_with_one_clean_version_is_forwarded() {
 
     let decision = harness.scanner.decide_index("demo").await;
 
+    let CargoIndexDecision::Entries { entries, .. } = decision else {
+        panic!("expected entries, got InProgress");
+    };
     assert_eq!(
-        decision,
-        CargoIndexDecision::Entries(vec![CargoIndexEntry {
+        entries,
+        vec![CargoIndexEntry {
             name: "demo".to_string(),
             vers: "1.0.0".to_string(),
             cksum: demo[0].cksum.clone(),
             yanked: false,
-        }]),
+        }],
         "a single CVE-clean version that passes review must be forwarded"
     );
     assert_eq!(harness.provider.calls(), 1, "exactly one review must run");
@@ -721,7 +725,10 @@ async fn a_crate_that_upstream_does_not_have_forwards_an_empty_list() {
 
     assert_eq!(
         decision,
-        CargoIndexDecision::Entries(Vec::new()),
+        CargoIndexDecision::Entries {
+            entries: Vec::new(),
+            audit: ListingAudit::default(),
+        },
         "a genuinely missing crate is an empty list, not an error and not InProgress"
     );
     assert_eq!(harness.provider.calls(), 0);
@@ -741,7 +748,13 @@ async fn an_invalid_crate_name_never_reaches_upstream() {
 
     let decision = harness.scanner.decide_index("../etc/passwd").await;
 
-    assert_eq!(decision, CargoIndexDecision::Entries(Vec::new()));
+    assert_eq!(
+        decision,
+        CargoIndexDecision::Entries {
+            entries: Vec::new(),
+            audit: ListingAudit::default(),
+        }
+    );
     assert_eq!(harness.provider.calls(), 0);
     // The mock server received nothing at all.
     let received = server.received_requests().await.expect("request log");

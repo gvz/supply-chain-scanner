@@ -43,10 +43,11 @@ use std::time::{Duration, Instant};
 use crate::advisory::matching_semver::affects;
 use crate::advisory::Advisory;
 use crate::ai::{AiReviewer, ReviewOutcome};
+use crate::audit::{ListingAudit, VersionDecision};
 use crate::config::ConfigHandle;
 use crate::db::advisory::AdvisoryStore;
 use crate::db::cargo_vet::CargoVetStore;
-use crate::db::verdict::{StoredVerdict, VerdictStore};
+use crate::db::verdict::{FileVerdict, StoredVerdict, VerdictStore};
 use crate::ecosystem::cargo::index::{validate_name, CargoIndexEntry};
 use crate::ecosystem::cargo::normalize_name;
 use crate::ecosystem::cargo::upstream::{CargoUpstream, UpstreamError};
@@ -81,13 +82,31 @@ const DEFAULT_REQUIRED_CRITERION: &str = "safe-to-deploy";
 /// serve for one crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CargoIndexDecision {
-    /// The forwardable versions, newest first. The list can be empty, and
-    /// an empty list is rendered like a crate with no usable version —
-    /// never an error.
-    Entries(Vec<CargoIndexEntry>),
+    /// The forwardable versions, newest first, and the fetch audit log's
+    /// own record of this listing: how many versions upstream carried and
+    /// the cascade's decision for each one it actually evaluated. The
+    /// list of entries can be empty, and an empty list is rendered like a
+    /// crate with no usable version — never an error.
+    ///
+    /// `audit` is built once, at [`CargoScanner::run_cascade`]'s own
+    /// `NextStep::Forward` arm, which is the only point every fact a
+    /// `listed` line needs (which versions were yanked, CVE-blocked,
+    /// too-new, review-failed, allowlisted, and which were ultimately
+    /// forwarded) is in scope at the same time. Every other path that
+    /// produces this variant (an invalid name, a crate upstream does not
+    /// have, an upstream outage, an internal lookup failure) never ran
+    /// that decision, so it carries a minimal audit instead: the
+    /// `versions_upstream` count it actually knows, and no `listed` lines
+    /// — which is the honest answer when nothing was evaluated.
+    Entries {
+        entries: Vec<CargoIndexEntry>,
+        audit: ListingAudit,
+    },
     /// The shared budget ran out mid-cascade. The caller tells the client
     /// to retry shortly. The reviews that already finished are stored, so
-    /// a retry resumes rather than restarts.
+    /// a retry resumes rather than restarts. No fetch audit record is
+    /// written for this: no verdict was reached, so there is nothing yet
+    /// for a line to describe.
     InProgress,
 }
 
@@ -113,9 +132,15 @@ pub enum CargoDownloadApproval {
         key: ArtifactKey,
         entry: CargoIndexEntry,
     },
-    /// A durable `Blocked` verdict is on record. Carries the stored
-    /// reason and, when one exists, the `why_id` for a `/why/<id>` link.
-    Refused(RefusalReason, Option<String>),
+    /// A durable `Blocked` verdict is on record. Carries the artifact
+    /// `key` (so the fetch audit log's `refused` line can name the exact
+    /// version and filename without a further lookup), the stored reason,
+    /// and, when one exists, the `why_id` for a `/why/<id>` link.
+    Refused {
+        key: ArtifactKey,
+        reason: RefusalReason,
+        why_id: Option<String>,
+    },
     /// No stored verdict exists for this version at all. The index gate
     /// never admitted it, so it was never CVE-filtered, aged-checked, or
     /// reviewed. This is a refusal at download time, never an
@@ -233,7 +258,10 @@ impl CargoScanner {
                 package,
                 "refusing to cascade an invalid crate name; the caller validates first"
             );
-            return CargoIndexDecision::Entries(Vec::new());
+            return CargoIndexDecision::Entries {
+                entries: Vec::new(),
+                audit: ListingAudit::default(),
+            };
         }
         let normalized = normalize_name(package);
         // `Config` has no cargo-specific budget field. `scan_budget` is
@@ -250,7 +278,10 @@ impl CargoScanner {
                 // Upstream answered: no such crate. This is not an
                 // outage. It must not wipe what earlier requests
                 // already learned, so the remembered body stays.
-                return CargoIndexDecision::Entries(Vec::new());
+                return CargoIndexDecision::Entries {
+                    entries: Vec::new(),
+                    audit: ListingAudit::default(),
+                };
             }
             Err(err) => {
                 tracing::warn!(
@@ -326,9 +357,11 @@ impl CargoScanner {
         match self.lookup_stored_verdict(&key, &fingerprint).await {
             Ok(Some(stored)) => match stored.verdict {
                 Verdict::Clean => CargoDownloadApproval::Approved { key, entry },
-                Verdict::Blocked(reason) => {
-                    CargoDownloadApproval::Refused(reason, Some(stored.why_id))
-                }
+                Verdict::Blocked(reason) => CargoDownloadApproval::Refused {
+                    key,
+                    reason,
+                    why_id: Some(stored.why_id),
+                },
             },
             Ok(None) => CargoDownloadApproval::NotApproved,
             Err(err) => {
@@ -381,11 +414,26 @@ impl CargoScanner {
         entries: &[CargoIndexEntry],
     ) -> CargoIndexDecision {
         if entries.is_empty() {
-            return CargoIndexDecision::Entries(Vec::new());
+            return CargoIndexDecision::Entries {
+                entries: Vec::new(),
+                audit: ListingAudit::default(),
+            };
         }
         let facts = match self.facts(normalized, entries).await {
             Ok(facts) => facts,
-            Err(_) => return CargoIndexDecision::Entries(Vec::new()),
+            // An outage path's own lookup failure: no cascade decision
+            // was reached for any of these entries, so none of them were
+            // evaluated. See the `CargoIndexDecision::Entries` doc
+            // comment for why this is a minimal, not the rich, audit.
+            Err(_) => {
+                return CargoIndexDecision::Entries {
+                    entries: Vec::new(),
+                    audit: ListingAudit {
+                        versions_upstream: entries.len(),
+                        decisions: Vec::new(),
+                    },
+                }
+            }
         };
 
         // Nothing can be reviewed during an outage, so every version with
@@ -407,9 +455,19 @@ impl CargoScanner {
             facts.allowlisted,
         );
         match plan_cascade(&input) {
-            NextStep::Forward(versions) => {
-                CargoIndexDecision::Entries(entries_for_versions(entries, &versions))
-            }
+            // See the `CargoIndexDecision::Entries` doc comment: this
+            // outage path never has the full per-version picture
+            // `run_cascade`'s own `NextStep::Forward` arm does (no
+            // `cve_blocked` set survives past `cascade_input`, and
+            // nothing here was actually reviewed), so it reports only
+            // the count it does know, with no `listed` lines.
+            NextStep::Forward(versions) => CargoIndexDecision::Entries {
+                entries: entries_for_versions(entries, &versions),
+                audit: ListingAudit {
+                    versions_upstream: entries.len(),
+                    decisions: Vec::new(),
+                },
+            },
             // Unreachable: every non-forwardable survivor was just marked
             // failed. Answering empty rather than panicking keeps an
             // outage path free of unwraps.
@@ -420,7 +478,13 @@ impl CargoScanner {
                     "the cascade wanted a review during an upstream outage; \
                      forwarding nothing"
                 );
-                CargoIndexDecision::Entries(Vec::new())
+                CargoIndexDecision::Entries {
+                    entries: Vec::new(),
+                    audit: ListingAudit {
+                        versions_upstream: entries.len(),
+                        decisions: Vec::new(),
+                    },
+                }
             }
         }
     }
@@ -443,7 +507,13 @@ impl CargoScanner {
                     error = %err,
                     "the advisory or cargo-vet lookup failed; forwarding nothing"
                 );
-                return CargoIndexDecision::Entries(Vec::new());
+                return CargoIndexDecision::Entries {
+                    entries: Vec::new(),
+                    audit: ListingAudit {
+                        versions_upstream: entries.len(),
+                        decisions: Vec::new(),
+                    },
+                };
             }
         };
 
@@ -484,7 +554,28 @@ impl CargoScanner {
                         forwarded = forwarded.len(),
                         "the cargo cascade forwarded this crate"
                     );
-                    return CargoIndexDecision::Entries(forwarded);
+                    // The only point every fact a `listed` line needs is
+                    // in scope at once: `entries` (all of them, not just
+                    // survivors), `cve_blocked`, `facts.too_new`,
+                    // `facts.review_status` (just recovered above, so it
+                    // reflects every review this cascade run completed),
+                    // and `facts.allowlisted`. See
+                    // `CargoScanner::listing_audit`'s own doc comment.
+                    let audit = self
+                        .listing_audit(
+                            normalized,
+                            entries,
+                            &cve_blocked,
+                            &facts.too_new,
+                            &facts.review_status,
+                            &facts.allowlisted,
+                            &versions,
+                        )
+                        .await;
+                    return CargoIndexDecision::Entries {
+                        entries: forwarded,
+                        audit,
+                    };
                 }
                 NextStep::NeedsReview(vers) => vers,
             };
@@ -512,7 +603,13 @@ impl CargoScanner {
                     version = candidate,
                     "the cascade named a version that is not in the index; forwarding nothing"
                 );
-                return CargoIndexDecision::Entries(Vec::new());
+                return CargoIndexDecision::Entries {
+                    entries: Vec::new(),
+                    audit: ListingAudit {
+                        versions_upstream: entries.len(),
+                        decisions: Vec::new(),
+                    },
+                };
             };
 
             match self.review_one(normalized, &entry, remaining).await {
@@ -667,6 +764,183 @@ impl CargoScanner {
         .map_err(|join_error| {
             anyhow::anyhow!("the cargo cascade fact lookup panicked: {join_error}")
         })?
+    }
+
+    /// Builds the fetch audit log's record of one listing response:
+    /// `versions_upstream` plus one [`VersionDecision`] per *evaluated*
+    /// version, in the vocabulary [`crate::audit`] defines.
+    ///
+    /// Called from exactly one place, [`CargoScanner::run_cascade`]'s own
+    /// `NextStep::Forward` arm, because that is the only point this
+    /// cascade run's entire picture is in scope at once: every entry
+    /// upstream listed, which of them `cve_blocked`/`too_new` removed,
+    /// `review_status` as this run's reviews left it, the operator's
+    /// `allowlisted` set, and `forwarded` — the exact versions the
+    /// cascade decided to serve. A version not in `forwarded` and not
+    /// caught by any of the named reasons is a survivor the cascade
+    /// marked `ReviewStatus::Failed` without a real review ever running
+    /// (the default stamp [`CargoScanner::facts`] applies to every
+    /// unreviewed survivor when no `[ai_review]` reviewer is configured):
+    /// nothing was actually evaluated for it, so it gets no
+    /// [`VersionDecision`] at all, exactly like a version the cascade
+    /// never looked at.
+    ///
+    /// A review-failed version's reason text is read back from
+    /// [`VerdictStore::file_verdicts`] — one bulk read, done here and
+    /// nowhere else in this call, rather than threading a
+    /// [`crate::model::RefusalReason`] up from wherever in the cascade
+    /// loop a review actually finished. That avoids the defect an
+    /// earlier task's review flagged on the PyPI path: two independent
+    /// reads of the same fact (the filtering decision inside the cascade
+    /// loop, and a second lookup for the audit text) that a concurrent
+    /// rescan could make disagree. `facts()`'s own per-entry reads decide
+    /// `review_status`; this read only fills in the *text* for an
+    /// already-decided `Failed` version, from the single row
+    /// [`VerdictStore::put`] last wrote for it — and when no such row
+    /// exists (the default-stamped, never-really-reviewed case above),
+    /// it correctly finds nothing, which is exactly the signal used to
+    /// treat the version as never evaluated.
+    ///
+    /// Every argument is a distinct fact the single caller already has in
+    /// scope at its own call site (see that doc comment); bundling them
+    /// into a struct would only move the same list one level out, for no
+    /// gain — the same tradeoff `CargoScanner::new` already accepts.
+    #[allow(clippy::too_many_arguments)]
+    async fn listing_audit(
+        &self,
+        normalized: &str,
+        entries: &[CargoIndexEntry],
+        cve_blocked: &HashSet<String>,
+        too_new: &HashSet<String>,
+        review_status: &HashMap<String, ReviewStatus>,
+        allowlisted: &HashSet<String>,
+        forwarded: &[String],
+    ) -> ListingAudit {
+        let forwarded_set: HashSet<&str> = forwarded.iter().map(String::as_str).collect();
+        let file_verdicts = self.file_verdicts_by_version(normalized).await;
+
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut decisions = Vec::new();
+        for entry in entries {
+            let vers = entry.vers.as_str();
+            if !seen.insert(vers) {
+                // A duplicate index line for a version already decided.
+                continue;
+            }
+
+            if forwarded_set.contains(vers) {
+                decisions.push(VersionDecision {
+                    version: entry.vers.clone(),
+                    filename: None,
+                    allowed: true,
+                    reason_code: allowlisted
+                        .contains(vers)
+                        .then(|| "allowlisted".to_string()),
+                    reason_detail: None,
+                    why_id: None,
+                });
+                continue;
+            }
+
+            // Not forwarded: find the reason, in the cascade's own
+            // filtering order (yanked, then CVE, then too-new — see
+            // `plan_cascade`'s module docs), falling through to a real
+            // review failure last. A version matching none of these was
+            // never evaluated and gets no line at all.
+            let reason = if entry.yanked {
+                Some(("yanked".to_string(), None, None))
+            } else if cve_blocked.contains(vers) {
+                Some((
+                    "cve".to_string(),
+                    Some(
+                        "a known vulnerability blocks this version under the configured CVE line"
+                            .to_string(),
+                    ),
+                    None,
+                ))
+            } else if too_new.contains(vers) {
+                Some((
+                    "too-new".to_string(),
+                    Some(
+                        "this version was published too recently to meet the configured \
+                         minimum release age"
+                            .to_string(),
+                    ),
+                    None,
+                ))
+            } else if matches!(review_status.get(vers), Some(ReviewStatus::Failed)) {
+                file_verdicts.get(vers).map(|verdict| {
+                    (
+                        verdict.reason_code.clone(),
+                        Some(verdict.reason_detail.clone()),
+                        Some(verdict.why_id.clone()),
+                    )
+                })
+            } else {
+                None
+            };
+
+            if let Some((reason_code, reason_detail, why_id)) = reason {
+                decisions.push(VersionDecision {
+                    version: entry.vers.clone(),
+                    filename: None,
+                    allowed: false,
+                    reason_code: Some(reason_code),
+                    reason_detail,
+                    why_id,
+                });
+            }
+        }
+
+        ListingAudit {
+            versions_upstream: entries.len(),
+            decisions,
+        }
+    }
+
+    /// Every stored verdict for `normalized` under this scanner's running
+    /// policy fingerprint, keyed by version. Used only by
+    /// [`CargoScanner::listing_audit`], as the single source of the
+    /// reason text a review-failed version's audit line reports.
+    ///
+    /// A lookup failure is logged and answered as an empty map rather
+    /// than propagated: this is enrichment for the fetch audit log's
+    /// `listed` lines, not the gate itself, so a read error here must not
+    /// turn into a failure to serve the listing that is already decided.
+    /// The affected lines simply carry no reason text, which is honest —
+    /// not a wrong answer, an absent one.
+    async fn file_verdicts_by_version(&self, normalized: &str) -> HashMap<String, FileVerdict> {
+        let store = Arc::clone(&self.verdict_store);
+        let package = normalized.to_string();
+        let fingerprint = self.fingerprint();
+        match tokio::task::spawn_blocking(move || {
+            store.file_verdicts(ECOSYSTEM, &package, &fingerprint)
+        })
+        .await
+        {
+            Ok(Ok(verdicts)) => verdicts
+                .into_iter()
+                .map(|verdict| (verdict.version.clone(), verdict))
+                .collect(),
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    package = normalized,
+                    error = %format!("{err:#}"),
+                    "could not read stored verdicts for the listing audit; review-failed \
+                     reasons will be omitted from this response's audit lines"
+                );
+                HashMap::new()
+            }
+            Err(join_error) => {
+                tracing::warn!(
+                    package = normalized,
+                    error = %join_error,
+                    "the listing-audit verdict lookup task panicked; review-failed reasons \
+                     will be omitted from this response's audit lines"
+                );
+                HashMap::new()
+            }
+        }
     }
 
     /// The versions of `entries` published too recently under

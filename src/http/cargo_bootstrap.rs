@@ -32,17 +32,19 @@
 //! checks than the configuration asked for:
 //!
 //! 1. `Db::open` (migrations run inside it).
-//! 2. `Policy::build` — fails if a configured plugin binary is missing or
+//! 2. `AuditLog::open` — fails if the configured audit path cannot be
+//!    created or appended to.
+//! 3. `Policy::build` — fails if a configured plugin binary is missing or
 //!    unreadable.
-//! 3. The sandbox from [`super::default_sandbox_factory`] — fails if
+//! 4. The sandbox from [`super::default_sandbox_factory`] — fails if
 //!    `bwrap` is absent while plugins or `[ai_review]` are configured.
-//! 4. `PluginRunner`, then the `AiReviewer` via [`super::build_ai_reviewer`].
-//! 5. `ArtifactCache`, then the `CargoUpstream`.
-//! 6. An initial OSV sync for `"crates.io"` when that mirror is empty, on
+//! 5. `PluginRunner`, then the `AiReviewer` via [`super::build_ai_reviewer`].
+//! 6. `ArtifactCache`, then the `CargoUpstream`.
+//! 7. An initial OSV sync for `"crates.io"` when that mirror is empty, on
 //!    the same `advisory_source_url` the PyPI path uses.
-//! 7. An initial `CargoVetSync::sync_all` when the cargo-vet store is
+//! 8. An initial `CargoVetSync::sync_all` when the cargo-vet store is
 //!    empty.
-//! 8. `CargoScanner`, the state, and the router.
+//! 9. `CargoScanner`, the state, and the router.
 //!
 //! # No `Reloader`
 //!
@@ -71,6 +73,7 @@ use axum::Router;
 
 use crate::advisory::osv::OsvSync;
 use crate::artifact_cache::ArtifactCache;
+use crate::audit::AuditLog;
 use crate::cargovet::CargoVetSync;
 use crate::config::{Config, ConfigHandle};
 use crate::db::advisory::AdvisoryStore;
@@ -141,6 +144,17 @@ pub async fn bootstrap_cargo_with_sandbox_factory(
 
     let db = Db::open(&config.db_path)
         .with_context(|| format!("opening database at {}", config.db_path.display()))?;
+
+    // Opened this early, mirroring `super::bootstrap`'s own order, so an
+    // unwritable audit path aborts startup rather than surfacing later as
+    // a 500 on a developer's first fetch. See `AuditLog::open`'s own doc
+    // comment for the fail-closed guarantee this depends on.
+    let audit = Arc::new(AuditLog::open(&config.audit).with_context(|| {
+        format!(
+            "opening the fetch audit log at {}",
+            config.audit.path.display()
+        )
+    })?);
 
     let config = Arc::new(config);
     let policy = Arc::new(
@@ -241,6 +255,7 @@ pub async fn bootstrap_cargo_with_sandbox_factory(
         // and fetch coordinators separate (`Scanner::coordinator` vs.
         // `Scanner::fetch_coordinator`).
         plugin_run_coordinator: Arc::new(ScanCoordinator::new()),
+        audit,
     };
 
     let router = cargo_router(state.clone());

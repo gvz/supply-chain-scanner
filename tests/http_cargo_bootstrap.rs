@@ -44,8 +44,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use zip::ZipWriter;
 
 use supply_chain_scanner::config::{
-    AiReviewConfig, AuditConfig, BlockOn, CargoRegistryConfig, CargoVetSource, Config, CveLine,
-    PluginConfig, UnknownSeverity,
+    AiReviewConfig, AuditConfig, AuditRotation, BlockOn, CargoRegistryConfig, CargoVetSource,
+    Config, CveLine, PluginConfig, UnknownSeverity,
 };
 use supply_chain_scanner::db::cargo_vet::CargoVetStore;
 use supply_chain_scanner::db::verdict::VerdictStore;
@@ -261,6 +261,18 @@ fn cargo_config(
     cache_dir: PathBuf,
 ) -> Config {
     let base = Url::parse(&format!("{}/", server.uri())).expect("valid upstream index url");
+    // `bootstrap_cargo` now opens the audit log for real (this task), so
+    // this can no longer be `AuditConfig::default()`'s bare "audit.jsonl":
+    // that resolves relative to the test binary's current directory,
+    // which is the repo's working directory, and every test in this file
+    // would leave a real file behind there. Co-locating it next to this
+    // test's own `db_path` keeps it inside that test's tempdir, which is
+    // removed automatically when the `TempDir` guard drops. See
+    // `tests/e2e.rs`'s own `base_config` for the PyPI path's identical fix.
+    let audit_path = db_path
+        .parent()
+        .expect("db_path has a parent directory")
+        .join("audit.jsonl");
     Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         db_path,
@@ -292,7 +304,11 @@ fn cargo_config(
             min_release_age_days: None,
         }),
         npm_registry: None,
-        audit: AuditConfig::default(),
+        audit: AuditConfig {
+            path: audit_path,
+            rotation: AuditRotation::Daily,
+            max_files: 14,
+        },
     }
 }
 

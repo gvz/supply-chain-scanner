@@ -20,6 +20,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use supply_chain_scanner::artifact_cache::ArtifactCache;
+use supply_chain_scanner::audit::AuditLog;
 use supply_chain_scanner::config::{
     AllowEntry, AuditConfig, Config, ConfigHandle, CveLine, PluginConfig, UnknownSeverity,
 };
@@ -332,6 +333,11 @@ impl Harness {
                 db.clone(),
             )),
             plugin_run_coordinator: Arc::new(ScanCoordinator::new()),
+            // These tests are about the download/plugin gate's own
+            // behaviour, not the fetch audit log (that is
+            // `tests/http_audit_cargo.rs`), so a discarding writer is
+            // enough.
+            audit: Arc::new(AuditLog::with_writer(std::io::sink())),
         };
 
         let app = cargo_router(state);

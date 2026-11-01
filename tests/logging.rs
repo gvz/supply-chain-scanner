@@ -26,6 +26,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use supply_chain_scanner::advisory::Advisory;
 use supply_chain_scanner::artifact_cache::ArtifactCache;
+use supply_chain_scanner::audit::AuditLog;
 use supply_chain_scanner::config::{AuditConfig, Config, ConfigHandle, CveLine, UnknownSeverity};
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::db::index_cache::IndexCache;
@@ -188,6 +189,10 @@ fn build_harness(server: &MockServer) -> Harness {
         )),
         config: config_handle,
         ecosystem: pypi,
+        // No test in this file exercises the fetch audit log; it checks
+        // the `tracing` log instead. A sink keeps that true without a
+        // test writing an audit file into the repo working directory.
+        audit: Arc::new(AuditLog::with_writer(std::io::sink())),
     };
 
     Harness {
@@ -395,7 +400,11 @@ async fn every_request_produces_an_access_log_line_with_its_status() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
     });
 
     let response = reqwest::get(format!("http://{addr}/why/no-such-verdict"))

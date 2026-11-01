@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use supply_chain_scanner::artifact_cache::ArtifactCache;
+use supply_chain_scanner::audit::AuditLog;
 use supply_chain_scanner::config::{
     AiReviewConfig, AuditConfig, BlockOn, Config, ConfigHandle, CveLine, UnknownSeverity,
 };
@@ -149,6 +150,10 @@ async fn harness_with_config(cfg: Config) -> Harness {
         reviews: Arc::new(ReviewStore::new(db.clone())),
         config: config_handle,
         ecosystem: Arc::new(PyPi::new(Arc::new(ecosystem_upstream))),
+        // No test in this file exercises the fetch audit log; it covers
+        // `/api/reviews` instead. A sink keeps that true without a test
+        // writing an audit file into the repo working directory.
+        audit: Arc::new(AuditLog::with_writer(std::io::sink())),
     };
 
     let app = router(
@@ -166,7 +171,11 @@ async fn harness_with_config(cfg: Config) -> Harness {
         .expect("bind loopback listener");
     let addr = listener.local_addr().expect("local addr");
     let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
     });
 
     Harness {

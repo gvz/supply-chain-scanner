@@ -265,13 +265,27 @@ async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
 /// `axum::serve` here only ever negotiates HTTP/1.1: neither `axum` nor
 /// `hyper` were built with their `http2` Cargo feature, so the h2 crate is
 /// not even compiled into this binary.
+///
+/// Served via `into_make_service_with_connect_info::<SocketAddr>()` rather
+/// than the router directly: every handler that writes an audit record
+/// needs the real TCP peer address, extracted via axum's `ConnectInfo`,
+/// and that extractor only has something to extract when the service was
+/// built this way. Nothing upstream of this process ever sits between it
+/// and a client, and `X-Forwarded-For` is deliberately never read (a
+/// header a client sent itself could only be a forgery) — the connection's
+/// own peer address is the only client identity this proxy ever trusts.
 async fn serve(bind: std::net::SocketAddr, router: axum::Router) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding listener on {bind}"))?;
     tracing::info!(%bind, "listening");
 
-    axum::serve(listener, router).await.context("serving HTTP")
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .context("serving HTTP")
 }
 
 /// Periodically re-syncs the OSV advisory mirror, reusing one database

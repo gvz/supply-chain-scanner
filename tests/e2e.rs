@@ -27,7 +27,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
-use supply_chain_scanner::config::{AllowEntry, AuditConfig, Config, CveLine, UnknownSeverity};
+use supply_chain_scanner::config::{
+    AllowEntry, AuditConfig, AuditRotation, Config, CveLine, UnknownSeverity,
+};
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::http::{bootstrap, watch_for_reload, Wired};
 
@@ -121,6 +123,17 @@ fn base_config(
     db_path: PathBuf,
     cache_dir: PathBuf,
 ) -> Config {
+    // `bootstrap` now opens the audit log for real (Task 3), so this
+    // can no longer be `AuditConfig::default()`'s bare "audit.jsonl":
+    // that resolves relative to the test binary's current directory,
+    // which is the repo's working directory, and every test in this
+    // file would leave a real file behind there. Co-locating it next to
+    // the test's own `db_path` keeps it inside that test's tempdir,
+    // which is removed automatically when the `TempDir` guard drops.
+    let audit_path = db_path
+        .parent()
+        .expect("db_path has a parent directory")
+        .join("audit.jsonl");
     Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         db_path,
@@ -145,7 +158,11 @@ fn base_config(
         ai_review: None,
         cargo_registry: None,
         npm_registry: None,
-        audit: AuditConfig::default(),
+        audit: AuditConfig {
+            path: audit_path,
+            rotation: AuditRotation::Daily,
+            max_files: 14,
+        },
     }
 }
 
@@ -167,7 +184,11 @@ async fn start_server(
 
     let router = wired.router.clone();
     tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
+        let _ = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
     });
 
     Ok((base_url, addr, wired))
@@ -882,7 +903,11 @@ async fn config_reload_signal_applies_a_new_allowlist_entry() {
 
     let router = wired.router.clone();
     tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
+        let _ = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
     });
 
     // Before the reload: the advisory blocks this version.

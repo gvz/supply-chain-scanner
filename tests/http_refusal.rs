@@ -17,6 +17,7 @@ use axum::body::to_bytes;
 use axum::extract::{Path, State};
 
 use supply_chain_scanner::artifact_cache::ArtifactCache;
+use supply_chain_scanner::audit::AuditLog;
 use supply_chain_scanner::config::{AuditConfig, Config, ConfigHandle, CveLine, UnknownSeverity};
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::db::index_cache::IndexCache;
@@ -122,6 +123,11 @@ fn app_state() -> (tempfile::TempDir, tempfile::TempDir, AppState) {
         reviews: Arc::new(reviews_store),
         config: config_handle,
         ecosystem: Arc::new(PyPi::new(Arc::new(ecosystem_upstream))),
+        // No test in this file exercises the fetch audit log; it covers
+        // the refusal/why surface instead. A sink keeps that true
+        // without a test writing an audit file into the repo working
+        // directory.
+        audit: Arc::new(AuditLog::with_writer(std::io::sink())),
     };
 
     (db_dir, cache_dir, state)

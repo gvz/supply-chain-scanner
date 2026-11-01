@@ -53,6 +53,7 @@ use axum::Router;
 use crate::ai::provider::OpenAiCompatible;
 use crate::ai::AiReviewer;
 use crate::artifact_cache::ArtifactCache;
+use crate::audit::{AuditLog, AuditRecord};
 use crate::config::{AiReviewConfig, Config, ConfigHandle};
 use crate::db::advisory::AdvisoryStore;
 use crate::db::index_cache::IndexCache;
@@ -80,6 +81,13 @@ pub struct AppState {
     pub reviews: Arc<ReviewStore>,
     pub config: Arc<ConfigHandle>,
     pub ecosystem: Arc<dyn Ecosystem>,
+    /// The fetch audit log. `artifact::artifact_handler` writes to this
+    /// directly (via [`audit_or_500`]) rather than through `crate::scan`,
+    /// because the client address this log exists to record is an HTTP
+    /// concept — [`crate::scan::Scanner`] never sees a `SocketAddr` and
+    /// must not start to, since the design keeps the client IP out of
+    /// everything SQLite-backed.
+    pub audit: Arc<AuditLog>,
 }
 
 /// Builds the router: the simple index, the artifact/metadata proxy,
@@ -189,6 +197,52 @@ fn plain_text_response(status: StatusCode, body: &str) -> Response {
         })
 }
 
+/// Writes `records` to `audit`, or reports the one response every caller
+/// must substitute for whatever it was about to send.
+///
+/// The spec's non-negotiable is that an un-logged fetch must never
+/// happen: if this write fails, the request has to fail with a 500
+/// rather than complete — serving the artifact, or returning a refusal
+/// that implies the artifact *was* evaluated — on a fetch that was never
+/// actually recorded. A 403 is deliberately never substituted here, even
+/// when the record being written is itself a `refused` one: a write
+/// failure is an operational fault in this process (a full disk, a
+/// permissions change, a vanished mount), not a verdict about the
+/// package, and collapsing the two into the same status code would send
+/// an operator hunting a policy problem that does not exist. The failure
+/// is logged at `error!` here — the one place both outcomes
+/// (`Ok`/caller proceeds, `Err`/caller returns 500) share a call site —
+/// so a caller cannot forward the 500 without the cause also reaching
+/// the operator's logs.
+///
+/// Returns `None` on success, so the caller's own response path runs
+/// completely unchanged; `artifact::artifact_handler` is the first
+/// caller, and a later task's cargo and npm download handlers call this
+/// same function rather than each growing their own copy of this
+/// tradeoff.
+pub(crate) fn audit_or_500(audit: &AuditLog, records: &[AuditRecord]) -> Option<Response> {
+    match audit.write(records) {
+        Ok(()) => None,
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "failed to write a fetch audit record; refusing to serve rather than let this \
+                 fetch go unlogged"
+            );
+            Some(
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(axum::body::Body::empty())
+                    .unwrap_or_else(|_| {
+                        let mut response = Response::new(axum::body::Body::empty());
+                        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                        response
+                    }),
+            )
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Startup
 // ---------------------------------------------------------------------------
@@ -210,13 +264,22 @@ pub struct Wired {
 }
 
 /// The fail-closed startup sequence, in order: open the database
-/// (migrations run inside [`Db::open`]), build the [`Policy`] (fails if
-/// a configured plugin binary is missing or unreadable), detect the
-/// sandbox when plugins or the AI reviewer are configured (fails if
-/// `bwrap` is absent from `PATH`), build the [`Scanner`], and run an
-/// initial advisory sync if the mirror is empty. A failure anywhere in
-/// that chain is returned as `Err` — this function never produces a
-/// `Wired` backed by fewer checks than the configuration asked for.
+/// (migrations run inside [`Db::open`]), open the fetch audit log (fails
+/// if the configured path cannot be created or appended to), build the
+/// [`Policy`] (fails if a configured plugin binary is missing or
+/// unreadable), detect the sandbox when plugins or the AI reviewer are
+/// configured (fails if `bwrap` is absent from `PATH`), build the
+/// [`Scanner`], and run an initial advisory sync if the mirror is empty.
+/// A failure anywhere in that chain is returned as `Err` — this function
+/// never produces a `Wired` backed by fewer checks than the configuration
+/// asked for.
+///
+/// The audit log is opened this early, well before anything that touches
+/// a request, specifically so an unwritable path aborts startup outright
+/// rather than surfacing later as a 500 on a developer's first fetch:
+/// the fail-closed guarantee [`AuditLog`] and [`audit_or_500`] exist to
+/// provide only holds if this process never finishes booting on a path
+/// it cannot actually write to.
 ///
 /// Deliberately stops short of binding a listener, spawning the
 /// periodic sync/eviction tickers, or installing the `SIGHUP` reload
@@ -227,6 +290,13 @@ pub struct Wired {
 pub async fn bootstrap(config: Config) -> anyhow::Result<Wired> {
     let db = Db::open(&config.db_path)
         .with_context(|| format!("opening database at {}", config.db_path.display()))?;
+
+    let audit = Arc::new(AuditLog::open(&config.audit).with_context(|| {
+        format!(
+            "opening the fetch audit log at {}",
+            config.audit.path.display()
+        )
+    })?);
 
     let config = Arc::new(config);
     let policy = Policy::build(Arc::clone(&config))
@@ -300,6 +370,7 @@ pub async fn bootstrap(config: Config) -> anyhow::Result<Wired> {
         reviews: Arc::new(ReviewStore::new(db.clone())),
         config: Arc::clone(&config_handle),
         ecosystem: pypi,
+        audit,
     };
 
     let reloader = Arc::new(Reloader::with_sandbox_factory(

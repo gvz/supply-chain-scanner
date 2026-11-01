@@ -373,7 +373,11 @@ async fn start(
     let wired = bootstrap_cargo_with_sandbox_factory(cfg, factory).await?;
     let router = wired.router.clone();
     let served = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
+        let _ = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
     });
 
     Ok(Served {

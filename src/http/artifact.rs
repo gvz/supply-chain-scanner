@@ -12,28 +12,40 @@
 //! verified. An index entry with no declared hash is `Unverifiable`,
 //! exactly as [`crate::scan::Scanner::decide`] already treats it.
 
+use std::net::SocketAddr;
 use std::path::Path as FsPath;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Extension, Path, State};
+use axum::extract::{ConnectInfo, Extension, Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::Response;
 use tokio_util::io::ReaderStream;
 
+use crate::audit::{AuditContext, AuditRecord};
 use crate::ecosystem::pypi::index::IndexEntry;
 use crate::ecosystem::pypi::upstream::{Upstream, UpstreamError};
 use crate::model::{ArtifactKey, RefusalReason};
 use crate::scan::Decision;
 
 use super::refusal::{in_progress_response, refusal_response, unverifiable_response};
-use super::{bad_request_response, not_found_response, why_url, AppState};
+use super::{audit_or_500, bad_request_response, not_found_response, why_url, AppState};
 
 pub async fn artifact_handler(
     State(state): State<AppState>,
     Extension(upstream): Extension<Arc<Upstream>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path((raw_package, raw_version, raw_filename)): Path<(String, String, String)>,
 ) -> Response {
+    // Built once, up front, from the real TCP peer address axum's
+    // `ConnectInfo` extracted — never from `X-Forwarded-For` or any other
+    // client-supplied header, which this proxy never reads for exactly
+    // this reason: nothing sits in front of it, so that header could only
+    // be a forgery, and honouring it would let a developer write someone
+    // else's address into a security log. Threaded through every audit
+    // record this request produces below.
+    let ctx = AuditContext::new(state.ecosystem.id(), peer);
+
     let package = match state.ecosystem.validate_name(&raw_package) {
         Ok(name) => name,
         Err(err) => return bad_request_response(&format!("invalid package name: {err}")),
@@ -83,11 +95,39 @@ pub async fn artifact_handler(
     };
 
     match state.scanner.decide(&key, &entry).await {
-        Decision::Serve(path) => serve_file(&path).await,
+        // Written before `serve_file` streams a single byte: the whole
+        // point of the fail-closed design is that a record which cannot
+        // be written must stop the artifact from ever reaching the
+        // client, and that is only enforceable if the write happens
+        // first. See `audit_or_500`'s doc comment for why a write
+        // failure here becomes a 500, never a 403.
+        Decision::Serve(path) => {
+            let record =
+                AuditRecord::served(&ctx, &key.package, &key.version, &key.filename, &key.sha256);
+            if let Some(failure) = audit_or_500(&state.audit, &[record]) {
+                return failure;
+            }
+            serve_file(&path).await
+        }
         Decision::Refuse { reason, why_id } => {
+            let record = AuditRecord::refused(
+                &ctx,
+                &key.package,
+                &key.version,
+                Some(key.filename.as_str()),
+                &reason,
+                why_id.as_deref(),
+            );
+            if let Some(failure) = audit_or_500(&state.audit, &[record]) {
+                return failure;
+            }
             let link = why_id.and_then(|id| why_url(&state.config.current(), &id));
             refusal_response(&reason, link.as_deref())
         }
+        // No fetch happened and no verdict was reached, so neither of
+        // these produces an audit record: there is nothing yet to
+        // describe. A later poll that resolves to `Serve` or `Refuse`
+        // writes its own record when it does.
         Decision::InProgress => in_progress_response(),
         Decision::Unverifiable(reason) => unverifiable_response(&reason),
     }

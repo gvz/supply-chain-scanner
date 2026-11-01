@@ -19,6 +19,7 @@
 
 # Cross-cutting concerns
 
+- [The fetch audit log](./audit-log.md)
 - [The security model](./security-model.md)
 - [Testing](./testing.md)
 

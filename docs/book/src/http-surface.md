@@ -53,3 +53,7 @@ Every response also repeats the same sanitized text in a plain-text body, for cl
 ## Refused to render a refusal
 
 Even the failure path fails closed. If response building itself somehow fails, the fallback sends the refusal status with a hardcoded safe phrase. Never a 200, never a pass-through. `tests/http_refusal.rs` pins the sanitization, the phrase budgeting, and the truncation-priority rules.
+
+## No route exposes the audit log, or a client IP
+
+This surface is deliberately missing a route: there is no HTTP endpoint, on any deployment, that reads back the fetch audit log described in [the audit log chapter](./audit-log.md). The client IP that log records exists in exactly one place in this proxy — that log file — and every route listed above, being unauthenticated and read by the same developers whose fetches are logged, must never become a way to read it back out. `/refusals`, `/why/<id>` and `/api/reviews` render package, version, filename and reason; none of them carries a `client_ip` field, because nothing upstream of rendering ever put one there — the verdict store itself has no IP column to read. This is a constraint by construction, not a filter applied at render time.

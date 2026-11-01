@@ -377,6 +377,107 @@ Operators shipping logs off-host should know that **plugin stdout travels with
 them**: it is the same string published on `/why/<id>`, stripped of control bytes,
 but it is attacker-influenced text.
 
+## The fetch audit log
+
+A separate, structured JSON Lines file — not the `warn!`/`error!`/`info!` stdout
+logging above — recording which client fetched which package version, and
+which *evaluated* versions were withheld from which client and why. All three
+deployments (PyPI, cargo, npm) write it, in the same shape, from `src/audit.rs`.
+It exists to answer a question the stdout log cannot: a CVE is disclosed for a
+version this proxy forwarded last month, and security needs to know which
+machines pulled it. The full chapter, including the schema field by field and
+the reason-code vocabulary, is in the mdbook: "The fetch audit log".
+
+**Four event kinds**, one JSON object per line: `listing` (one per listing
+request, carrying `versions_upstream` and `versions_evaluated` — the counts
+that keep "never evaluated" distinguishable from "never fetched"), `listed`
+(one per *evaluated* version in a listing response, `allowed` or `denied` with
+a reason), `served` (a download that delivered bytes) and `refused` (a
+download that got a refusal response). Every line carries `ts`, `event`,
+`ecosystem`, `client_ip`, `client_port`, `request_id` and `package`; every
+other field is omitted entirely when absent, never written as `null`.
+
+A `listed` line requires a version the proxy actually reached a verdict on —
+on cargo and npm the cascade evaluates a handful of a package's versions per
+request and never looks at the rest, and on PyPI "evaluated" means an entry
+with a stored verdict under the running policy fingerprint. A version absent
+from the log may simply never have been a candidate; the `listing` line's
+counts are the only way to tell that apart from "nobody fetched it."
+`versions_upstream` counts index **entries** (files) on PyPI but **versions**
+on cargo and npm — the field name is shared across all three on purpose, so
+three deployments' shipped logs merge into one queryable stream, but a PyPI
+reader who assumes it counts distinct versions the way cargo and npm do reads
+it high.
+
+**A 403 refusal is always logged**, including a hash-mismatch refusal and
+cargo's `not-index-approved`/npm's `not-packument-approved`. **A 503, a 404,
+and a 429 "still in progress" are never logged** — none of them reflects a
+verdict the proxy actually reached. Non-package routes (`/healthz`,
+`/why/{id}`, `/refusals`, `/api/reviews`, `/config.json`, `/-/ping`, npm's
+security-audit stubs, npm's write/auth refusals) emit nothing.
+
+**Settings and defaults.** `[audit]` is a new, **required** table — unlike
+every other table in this file, an existing config with no `[audit]` table
+fails to parse, because the whole point of this feature is that an un-logged
+fetch must never happen; there is no "logging off" default to fall back to.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `path` | required | A filename **prefix**, not the exact file written. The rolling writer appends a date suffix, so `audit.jsonl` becomes `audit.jsonl.2026-11-01` (daily) or `audit.jsonl.2026-11-01-14` (hourly). A shipper has to glob on the prefix, not tail one fixed name. |
+| `rotation` | `daily` | `daily` or `hourly`. |
+| `max_files` | `14` | Rotated files kept before the oldest is deleted. |
+
+**Restart-only.** `[audit]` joins `bind` and `db_path` among the fields a
+`SIGHUP` reload rejects in full, naming `audit`, rather than applying — the
+open file handle is built once at startup, and there is no "close the old
+file, open the new one" step a reload could trigger.
+
+**Fail closed.** A write failure returns **500**, with no package bytes and
+no index/packument content — never a 403, because a write failure is an
+operational fault in this process, not a verdict about the package. The cause
+is logged at `error!` on stdout at the same call site: `failed to write a
+fetch audit record; refusing to serve rather than let this fetch go
+unlogged`. The trade this accepts deliberately: a full disk stops every build
+in the organization, on every ecosystem this proxy serves, in exchange for
+the guarantee that absence from the log means absence of a fetch rather than
+a silent gap indistinguishable from one. An unwritable configured path fails
+**at startup** instead — `bootstrap` opens this log before the router is
+built, naming the path in the boot error, rather than surfacing as a wave of
+500s discovered hours later on a developer's first fetch.
+
+**Where the client IP lives, and does not.** It exists in exactly one place
+in this proxy: this file. It is never written to SQLite — the verdict store
+gains no IP column — and never exposed on any HTTP route; `/refusals`,
+`/why/<id>` and `/api/reviews` are all unauthenticated and read by the same
+developers whose fetches are logged. `X-Forwarded-For` is never read: nothing
+sits in front of this proxy, so the header could only be a client forging its
+own identity, and the logged address is always the real TCP peer. This file
+now holds network-attributable data about real developers that the stdout
+log above never did, and it deserves its own filesystem permissions and its
+own retention policy, separate from the rest of this proxy's logs.
+
+**Volume.** One `listing` line plus one `listed` line per evaluated version,
+per listing request — tens of lines, not the thousand-plus versions a
+popular package's full history might carry. The cost that remains is
+repetition: every `npm install` refetches the packument for every package in
+the dependency tree, so a CI run with a few hundred dependencies emits
+thousands of lines on a single install, most of them restating verdicts that
+have not changed since the last run. Size retention for that steady-state
+rate rather than being surprised by it.
+
+**Two honest limitations.** A `served` line is written *before* the response
+body streams — fail-closed requires the write to happen first — so a
+connection that drops mid-transfer still produces a `served` line; the record
+means "this proxy decided to serve these bytes," not "these bytes arrived."
+And records are flushed to the OS but not `fsync`ed per line, since a sync on
+every line would dominate request latency at this log's volume: the
+guarantee is "no fetch without a successful write," not "no fetch without a
+*durable* write," so a kernel panic can still lose the tail of the file. A
+third, ecosystem-specific one: on npm, the `sha256` field on a `served` line
+carries whatever digest npm itself declared, which is a SHA-1 or a SHA-512 far
+more often than an actual SHA-256 (see "Integrity" above) — the field name
+predates this feature and was never renamed for it.
+
 ## Deployment
 
 No authentication and no rate limiting. Security depends entirely on network

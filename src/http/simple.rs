@@ -2,16 +2,29 @@
 //!
 //! This handler never serves bytes itself — it fetches upstream's index
 //! page for `package` through [`crate::ecosystem::Ecosystem::simple_page`],
-//! drops any entry [`crate::scan::Scanner::blocked_filenames`] says is
-//! blocked under today's policy (unless that version is allowlisted, in
-//! which case it must stay visible so pip can still select it), rewrites
-//! every surviving entry's URL to this proxy's own `/files/...` form, and
+//! drops any entry [`crate::scan::Scanner::file_verdicts`] says is blocked
+//! under today's policy (unless that version is allowlisted, in which
+//! case it must stay visible so pip can still select it), rewrites every
+//! surviving entry's URL to this proxy's own `/files/...` form, and
 //! renders the result with [`crate::ecosystem::pypi::index::render_simple_page`].
 //!
 //! Filtering here is a convenience, not the gate: [`super::artifact::artifact_handler`]
 //! independently re-decides every download regardless of what this page
-//! showed, exactly as [`crate::scan::Scanner::blocked_filenames`]'s own
-//! docs describe.
+//! showed.
+//!
+//! **One lookup, not two.** A predecessor of this handler read the
+//! blocked set from [`crate::scan::Scanner::blocked_filenames`] and the
+//! audit reasons from [`crate::scan::Scanner::file_verdicts`] as two
+//! separate, sequential DB round-trips. That let a verdict write landing
+//! between the two awaits (a concurrent re-scan flipping a verdict) make
+//! the page's filtering decision and the audit log's decision disagree
+//! about the very same request — exactly the kind of drift this audit
+//! feature exists to rule out. `file_verdicts` already carries `blocked`
+//! per filename, so the filtering decision below is derived from the
+//! same single read the audit decision uses: one row, one `blocked`
+//! bool, both consumers. `Scanner::blocked_filenames` and
+//! `VerdictStore::blocked_filenames` are untouched and keep their own
+//! tests; this handler simply no longer calls them.
 //!
 //! **The audit side of this handler.** PyPI has no cascade: most of
 //! upstream's entries have never been scanned at all, so "evaluated"
@@ -70,14 +83,14 @@ pub async fn simple_handler(
         Err(err) => return super::refusal::unverifiable_response(&upstream_unverifiable(&err)),
     };
 
-    let blocked = state
-        .scanner
-        .blocked_filenames(state.ecosystem.id(), &package)
-        .await;
-
-    // What `blocked` throws away the moment it answers "hide this or
-    // not": the reason, detail and why_id behind each evaluated entry's
-    // decision, which the `listed` audit records below need to report.
+    // The single source of truth for both this page's filtering and its
+    // audit decisions: one row per scanned filename, carrying `blocked`
+    // alongside the reason, detail and why_id the `listed` audit records
+    // need to report. Reading it once and deriving `is_blocked` from the
+    // same row the audit decision reads (below) is the whole point —
+    // two independent reads (one for filtering, one for the audit) could
+    // straddle a concurrent re-scan and see two different answers for
+    // the same filename on the same request.
     let file_verdicts = state
         .scanner
         .file_verdicts(state.ecosystem.id(), &package)
@@ -100,9 +113,14 @@ pub async fn simple_handler(
         };
 
         let allowlisted = is_allowlisted(&config, &package, &parsed.version);
-        let is_blocked = blocked.contains(&entry.filename);
+        let verdict = verdicts_by_filename.get(entry.filename.as_str());
+        // An entry with no stored verdict has never been scanned, so it
+        // was never blocked by this proxy — it stays on the page exactly
+        // as it always has, and (per the audit doc comment above) gets
+        // no `listed` line at all.
+        let is_blocked = verdict.is_some_and(|verdict| verdict.blocked);
 
-        if let Some(verdict) = verdicts_by_filename.get(entry.filename.as_str()) {
+        if let Some(verdict) = verdict {
             let (allowed, reason_code, reason_detail) = if verdict.blocked && allowlisted {
                 (
                     true,

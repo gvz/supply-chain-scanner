@@ -565,6 +565,7 @@ impl CargoScanner {
                         .listing_audit(
                             normalized,
                             entries,
+                            &facts.advisories,
                             &cve_blocked,
                             &facts.too_new,
                             &facts.review_status,
@@ -696,6 +697,25 @@ impl CargoScanner {
         })
     }
 
+    /// The advisory the fetch audit log cites for one CVE-blocked
+    /// version's `cve:<advisory-id>` reason code: the lowest-id advisory
+    /// among `advisories` that [`CargoScanner::advisory_blocks`] this
+    /// `version`, chosen deterministically when more than one blocks it
+    /// rather than by whatever order `advisories` iterates in. `None`
+    /// only when the caller's own `cve_blocked` set disagrees with this
+    /// same rule, which should not happen since both are built from the
+    /// same `advisories` list.
+    fn blocking_advisory<'a>(
+        &self,
+        advisories: &'a [Advisory],
+        version: &str,
+    ) -> Option<&'a Advisory> {
+        advisories
+            .iter()
+            .filter(|adv| self.advisory_blocks(adv, version))
+            .min_by(|a, b| a.id.cmp(&b.id))
+    }
+
     /// Reads every per-version fact one cascade iteration needs, on the
     /// blocking pool.
     async fn facts(&self, normalized: &str, entries: &[CargoIndexEntry]) -> anyhow::Result<Facts> {
@@ -810,6 +830,7 @@ impl CargoScanner {
         &self,
         normalized: &str,
         entries: &[CargoIndexEntry],
+        advisories: &[Advisory],
         cve_blocked: &HashSet<String>,
         too_new: &HashSet<String>,
         review_status: &HashMap<String, ReviewStatus>,
@@ -850,14 +871,34 @@ impl CargoScanner {
             let reason = if entry.yanked {
                 Some(("yanked".to_string(), None, None))
             } else if cve_blocked.contains(vers) {
-                Some((
-                    "cve".to_string(),
-                    Some(
-                        "a known vulnerability blocks this version under the configured CVE line"
-                            .to_string(),
-                    ),
-                    None,
-                ))
+                // The reason vocabulary is reused verbatim rather than
+                // invented, per the design spec: `cve:<advisory-id>` is
+                // the exact spelling `src/advisory/matching.rs`'s own
+                // `refusal_reason` already uses for the PyPI path, so a
+                // Loki hit on this denial carries the same id a `/why`
+                // link (were one to exist for this code) would. When
+                // more than one advisory blocks the same version, the
+                // lowest id is chosen, deterministically rather than by
+                // whatever order `advisories` happens to iterate in.
+                Some(match self.blocking_advisory(advisories, vers) {
+                    Some(adv) => {
+                        let severity = match adv.severity {
+                            Some(score) => format!("{score}"),
+                            None => "unknown".to_string(),
+                        };
+                        (
+                            format!("cve:{}", adv.id),
+                            Some(format!("{} (severity {severity})", adv.summary)),
+                            None,
+                        )
+                    }
+                    // Unreachable in practice: `cve_blocked` was built
+                    // from this same `advisories` list via the same
+                    // `advisory_blocks` rule a moment earlier in
+                    // `run_cascade`. Falls back to the bare code rather
+                    // than panicking if that invariant is ever broken.
+                    None => ("cve".to_string(), None, None),
+                })
             } else if too_new.contains(vers) {
                 Some((
                     "too-new".to_string(),

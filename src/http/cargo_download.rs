@@ -141,11 +141,20 @@ const MAX_VERSION_LEN: usize = 128;
 enum DownloadOutcome {
     /// Bytes were served for this artifact key.
     Served { key: ArtifactKey },
-    /// A refusal response was built from a durable reason. `why_id` is
-    /// `Some` only when storing the verdict that produced this refusal
-    /// actually succeeded.
+    /// A refusal response was built from a reason. `filename` is `None`
+    /// only for `CargoDownloadApproval::NotApproved`'s own refusal: no
+    /// index entry was ever matched for that request, so there is no
+    /// verified filename to name, but a refusal response still reached
+    /// the client and still has to be reported as one — this is `refused`
+    /// per the design spec's own definition ("a download that got a
+    /// refusal response"), not the listing path's "only evaluated
+    /// versions get a record" rule, which governs `listed` lines, not
+    /// `refused` ones. `why_id` is `Some` only when a durable verdict
+    /// backs this refusal and storing it actually succeeded.
     Refused {
-        key: ArtifactKey,
+        package: String,
+        version: String,
+        filename: Option<String>,
         reason: RefusalReason,
         why_id: Option<String>,
     },
@@ -170,14 +179,16 @@ impl DownloadOutcome {
                 &key.sha256,
             )],
             DownloadOutcome::Refused {
-                key,
+                package,
+                version,
+                filename,
                 reason,
                 why_id,
             } => vec![AuditRecord::refused(
                 ctx,
-                &key.package,
-                &key.version,
-                Some(key.filename.as_str()),
+                &package,
+                &version,
+                filename.as_deref(),
                 &reason,
                 why_id.as_deref(),
             )],
@@ -278,19 +289,39 @@ pub async fn cargo_download_handler(
                 &ctx,
                 response,
                 DownloadOutcome::Refused {
-                    key,
+                    package: key.package,
+                    version: key.version,
+                    filename: Some(key.filename),
                     reason,
                     why_id,
                 },
             )
         }
-        // Per the fetch audit log's own "only evaluated versions get a
-        // record" rule (see `crate::scan::cargo::CargoScanner::listing_audit`'s
-        // doc comment): a version with no stored verdict was never
-        // admitted by the index gate, so nothing was ever evaluated about
-        // it. No audit record either.
+        // No stored verdict exists for this version at all: the index
+        // gate never admitted it, so there is no artifact key to name a
+        // filename from. That is the "only evaluated versions get a
+        // `listed` record" rule's own territory (see
+        // `crate::scan::cargo::CargoScanner::listing_audit`'s doc
+        // comment) — it governs the *listing* path's `listed` lines, not
+        // this one. A refusal response still reaches the client here,
+        // and the design spec defines `refused` as exactly that ("a
+        // download that got a refusal response"), so this still writes
+        // one, with `filename: None` since no entry was ever matched.
         CargoDownloadApproval::NotApproved => {
-            refusal_response(&not_index_approved_reason(&name, &raw_version), None)
+            let reason = not_index_approved_reason(&name, &raw_version);
+            let response = refusal_response(&reason, None);
+            finish_with_audit(
+                &state,
+                &ctx,
+                response,
+                DownloadOutcome::Refused {
+                    package: name,
+                    version: raw_version,
+                    filename: None,
+                    reason,
+                    why_id: None,
+                },
+            )
         }
         CargoDownloadApproval::NotFound => not_found_response(),
         CargoDownloadApproval::Unverifiable(reason) => unverifiable_response(&RefusalReason {
@@ -469,7 +500,9 @@ async fn serve_with_plugin_dedup(
                 (
                     refusal_response(&reason, link.as_deref()),
                     DownloadOutcome::Refused {
-                        key: key.clone(),
+                        package: key.package.clone(),
+                        version: key.version.clone(),
+                        filename: Some(key.filename.clone()),
                         reason,
                         why_id,
                     },
@@ -616,7 +649,9 @@ async fn run_plugin_gate(
                 refusal_response(&reason, link.as_deref()),
                 broadcast,
                 DownloadOutcome::Refused {
-                    key: key.clone(),
+                    package: key.package.clone(),
+                    version: key.version.clone(),
+                    filename: Some(key.filename.clone()),
                     reason,
                     why_id,
                 },

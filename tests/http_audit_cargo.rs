@@ -34,8 +34,8 @@ use supply_chain_scanner::advisory::Advisory;
 use supply_chain_scanner::artifact_cache::ArtifactCache;
 use supply_chain_scanner::audit::AuditLog;
 use supply_chain_scanner::config::{
-    AiReviewConfig, AuditConfig, AuditRotation, BlockOn, CargoRegistryConfig, Config, ConfigHandle,
-    CveLine, PluginConfig, UnknownSeverity,
+    AiReviewConfig, AllowEntry, AuditConfig, AuditRotation, BlockOn, CargoRegistryConfig, Config,
+    ConfigHandle, CveLine, PluginConfig, UnknownSeverity,
 };
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::db::cargo_vet::CargoVetStore;
@@ -517,6 +517,17 @@ async fn a_cargo_index_listing_logs_forwarded_and_filtered_versions_with_reasons
 
     let mut cfg = base_config(&server);
     cfg.cargo_registry.as_mut().unwrap().min_release_age_days = Some(30);
+    // The forwarded version is also allowlisted, on top of being
+    // cargo-vet covered: its `listed` line must still say `allowed`
+    // (allowlisted and vet-covered are both forwardable, and the
+    // allowlist is checked first), but now with `reason_code:
+    // "allowlisted"` rather than no reason at all. This perturbs neither
+    // `versions_upstream` nor `versions_evaluated` nor the count of
+    // `listed` lines below: 3.0.0 already had one.
+    cfg.allowlist = vec![AllowEntry {
+        package: name.to_string(),
+        version: "3.0.0".to_string(),
+    }];
 
     let (audit_dir, audit) = audit_log_over_tempdir();
     let harness = start(server, cfg, audit).await;
@@ -571,13 +582,21 @@ async fn a_cargo_index_listing_logs_forwarded_and_filtered_versions_with_reasons
         .collect();
     assert_eq!(codes_by_version["0.9.0"], "yanked");
     assert_eq!(codes_by_version["2.0.0"], "too-new");
-    assert_eq!(codes_by_version["1.5.0"], "cve");
+    // The reason vocabulary is reused verbatim from
+    // `src/advisory/matching.rs`'s own `cve:<advisory-id>` spelling, not
+    // a bare "cve", so a Loki hit on this denial carries the same id a
+    // `/why` link would.
+    assert_eq!(codes_by_version["1.5.0"], "cve:OSV-TEST-0001");
 
     let allowed = listed
         .iter()
         .find(|line| line["version"] == "3.0.0")
         .expect("the forwarded version has a listed line");
     assert_eq!(allowed["decision"], "allowed");
+    assert_eq!(
+        allowed["reason_code"], "allowlisted",
+        "a forwarded version that is also allowlisted must say so, not read as an ordinary pass"
+    );
 }
 
 /// A version the cascade marked review-failed from a *real* stored
@@ -735,6 +754,46 @@ async fn a_refused_cargo_download_writes_a_refused_line() {
     assert_eq!(record["event"], "refused");
     assert_eq!(record["reason_code"], "plugin:yara");
     assert!(record["why_id"].is_string());
+}
+
+/// A version the index gate never admitted (no stored verdict at all)
+/// still gets a `refused` line when the download is refused: the design
+/// spec defines `refused` as "a download that got a refusal response",
+/// and a 403 reaches the client here exactly as it does for a
+/// pre-existing stored block. `filename` is absent, since no index entry
+/// was ever matched for this request to name one from.
+#[tokio::test]
+async fn a_not_approved_cargo_download_writes_a_refused_line_with_no_filename() {
+    let server = MockServer::start().await;
+    let name = "demo-crate";
+    // Deliberately no stored verdict for this version: the index gate
+    // never reached it, so `approved_for_download` answers `NotApproved`.
+    mount_index(&server, name, &[line("1.0.0", "cksum-1.0.0", false)]).await;
+
+    let cfg = base_config(&server);
+    let (audit_dir, audit) = audit_log_over_tempdir();
+    let harness = start(server, cfg, audit).await;
+
+    let response = reqwest::get(format!(
+        "http://{}/crates/{name}/1.0.0/download",
+        harness.addr
+    ))
+    .await
+    .expect("request crate download");
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let lines = read_audit_lines(audit_dir.path(), "audit.jsonl");
+    let record = lines
+        .iter()
+        .find(|line| line["event"] == "refused")
+        .expect("a refused record was written for the never-admitted version");
+    assert_eq!(record["package"], name);
+    assert_eq!(record["version"], "1.0.0");
+    assert!(
+        record.get("filename").is_none(),
+        "no index entry was ever matched, so filename must be absent, not null or fabricated: {record:?}"
+    );
+    assert_eq!(record["reason_code"], "not-index-approved");
 }
 
 /// A sandbox stub that always reports a plugin block, for

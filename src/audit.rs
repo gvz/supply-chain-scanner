@@ -623,6 +623,109 @@ mod tests {
         (cell, clock)
     }
 
+    /// A clock that jumps one day further *every single time it is read*,
+    /// starting from `start`. Used by
+    /// `audit_log_write_keeps_one_complete_record_per_file_under_a_clock_that_advances_every_read`
+    /// below to make a rotation-per-token bug impossible to survive: if
+    /// anything in the write path consults this clock more than once per
+    /// record, that record's bytes land in more than one file.
+    fn advancing_clock(start: chrono::DateTime<Utc>) -> ClockFn {
+        let day = Arc::new(Mutex::new(0i64));
+        Box::new(move || {
+            let mut day = day.lock().expect("clock mutex");
+            let now = start + chrono::Duration::days(*day);
+            *day += 1;
+            now
+        })
+    }
+
+    /// Regression test for the Critical fix, exercised through the actual
+    /// public path (`AuditLog::write` -> `RotatingFile`), not by calling
+    /// `write_all` directly with a hand-built buffer: that would also pass
+    /// pre-fix, since a small buffer written in one `write_all` call issues
+    /// exactly one `write` either way and proves nothing about
+    /// `serde_json`'s many per-token writes.
+    ///
+    /// Against `advancing_clock`, which returns a *new* day on every read,
+    /// the fix (buffer a whole record, then one `write_all` -> one
+    /// rotation decision) must still land each record whole in exactly one
+    /// file: `AuditLog::write` only ever reads the clock once per record.
+    /// Reintroducing the old bug — streaming `serde_json::to_writer`
+    /// straight into the locked writer — would have the formatter's many
+    /// small `write_all` calls each consult this clock, rotating mid
+    /// -record and scattering unparseable fragments across several files;
+    /// this test fails loudly if that regression returns (verified by
+    /// hand; see the task-2-report.md fix report for what the failure
+    /// looked like).
+    #[test]
+    fn audit_log_write_keeps_one_complete_record_per_file_under_a_clock_that_advances_every_read() {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let config = AuditConfig {
+            path: dir.path().join("audit.jsonl"),
+            rotation: AuditRotation::Daily,
+            max_files: 365,
+        };
+        let start = Utc
+            .with_ymd_and_hms(2026, 11, 1, 0, 0, 0)
+            .single()
+            .expect("valid datetime");
+        let rotating =
+            RotatingFile::open_with_clock(&config, advancing_clock(start)).expect("open succeeds");
+        let log = AuditLog::with_writer(rotating);
+
+        let client: SocketAddr = "10.1.2.3:51234".parse().expect("valid socket addr");
+        let ctx = AuditContext::new("pypi", client);
+        let records: Vec<AuditRecord> = (0..5)
+            .map(|i| {
+                AuditRecord::served(
+                    &ctx,
+                    "pkg",
+                    "1.0.0",
+                    "pkg-1.0.0.tar.gz",
+                    &format!("{i:064x}"),
+                )
+            })
+            .collect();
+
+        log.write(&records).expect("write succeeds");
+
+        let mut complete_records_found = 0usize;
+        for entry in std::fs::read_dir(dir.path()).expect("read tempdir") {
+            let entry = entry.expect("dir entry");
+            if !entry.file_type().expect("file type").is_file() {
+                continue;
+            }
+            let contents = std::fs::read_to_string(entry.path()).expect("read dated file");
+            if contents.is_empty() {
+                // The file created at `open`, before the first record ever
+                // rotated away from it: never written to, legitimately empty.
+                continue;
+            }
+            let lines: Vec<&str> = contents.lines().collect();
+            assert_eq!(
+                lines.len(),
+                1,
+                "{} must hold exactly one record, found {} lines: {:?}",
+                entry.path().display(),
+                lines.len(),
+                lines
+            );
+            serde_json::from_str::<serde_json::Value>(lines[0]).unwrap_or_else(|err| {
+                panic!(
+                    "{} does not hold one complete record ({err}); a rotation-per-token \
+                     regression would scatter a record's bytes across files like this: {contents:?}",
+                    entry.path().display()
+                )
+            });
+            complete_records_found += 1;
+        }
+        assert_eq!(
+            complete_records_found,
+            records.len(),
+            "every record must have landed whole in exactly one file"
+        );
+    }
+
     /// `directory_and_prefix` must not be fooled by a bare filename with
     /// no directory component into trying to create an empty directory.
     #[test]

@@ -20,7 +20,7 @@
 - **Fail closed:** a failed audit write returns `500 Internal Server Error` and no package bytes. Never a 403 — a write failure must not read as a policy refusal.
 - **Records are written before the response body**, including before the first streamed artifact byte.
 - **Only versions the cascade actually evaluated get a verdict line.** Versions never considered are counted, never listed.
-- **Reason vocabulary is the existing one:** `reason_code`, `reason_detail`, `why_id` as `src/db/verdict.rs` stores them. Existing spellings to reuse verbatim: `too-new`, `yanked`, `cve`, `plugin:*`, `ai:*`.
+- **Reason vocabulary is the existing one:** `reason_code`, `reason_detail`, `why_id` as `src/db/verdict.rs` stores them. Existing spellings to reuse verbatim: `too-new`, `yanked`, `cve:<advisory-id>`, `plugin:*`, `ai:*`. (Corrected during execution — see "Rulings applied during execution" at the end of this plan.)
 - **`[audit]` is restart-only**, alongside `bind` and `db_path`. A reload that changes it is rejected in full with the field named.
 - **Non-package routes emit nothing:** `/healthz`, `/why/{id}`, `/refusals`, `/api/reviews`, `/-/ping`, the npm audit stubs, the npm write refusals.
 
@@ -840,3 +840,40 @@ Expected: success, no broken links.
 git add docs/
 git commit -m "docs(audit): document the fetch audit log for operators"
 ```
+
+
+---
+
+## Rulings applied during execution
+
+These are decisions taken while executing the plan, where the plan was wrong,
+silent, or contradicted the spec. The spec was the binding authority throughout.
+The full list with costs-if-wrong lives in the execution ledger; these are the
+ones that changed what shipped relative to the text above.
+
+- **The CVE denial code is `cve:<advisory-id>`, not the bare `cve`** this plan
+  mandated for cargo and npm. The spec requires reusing the codebase's existing
+  spellings verbatim so a log hit reaches the advisory that caused it; the
+  existing spelling is `cve:<advisory-id>` (`src/advisory/matching.rs`), and the
+  matching advisory *is* in scope at the cascade's decision point — the plan's
+  bare code rested on a wrong assumption that it was not. Where several
+  advisories match one version, the lexicographic minimum id wins.
+- **`FileVerdict` carries `version`.** Task 4's interface block omitted it, but
+  cargo and npm decide per version, not per file, and would otherwise have had to
+  reconstruct a filename to look a reason up.
+- **Task 3 rewired all ten router-serving test files**, not the one this plan
+  named. `ConnectInfo` extraction fails on any router served without
+  `into_make_service_with_connect_info`, so doing the cargo and npm files later
+  would have opened Tasks 5 and 6 on a red suite.
+- **Every arm returning a 403 writes a `refused` record**, including the
+  hash-mismatch refusal in both `cargo_download` and `npm_download`, which this
+  plan never mentioned. A 503 unverifiable, a 404, and a 429 write nothing. The
+  hash-mismatch case is the highest-signal denial the log carries — bytes that do
+  not match the registry-declared digest — and it was silent on cargo and npm
+  while PyPI logged it.
+- **`[audit]` is a required config table** with a Rust-side `AuditConfig::default()`
+  for test ergonomics; its serde contract still requires `path`.
+- **`tracing-appender` was rejected** and the rotating writer hand-rolled: the
+  crate's `write()` handles a failed period-open by printing to stderr and then
+  writing into the stale previous-period handle while returning `Ok`, which
+  defeats the fail-closed contract this log exists to keep.

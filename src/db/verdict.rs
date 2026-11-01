@@ -71,6 +71,27 @@ pub struct BlockedVerdict {
     pub scanned_at: i64,
 }
 
+/// Every verdict on record for one package under `fingerprint`, keyed by
+/// filename. Carries what an audit line needs that
+/// [`VerdictStore::blocked_filenames`] drops: whether it was blocked,
+/// why, and its `why_id`. `version` rides along too (selected straight
+/// off the `verdicts` table's own `version` column) because PyPI's
+/// listing audit needs both: a PyPI `listed` record carries `version`
+/// *and* `filename`, since one version can ship several files and only
+/// some of them get blocked. cargo and npm decide per version rather
+/// than per file, so their own listing audits (later tasks) only need
+/// this same `version` field and never have to reconstruct it by parsing
+/// `filename` back apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileVerdict {
+    pub filename: String,
+    pub version: String,
+    pub blocked: bool,
+    pub reason_code: String,
+    pub reason_detail: String,
+    pub why_id: String,
+}
+
 /// The durable record of every artifact this scanner has ever scanned.
 pub struct VerdictStore {
     db: Db,
@@ -346,6 +367,50 @@ impl VerdictStore {
             filenames.insert(row.context("reading blocked filename row")?);
         }
         Ok(filenames)
+    }
+
+    /// Every verdict on record for `(ecosystem, package)` under the given
+    /// policy `fingerprint`, one row per scanned filename.
+    ///
+    /// This is [`VerdictStore::blocked_filenames`]'s query without the
+    /// `blocked = 1` clause, carrying what an audit line needs that
+    /// `blocked_filenames` deliberately drops: whether each filename was
+    /// blocked, why, and its `why_id`. `blocked_filenames` only has to
+    /// answer "hide this or not", so it discards the reason the moment
+    /// it has the filename; a listing audit record has to say *which*
+    /// evaluated entries were denied and why, so this keeps it.
+    pub fn file_verdicts(
+        &self,
+        ecosystem: &str,
+        package: &str,
+        fingerprint: &str,
+    ) -> anyhow::Result<Vec<FileVerdict>> {
+        let conn = self.db.conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT filename, version, blocked, reason_code, reason_detail, why_id
+                 FROM verdicts
+                 WHERE ecosystem = ?1 AND package = ?2 AND fingerprint = ?3",
+            )
+            .context("preparing file_verdicts query")?;
+        let rows = stmt
+            .query_map(rusqlite::params![ecosystem, package, fingerprint], |row| {
+                Ok(FileVerdict {
+                    filename: row.get(0)?,
+                    version: row.get(1)?,
+                    blocked: row.get(2)?,
+                    reason_code: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    reason_detail: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    why_id: row.get(5)?,
+                })
+            })
+            .context("querying file verdicts")?;
+
+        let mut verdicts = Vec::new();
+        for row in rows {
+            verdicts.push(row.context("reading file verdict row")?);
+        }
+        Ok(verdicts)
     }
 }
 

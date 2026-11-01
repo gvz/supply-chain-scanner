@@ -12,21 +12,53 @@
 //! independently re-decides every download regardless of what this page
 //! showed, exactly as [`crate::scan::Scanner::blocked_filenames`]'s own
 //! docs describe.
+//!
+//! **The audit side of this handler.** PyPI has no cascade: most of
+//! upstream's entries have never been scanned at all, so "evaluated"
+//! here means "has a stored verdict under today's policy fingerprint" —
+//! [`crate::scan::Scanner::file_verdicts`] is exactly that lookup. One
+//! `listing` record is written counting how many entries upstream's
+//! page carried against how many of those were actually evaluated, and
+//! one `listed` record follows per evaluated entry, naming both its
+//! `version` and `filename` (PyPI decides per file, so one version can
+//! be part-blocked) and whether it was allowed or denied and why. An
+//! entry upstream listed but this proxy never scanned gets no `listed`
+//! record at all — counting it as "evaluated" would make "never looked
+//! at" indistinguishable from "looked at and let through", which is
+//! exactly the confusion the design calls out. A blocked-but-allowlisted
+//! entry stays visible on the page as it always has, but its audit line
+//! still has to say the scan itself found something: it is logged
+//! `allowed` with `reason_code: "allowlisted"` rather than as an
+//! ordinary pass, so a reader of the log can tell the two apart. Written
+//! before the rendered page is returned, and — like every write
+//! `audit_or_500` guards — a write failure here is a 500 with no index
+//! HTML, never a page that implies this listing was recorded when it
+//! was not.
 
-use axum::extract::{Path, State};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 
+use crate::audit::{AuditContext, ListingAudit, VersionDecision};
+use crate::db::verdict::FileVerdict;
 use crate::ecosystem::pypi::index::{render_simple_page, IndexEntry};
 use crate::ecosystem::pypi::upstream::UpstreamError;
 use crate::scan::is_allowlisted;
 
-use super::{bad_request_response, not_found_response, AppState};
+use super::{audit_or_500, bad_request_response, not_found_response, AppState};
 
 pub async fn simple_handler(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(raw_package): Path<String>,
 ) -> Response {
+    // See `artifact_handler`'s own doc comment for why this is built
+    // from the real TCP peer and never from a client-supplied header.
+    let ctx = AuditContext::new(state.ecosystem.id(), peer);
+
     let package = match state.ecosystem.validate_name(&raw_package) {
         Ok(name) => name,
         Err(err) => return bad_request_response(&format!("invalid package name: {err}")),
@@ -43,34 +75,86 @@ pub async fn simple_handler(
         .blocked_filenames(state.ecosystem.id(), &package)
         .await;
 
+    // What `blocked` throws away the moment it answers "hide this or
+    // not": the reason, detail and why_id behind each evaluated entry's
+    // decision, which the `listed` audit records below need to report.
+    let file_verdicts = state
+        .scanner
+        .file_verdicts(state.ecosystem.id(), &package)
+        .await;
+    let verdicts_by_filename: HashMap<&str, &FileVerdict> = file_verdicts
+        .iter()
+        .map(|verdict| (verdict.filename.as_str(), verdict))
+        .collect();
+
     let config = state.config.current();
     let public_url = &config.public_url;
 
-    let filtered: Vec<IndexEntry> = fetched
-        .value
-        .into_iter()
-        .filter_map(|entry| {
-            let parsed = state.ecosystem.parse_filename(&entry.filename)?;
+    let versions_upstream = fetched.value.len();
+    let mut decisions = Vec::new();
+    let mut filtered = Vec::new();
 
-            if blocked.contains(&entry.filename)
-                && !is_allowlisted(&config, &package, &parsed.version)
-            {
-                return None;
-            }
+    for entry in fetched.value {
+        let Some(parsed) = state.ecosystem.parse_filename(&entry.filename) else {
+            continue;
+        };
 
-            let rewritten_path = format!("files/{package}/{}/{}", parsed.version, entry.filename);
-            let rewritten_url = public_url.join(&rewritten_path).ok()?;
+        let allowlisted = is_allowlisted(&config, &package, &parsed.version);
+        let is_blocked = blocked.contains(&entry.filename);
 
-            Some(IndexEntry {
-                filename: entry.filename,
-                url: rewritten_url,
-                sha256: entry.sha256,
-                requires_python: entry.requires_python,
-                metadata_hash: entry.metadata_hash,
-                yanked: entry.yanked,
-            })
-        })
-        .collect();
+        if let Some(verdict) = verdicts_by_filename.get(entry.filename.as_str()) {
+            let (allowed, reason_code, reason_detail) = if verdict.blocked && allowlisted {
+                (
+                    true,
+                    Some("allowlisted".to_string()),
+                    Some(verdict.reason_detail.clone()),
+                )
+            } else if verdict.blocked {
+                (
+                    false,
+                    Some(verdict.reason_code.clone()),
+                    Some(verdict.reason_detail.clone()),
+                )
+            } else {
+                (true, None, None)
+            };
+            decisions.push(VersionDecision {
+                version: parsed.version.clone(),
+                filename: Some(entry.filename.clone()),
+                allowed,
+                reason_code,
+                reason_detail,
+                why_id: Some(verdict.why_id.clone()),
+            });
+        }
+
+        if is_blocked && !allowlisted {
+            continue;
+        }
+
+        let rewritten_path = format!("files/{package}/{}/{}", parsed.version, entry.filename);
+        let Ok(rewritten_url) = public_url.join(&rewritten_path) else {
+            continue;
+        };
+
+        filtered.push(IndexEntry {
+            filename: entry.filename,
+            url: rewritten_url,
+            sha256: entry.sha256,
+            requires_python: entry.requires_python,
+            metadata_hash: entry.metadata_hash,
+            yanked: entry.yanked,
+        });
+    }
+
+    let listing_audit = ListingAudit {
+        versions_upstream,
+        decisions,
+    };
+    let records = listing_audit.records(&ctx, &package);
+    if let Some(failure) = audit_or_500(&state.audit, &records) {
+        return failure;
+    }
 
     let page = render_simple_page(&package, &filtered);
     Response::builder()

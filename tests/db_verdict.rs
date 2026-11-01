@@ -393,3 +393,62 @@ fn put_resets_plugin_checked_so_a_rewritten_verdict_re_runs_the_plugin_gate() {
         "put must reset plugin_checked to 0 so the plugin gate runs again"
     );
 }
+
+#[test]
+fn file_verdicts_returns_clean_and_blocked_rows_with_their_reasons() {
+    let (_dir, db) = open_db();
+    let store = VerdictStore::new(db);
+
+    let clean_wheel = key(
+        "example_package-1.2.3-py3-none-any.whl",
+        "1".repeat(64).as_str(),
+    );
+    let blocked_sdist = key("example_package-1.2.3.tar.gz", "2".repeat(64).as_str());
+    let stale = key(
+        "example_package-1.2.3-cp311-cp311-linux_x86_64.whl",
+        "3".repeat(64).as_str(),
+    );
+
+    store
+        .put(&clean_wheel, &Verdict::Clean, FINGERPRINT_A)
+        .expect("put clean wheel");
+
+    let reason = RefusalReason {
+        code: "plugin:yara".to_string(),
+        detail: "matched malware signature".to_string(),
+    };
+    store
+        .put(&blocked_sdist, &Verdict::Blocked(reason), FINGERPRINT_A)
+        .expect("put blocked sdist");
+
+    // Stored under a different fingerprint: must not show up when
+    // querying under FINGERPRINT_A, exactly like `blocked_filenames`.
+    store
+        .put(&stale, &Verdict::Clean, FINGERPRINT_B)
+        .expect("put stale clean artifact");
+
+    let rows = store
+        .file_verdicts("pypi", "example-package", FINGERPRINT_A)
+        .expect("file_verdicts should succeed");
+
+    assert_eq!(rows.len(), 2);
+
+    let clean = rows
+        .iter()
+        .find(|row| row.filename == "example_package-1.2.3-py3-none-any.whl")
+        .expect("clean row must be present");
+    let blocked = rows
+        .iter()
+        .find(|row| row.filename == "example_package-1.2.3.tar.gz")
+        .expect("blocked row must be present");
+
+    assert!(!clean.blocked);
+    assert_eq!(clean.version, "1.2.3");
+    assert!(!clean.why_id.is_empty());
+
+    assert!(blocked.blocked);
+    assert_eq!(blocked.version, "1.2.3");
+    assert_eq!(blocked.reason_code, "plugin:yara");
+    assert_eq!(blocked.reason_detail, "matched malware signature");
+    assert!(!blocked.why_id.is_empty());
+}

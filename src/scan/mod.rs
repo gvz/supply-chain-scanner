@@ -59,7 +59,7 @@ use crate::ai::{AiReviewer, ReviewOutcome};
 use crate::artifact_cache::ArtifactCache;
 use crate::config::{Config, ConfigHandle, PluginConfig};
 use crate::db::advisory::AdvisoryStore;
-use crate::db::verdict::{StoredVerdict, VerdictStore};
+use crate::db::verdict::{FileVerdict, StoredVerdict, VerdictStore};
 use crate::ecosystem::pypi::index::{normalize_name, IndexEntry};
 use crate::ecosystem::pypi::upstream::{Upstream, UpstreamError};
 use crate::model::{ArtifactKey, RefusalReason, Verdict};
@@ -392,6 +392,57 @@ impl Scanner {
                      regardless"
                 );
                 HashSet::new()
+            }
+        }
+    }
+
+    /// Every verdict on record for `(ecosystem, package)` under today's
+    /// policy — the lookup `src/http/simple.rs` needs to build the PyPI
+    /// listing audit. `blocked_filenames` above only tells the caller
+    /// which filenames to hide; this instead returns a `FileVerdict` per
+    /// scanned filename, carrying the `blocked`/`reason_code`/
+    /// `reason_detail`/`why_id` an audit line has to report.
+    ///
+    /// Degrades exactly like `blocked_filenames`: this is display/audit
+    /// data, not the gate (`decide()` remains the real gate regardless
+    /// of what a listing page or its audit record said), so a lookup
+    /// failure here warns and returns an empty vec rather than failing
+    /// the listing request outright.
+    pub async fn file_verdicts(&self, ecosystem: &str, package: &str) -> Vec<FileVerdict> {
+        let fingerprint = self.fingerprint();
+        let store = Arc::clone(&self.verdict_store);
+        let ecosystem_owned = ecosystem.to_string();
+        let package_owned = package.to_string();
+
+        let result = tokio::task::spawn_blocking(move || {
+            store.file_verdicts(&ecosystem_owned, &package_owned, &fingerprint)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(verdicts)) => verdicts,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    ecosystem,
+                    package,
+                    error = %err,
+                    "file_verdicts lookup failed; this listing's audit record will \
+                     undercount versions_evaluated until this is resolved, though \
+                     decide() independently re-evaluates any download regardless"
+                );
+                Vec::new()
+            }
+            Err(join_error) => {
+                tracing::warn!(
+                    ecosystem,
+                    package,
+                    error = %join_error,
+                    "file_verdicts lookup task panicked; this listing's audit \
+                     record will undercount versions_evaluated until this is \
+                     resolved, though decide() independently re-evaluates any \
+                     download regardless"
+                );
+                Vec::new()
             }
         }
     }

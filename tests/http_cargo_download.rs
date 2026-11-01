@@ -21,7 +21,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use supply_chain_scanner::artifact_cache::ArtifactCache;
 use supply_chain_scanner::config::{
-    AllowEntry, Config, ConfigHandle, CveLine, PluginConfig, UnknownSeverity,
+    AllowEntry, AuditConfig, Config, ConfigHandle, CveLine, PluginConfig, UnknownSeverity,
 };
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::db::cargo_vet::CargoVetStore;
@@ -76,6 +76,7 @@ fn base_config(plugin_binary: PathBuf) -> Config {
         ai_review: None,
         cargo_registry: None,
         npm_registry: None,
+        audit: AuditConfig::default(),
     }
 }
 

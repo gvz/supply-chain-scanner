@@ -44,8 +44,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use zip::ZipWriter;
 
 use supply_chain_scanner::config::{
-    AiReviewConfig, BlockOn, CargoRegistryConfig, CargoVetSource, Config, CveLine, PluginConfig,
-    UnknownSeverity,
+    AiReviewConfig, AuditConfig, BlockOn, CargoRegistryConfig, CargoVetSource, Config, CveLine,
+    PluginConfig, UnknownSeverity,
 };
 use supply_chain_scanner::db::cargo_vet::CargoVetStore;
 use supply_chain_scanner::db::verdict::VerdictStore;
@@ -292,6 +292,7 @@ fn cargo_config(
             min_release_age_days: None,
         }),
         npm_registry: None,
+        audit: AuditConfig::default(),
     }
 }
 

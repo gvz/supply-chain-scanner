@@ -122,6 +122,10 @@ struct ConfigFile {
     /// a test can write either a valid table or a deliberately broken
     /// one.
     ai_review: Option<String>,
+    /// The `[audit]` table's `path`. A test that exercises the
+    /// restart-only rejection changes this between an initial write and a
+    /// reload; every other test leaves it at the default.
+    audit_path: &'static str,
 }
 
 impl ConfigFile {
@@ -131,6 +135,7 @@ impl ConfigFile {
             plugins: Vec::new(),
             cache_ttl: "1h",
             ai_review: None,
+            audit_path: "audit.jsonl",
         }
     }
 
@@ -151,11 +156,15 @@ advisory_source_url = "https://osv-vulnerabilities.storage.googleapis.com/PyPI/a
 min_severity = {min_severity:?}
 require_fix_available = false
 unknown_severity = "allow"
+
+[audit]
+path = "{audit_path}"
 "#,
             db_path = db_path.display(),
             cache_dir = cache_dir.display(),
             cache_ttl = self.cache_ttl,
             min_severity = self.min_severity,
+            audit_path = self.audit_path,
         );
         for (name, binary) in &self.plugins {
             toml.push_str(&format!(
@@ -580,6 +589,39 @@ async fn reload_naming_a_restart_only_field_is_rejected_and_names_it() {
     assert_eq!(
         harness.config.current().cache_ttl,
         Duration::from_secs(60 * 60),
+        "a rejected reload must change nothing"
+    );
+}
+
+/// `audit` is a restart-only field too: the appender's file handle is
+/// opened once at startup, so a reload that only changes `audit.path`
+/// must be rejected in full, exactly like `cache_ttl` above.
+#[tokio::test]
+async fn changing_the_audit_table_is_a_restart_only_reload_rejection() {
+    let server = MockServer::start().await;
+    let _ = mount_artifact(&server).await;
+
+    let harness = Harness::new(
+        &server,
+        &ConfigFile::new(),
+        FakeSandbox::new::<_, PathBuf>([]),
+    );
+
+    let mut changed = ConfigFile::new();
+    changed.audit_path = "other-audit.jsonl";
+    harness.rewrite(&changed);
+
+    let err = harness
+        .reload()
+        .expect_err("changing the [audit] table must reject the reload");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("audit"),
+        "the rejection must name the offending field, got {message}"
+    );
+    assert_eq!(
+        harness.config.current().audit.path,
+        std::path::PathBuf::from("audit.jsonl"),
         "a rejected reload must change nothing"
     );
 }

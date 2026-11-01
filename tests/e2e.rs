@@ -27,7 +27,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
-use supply_chain_scanner::config::{AllowEntry, Config, CveLine, UnknownSeverity};
+use supply_chain_scanner::config::{AllowEntry, AuditConfig, Config, CveLine, UnknownSeverity};
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::http::{bootstrap, watch_for_reload, Wired};
 
@@ -145,6 +145,7 @@ fn base_config(
         ai_review: None,
         cargo_registry: None,
         npm_registry: None,
+        audit: AuditConfig::default(),
     }
 }
 
@@ -976,10 +977,14 @@ advisory_source_url = "{advisory_url}"
 min_severity = 7.0
 require_fix_available = false
 unknown_severity = "allow"
+
+[audit]
+path = "{audit_path}"
 "#,
         db_path = db_path.display(),
         cache_dir = cache_dir.display(),
         upstream_url = server.uri(),
+        audit_path = cache_dir.join("audit.jsonl").display(),
     );
 
     for (package, version) in allowlist {

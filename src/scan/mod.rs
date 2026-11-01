@@ -1292,7 +1292,7 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use crate::config::{AllowEntry, Config, CveLine, UnknownSeverity};
+    use crate::config::{AllowEntry, AuditConfig, Config, CveLine, UnknownSeverity};
     use crate::db::index_cache::IndexCache;
     use crate::plugin::{SandboxOutcome, SandboxRunner, SandboxSpec};
 
@@ -1409,6 +1409,7 @@ mod tests {
             ai_review: None,
             cargo_registry: None,
             npm_registry: None,
+            audit: AuditConfig::default(),
         }
     }
 

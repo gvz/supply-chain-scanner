@@ -27,7 +27,7 @@ use supply_chain_scanner::ai::provider::{ChatProvider, ProviderError};
 use supply_chain_scanner::ai::AiReviewer;
 use supply_chain_scanner::artifact_cache::ArtifactCache;
 use supply_chain_scanner::config::{
-    AiReviewConfig, AllowEntry, BlockOn, Config, ConfigHandle, CveLine, PluginConfig,
+    AiReviewConfig, AllowEntry, AuditConfig, BlockOn, Config, ConfigHandle, CveLine, PluginConfig,
     UnknownSeverity,
 };
 use supply_chain_scanner::db::advisory::AdvisoryStore;
@@ -83,6 +83,7 @@ fn base_config(scan_budget: Duration) -> Config {
         ai_review: None,
         cargo_registry: None,
         npm_registry: None,
+        audit: AuditConfig::default(),
     }
 }
 

@@ -24,7 +24,7 @@ use supply_chain_scanner::ai::AiReviewer;
 use supply_chain_scanner::artifact_cache::ArtifactCache;
 use supply_chain_scanner::cargovet::parse::AuditEntry;
 use supply_chain_scanner::config::{
-    AiReviewConfig, BlockOn, Config, ConfigHandle, CveLine, UnknownSeverity,
+    AiReviewConfig, AuditConfig, BlockOn, Config, ConfigHandle, CveLine, UnknownSeverity,
 };
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::db::cargo_vet::CargoVetStore;
@@ -77,6 +77,7 @@ fn base_config() -> Config {
         ai_review: None,
         cargo_registry: None,
         npm_registry: None,
+        audit: AuditConfig::default(),
     }
 }
 

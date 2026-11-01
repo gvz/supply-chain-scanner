@@ -36,6 +36,34 @@ advisory_sync_interval = "1h"
 # value shown here (the public OSV PyPI feed) if omitted.
 advisory_source_url = "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip"
 
+# Where every fetch is logged: which client IP fetched which package
+# version, and which evaluated versions were withheld and why. Required —
+# a config file with no [audit] table fails to load, on purpose: the whole
+# point of this log is that an un-logged fetch must never happen, so there
+# is no "logging off" default to fall back to.
+#
+# `path` is a filename PREFIX, not the exact file written: the rolling
+# appender appends a date suffix, so "audit.jsonl" becomes something like
+# "audit.jsonl.2026-11-01". A shipper reading these files off-box needs to
+# glob on the prefix rather than tail one fixed name.
+#
+# This file carries fetch-level, network-attributable data about real
+# developers (source IP, package, version) — give its directory its own
+# filesystem permissions, separate from the rest of this proxy's state. A
+# write failure to this log is not swallowed: the request that triggered it
+# returns HTTP 500, because serving an artifact without recording that it
+# was served would defeat the log's purpose.
+[audit]
+path = "/var/log/scanner/audit.jsonl"
+
+# How often the log rotates to a fresh file. "daily" (the default) or
+# "hourly".
+rotation = "daily"
+
+# How many rotated files to keep before the oldest is deleted. Optional —
+# defaults to 14, which at daily rotation is two weeks of history.
+max_files = 14
+
 [cve]
 # Advisories scoring at or above this severity (CVSS-style, 0.0-10.0) block
 # the package.

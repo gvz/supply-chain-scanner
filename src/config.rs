@@ -109,6 +109,16 @@ pub struct Config {
     /// npm) ship as three deployments of the same binary.
     #[serde(default)]
     pub npm_registry: Option<NpmRegistryConfig>,
+    /// The `[audit]` table: where the JSON Lines fetch-audit log is
+    /// written, and how it rotates. Required, not optional like the
+    /// tables above — the point of the audit log is that an un-logged
+    /// fetch must never happen, so a config file that omits this table
+    /// fails to load rather than quietly running with logging off. That
+    /// is a breaking change for a config written before this field
+    /// existed, and deliberately so: the alternative (defaulting it in)
+    /// would let an operator believe fetches are audited when they are
+    /// not.
+    pub audit: AuditConfig,
 }
 
 /// How long an artifact download may take.
@@ -422,6 +432,61 @@ pub enum BlockOn {
     Suspicious,
 }
 
+/// Default for [`AuditConfig::max_files`]: 14. Paired with the default
+/// [`AuditRotation::Daily`], that is two weeks of daily audit files kept
+/// on disk before the rolling appender starts deleting the oldest one —
+/// enough to cover a typical incident-response window without an
+/// operator having to configure anything.
+fn default_audit_max_files() -> usize {
+    14
+}
+
+/// The `[audit]` table: where the fetch-audit JSON Lines log is written
+/// and how it rotates.
+///
+/// `path` is a filename *prefix*, not the exact file written: a later
+/// task's rolling appender appends a date suffix (so
+/// `audit.jsonl` becomes `audit.jsonl.2026-11-01`), and an operator
+/// shipping these files off-box needs to glob on the prefix rather than
+/// tail one fixed name.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditConfig {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub rotation: AuditRotation,
+    #[serde(default = "default_audit_max_files")]
+    pub max_files: usize,
+}
+
+impl Default for AuditConfig {
+    /// Exists so the many test call sites that build a `Config` as a Rust
+    /// struct literal can write `audit: AuditConfig::default()` instead
+    /// of each spelling out a throwaway path, rather than this struct
+    /// itself being optional. The *serde* contract is unaffected by this
+    /// impl: `path` still has no `#[serde(default)]`, so a production
+    /// TOML file that omits it is still rejected at load, exactly as
+    /// `[audit]` being a required table demands. Any test that actually
+    /// boots a router and exercises logging should set a tempdir path of
+    /// its own rather than relying on this default.
+    fn default() -> Self {
+        Self {
+            path: PathBuf::from("audit.jsonl"),
+            rotation: AuditRotation::Daily,
+            max_files: 14,
+        }
+    }
+}
+
+/// How often the audit log rotates to a fresh file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditRotation {
+    #[default]
+    Daily,
+    Hourly,
+}
+
 /// Whether `url`'s host is a loopback address, to which plain HTTP is
 /// acceptable (the traffic cannot leave the machine).
 ///
@@ -480,6 +545,26 @@ impl Config {
             bail!(
                 "a config file must carry at most one of [cargo_registry] or \
                  [npm_registry], never both: each ecosystem runs as a separate deployment"
+            );
+        }
+        if self.audit.max_files == 0 {
+            bail!("audit.max_files of 0 would keep no audit history at all; it must be at least 1");
+        }
+        // `Path::file_name()` alone is not enough: for a path that ends in
+        // a separator (e.g. "/var/log/scanner/"), it strips the trailing
+        // separator and still returns the last component, so a directory
+        // written with a trailing slash would slip past a bare
+        // `file_name().is_none()` check. Checking the raw string for a
+        // trailing separator catches that case too.
+        let path_str = self.audit.path.as_os_str().to_string_lossy();
+        if self.audit.path.file_name().is_none()
+            || path_str.ends_with('/')
+            || path_str.ends_with(std::path::MAIN_SEPARATOR)
+        {
+            bail!(
+                "audit.path of \"{}\" has no file name: it must be a filename prefix \
+                 (e.g. \"audit.jsonl\"), not a directory",
+                self.audit.path.display()
             );
         }
         if let Some(ai) = self.ai_review.as_ref() {

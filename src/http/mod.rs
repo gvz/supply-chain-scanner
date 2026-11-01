@@ -411,10 +411,13 @@ pub fn default_sandbox_factory() -> SandboxFactory {
 /// [`ArtifactCache`] root, `upstream_url` into both HTTP clients' base
 /// URLs, `advisory_source_url`/`advisory_sync_interval` into the sync
 /// ticker, `cache_ttl` into the eviction ticker, `download` into the
-/// upstream clients' timeout configuration, and `max_concurrent_scans`
-/// into the initial permit count of the `Scanner`'s full-scan semaphore
+/// upstream clients' timeout configuration, `max_concurrent_scans` into
+/// the initial permit count of the `Scanner`'s full-scan semaphore
 /// (shrinking a `tokio::sync::Semaphore` that already has permits checked
-/// out is not well-defined, so this can't be live-reloaded either).
+/// out is not well-defined, so this can't be live-reloaded either), and
+/// `audit` into the open file handle the rolling appender holds for the
+/// whole life of the process (opened once at startup; there is no
+/// "close the old file, open the new one" step a reload could trigger).
 ///
 /// A reload that changes any of them is **rejected in full**. That is a
 /// deliberate choice over the alternative of applying the rest: applying
@@ -431,6 +434,7 @@ const RESTART_ONLY_FIELDS: &[&str] = &[
     "cache_ttl",
     "download",
     "max_concurrent_scans",
+    "audit",
 ];
 
 /// Configuration fields a reload genuinely applies, for the log line that
@@ -474,6 +478,9 @@ fn restart_only_changes(boot: &Config, candidate: &Config) -> Vec<&'static str> 
     }
     if boot.max_concurrent_scans != candidate.max_concurrent_scans {
         changed.push("max_concurrent_scans");
+    }
+    if boot.audit != candidate.audit {
+        changed.push("audit");
     }
     changed
 }

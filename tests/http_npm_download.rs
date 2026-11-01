@@ -28,7 +28,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use supply_chain_scanner::artifact_cache::ArtifactCache;
 use supply_chain_scanner::config::{
-    AllowEntry, Config, ConfigHandle, CveLine, NpmRegistryConfig, PluginConfig, UnknownSeverity,
+    AllowEntry, AuditConfig, Config, ConfigHandle, CveLine, NpmRegistryConfig, PluginConfig,
+    UnknownSeverity,
 };
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::db::review::ReviewStore;
@@ -89,6 +90,7 @@ fn base_config(server: &MockServer, plugin_binary: PathBuf) -> Config {
             max_packument_bytes: 67_108_864,
             min_release_age_days: None,
         }),
+        audit: AuditConfig::default(),
     }
 }
 

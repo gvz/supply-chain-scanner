@@ -7,7 +7,7 @@ use std::time::Duration;
 use supply_chain_scanner::advisory::matching::{affects, first_blocking};
 use supply_chain_scanner::advisory::osv::parse_osv;
 use supply_chain_scanner::advisory::{Advisory, VersionRange};
-use supply_chain_scanner::config::{Config, CveLine, UnknownSeverity};
+use supply_chain_scanner::config::{AuditConfig, Config, CveLine, UnknownSeverity};
 use supply_chain_scanner::policy::Policy;
 
 /// Reads a fixture JSON document from `tests/fixtures/osv/`, mirroring
@@ -46,6 +46,7 @@ fn base_config() -> Config {
         ai_review: None,
         cargo_registry: None,
         npm_registry: None,
+        audit: AuditConfig::default(),
     }
 }
 

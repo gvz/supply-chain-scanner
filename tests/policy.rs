@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use supply_chain_scanner::config::{
-    AiReviewConfig, BlockOn, Config, CveLine, PluginConfig, UnknownSeverity,
+    AiReviewConfig, AuditConfig, BlockOn, Config, CveLine, PluginConfig, UnknownSeverity,
 };
 use supply_chain_scanner::policy::{policy_fingerprint, AdvisoryVerdictInput, Policy};
 
@@ -38,6 +38,7 @@ fn base_config() -> Config {
         ai_review: None,
         cargo_registry: None,
         npm_registry: None,
+        audit: AuditConfig::default(),
     }
 }
 

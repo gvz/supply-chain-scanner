@@ -41,7 +41,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use zip::ZipWriter;
 
 use supply_chain_scanner::config::{
-    AiReviewConfig, BlockOn, Config, CveLine, NpmRegistryConfig, PluginConfig, UnknownSeverity,
+    AiReviewConfig, AuditConfig, BlockOn, Config, CveLine, NpmRegistryConfig, PluginConfig,
+    UnknownSeverity,
 };
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::ecosystem::npm::packument_path;
@@ -326,6 +327,7 @@ fn npm_config(
             max_packument_bytes: 67_108_864,
             min_release_age_days: None,
         }),
+        audit: AuditConfig::default(),
     }
 }
 

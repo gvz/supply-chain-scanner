@@ -26,7 +26,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use supply_chain_scanner::advisory::Advisory;
 use supply_chain_scanner::artifact_cache::ArtifactCache;
-use supply_chain_scanner::config::{Config, ConfigHandle, CveLine, UnknownSeverity};
+use supply_chain_scanner::config::{AuditConfig, Config, ConfigHandle, CveLine, UnknownSeverity};
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::db::index_cache::IndexCache;
 use supply_chain_scanner::db::verdict::VerdictStore;
@@ -136,6 +136,7 @@ fn base_config() -> Config {
         ai_review: None,
         cargo_registry: None,
         npm_registry: None,
+        audit: AuditConfig::default(),
     }
 }
 

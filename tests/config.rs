@@ -31,6 +31,9 @@ version = "1.2.3"
 name = "yara-malware"
 binary = "/opt/scanner/plugins/yara-malware"
 timeout = "5s"
+
+[audit]
+path = "/var/log/scanner/audit.jsonl"
 "#;
 
 fn write_temp_toml(contents: &str) -> tempfile::NamedTempFile {

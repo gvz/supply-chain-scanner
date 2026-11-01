@@ -25,7 +25,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use supply_chain_scanner::ai::provider::{ChatProvider, ProviderError};
 use supply_chain_scanner::ai::AiReviewer;
 use supply_chain_scanner::config::{
-    AiReviewConfig, BlockOn, CargoRegistryConfig, Config, ConfigHandle, CveLine, UnknownSeverity,
+    AiReviewConfig, AuditConfig, BlockOn, CargoRegistryConfig, Config, ConfigHandle, CveLine,
+    UnknownSeverity,
 };
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::db::cargo_vet::CargoVetStore;
@@ -80,6 +81,7 @@ fn base_config(scan_budget: Duration) -> Config {
         ai_review: None,
         cargo_registry: None,
         npm_registry: None,
+        audit: AuditConfig::default(),
     }
 }
 

@@ -27,7 +27,8 @@ use supply_chain_scanner::ai::provider::{ChatProvider, ProviderError};
 use supply_chain_scanner::ai::AiReviewer;
 use supply_chain_scanner::artifact_cache::ArtifactCache;
 use supply_chain_scanner::config::{
-    AiReviewConfig, BlockOn, Config, ConfigHandle, CveLine, NpmRegistryConfig, UnknownSeverity,
+    AiReviewConfig, AuditConfig, BlockOn, Config, ConfigHandle, CveLine, NpmRegistryConfig,
+    UnknownSeverity,
 };
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::db::review::ReviewStore;
@@ -99,6 +100,7 @@ fn base_config(public_url: &str, server: &MockServer, scan_budget: Duration) -> 
             max_packument_bytes: 67_108_864,
             min_release_age_days: None,
         }),
+        audit: AuditConfig::default(),
     }
 }
 

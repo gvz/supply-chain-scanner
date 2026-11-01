@@ -30,6 +30,9 @@ advisory_source_url = "https://osv-vulnerabilities.storage.googleapis.com/PyPI/a
 [cve]
 min_severity = 7.0
 require_fix_available = false
+
+[audit]
+path = "/var/log/scanner/audit.jsonl"
 "#;
 
 fn write_temp_toml(contents: &str) -> tempfile::NamedTempFile {

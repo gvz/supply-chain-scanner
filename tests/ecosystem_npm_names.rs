@@ -89,12 +89,15 @@ fn validate_rejects_an_embedded_at_sign() {
 }
 
 #[test]
-fn validate_rejects_an_uppercase_letter() {
-    // npm names are lowercase at the registry. `validate_name`'s contract
-    // is to return the name unchanged, not to fold it, so an uppercase
-    // letter in a *requested* name is a rejection, not a silent lowercase.
-    assert!(validate_name("Lodash").is_err());
-    assert!(validate_name("@Babel/core").is_err());
+fn validate_accepts_a_mixed_case_name_unchanged() {
+    // npm stopped accepting *new* uppercase names but still serves
+    // grandfathered ones case-sensitively — `JSONStream` is the canonical
+    // example and a common transitive dependency. `validate_name`'s
+    // contract is to return the name unchanged, not to fold it, so a
+    // mixed-case name must validate as-is, not be rejected or lowercased.
+    assert_eq!(validate_name("JSONStream").unwrap(), "JSONStream");
+    assert_eq!(validate_name("@Babel/core").unwrap(), "@Babel/core");
+    assert_eq!(normalize_name("JSONStream"), "jsonstream");
 }
 
 #[test]
@@ -109,6 +112,13 @@ fn normalize_lowercases_but_folds_nothing() {
 fn packument_path_encodes_a_scope_separator() {
     assert_eq!(packument_path("@babel/core"), "@babel%2fcore");
     assert_eq!(packument_path("lodash"), "lodash");
+}
+
+#[test]
+fn packument_path_preserves_case() {
+    // npm serves grandfathered mixed-case names case-sensitively, so
+    // lowercasing the path here would 404 against the real registry.
+    assert_eq!(packument_path("JSONStream"), "JSONStream");
 }
 
 #[test]

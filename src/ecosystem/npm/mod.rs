@@ -40,13 +40,20 @@ fn invalid(reason: &str) -> InvalidName {
 }
 
 /// Whether `c` is a character npm permits inside a name's body (the part
-/// after an optional leading `@` and scope separator): lowercase ASCII
-/// letters, digits, and `-` `_` `.` `~`. Nothing else is a legal npm
-/// package name character, so anything outside this set is also not
+/// after an optional leading `@` and scope separator): ASCII letters
+/// (upper or lower), digits, and `-` `_` `.` `~`. Nothing else is a legal
+/// npm package name character, so anything outside this set is also not
 /// URL-safe as a path segment — `?` `#` `%` `&` `=` `:` space and every
 /// other ASCII punctuation character are all excluded.
+///
+/// Uppercase is accepted, not folded: npm stopped accepting *new*
+/// uppercase names but still serves grandfathered ones (`JSONStream` is
+/// the canonical example) case-sensitively. Folding case here would make
+/// [`validate_name`] return a name that no longer addresses the same
+/// upstream package. Case folding for keyed lookups is
+/// [`normalize_name`]'s job, kept separate on purpose.
 fn is_npm_name_char(c: char) -> bool {
-    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.' | '~')
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~')
 }
 
 /// Validates a package name from untrusted input and returns it unchanged on
@@ -65,15 +72,16 @@ fn is_npm_name_char(c: char) -> bool {
 /// - any `/` except the single scope separator in a scoped name (one starting
 ///   with `@`)
 /// - any character in the name or scope body outside npm's own legal set:
-///   lowercase ASCII letters, digits, `-`, `_`, `.`, `~` (see
+///   ASCII letters (upper or lower), digits, `-`, `_`, `.`, `~` (see
 ///   [`is_npm_name_char`]). This is what stops a name like `lodash?x` or
 ///   `http:evil.example.com` from reaching [`crate::ecosystem::npm::upstream::NpmUpstream::packument`]'s
 ///   `Url::join`, where a character such as `?`, `#`, or a `:`-led scheme
 ///   would be interpreted by the URL parser rather than treated as a
-///   literal path segment. An uppercase letter is rejected here too,
-///   deliberately: npm names are lowercase at the registry, but this
-///   function's contract is to return the name unchanged, not to fold it —
-///   that is [`normalize_name`]'s job, kept separate on purpose.
+///   literal path segment. Uppercase letters are accepted, not rejected:
+///   npm serves grandfathered mixed-case names (`JSONStream`) case-
+///   sensitively, and this function's contract is to return the name
+///   unchanged, not to fold it — case folding for lookups is
+///   [`normalize_name`]'s job, kept separate on purpose.
 ///
 /// The name is returned as given, not normalized. Normalize it separately
 /// with [`normalize_name`] when you need the canonical form.

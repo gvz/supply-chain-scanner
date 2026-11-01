@@ -70,15 +70,17 @@
 //! fields read out of [`NpmAppState`] instead of duplicating the lookup,
 //! the gate or the rendering.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{Path, RawQuery, State};
+use axum::extract::{ConnectInfo, Path, RawQuery, State};
 use axum::http::{header, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
 
 use crate::artifact_cache::ArtifactCache;
+use crate::audit::{AuditContext, AuditLog};
 use crate::config::ConfigHandle;
 use crate::db::review::ReviewStore;
 use crate::db::verdict::VerdictStore;
@@ -89,7 +91,7 @@ use crate::scan::coordinator::ScanCoordinator;
 use crate::scan::npm::{NpmIndexDecision, NpmScanner};
 
 use super::refusal::in_progress_response;
-use super::{bad_request_response, not_found_response};
+use super::{audit_or_500, bad_request_response, not_found_response};
 
 /// The ecosystem id every npm artifact key carries, and therefore the id
 /// [`super::refusals`] queries for on this deployment.
@@ -146,6 +148,13 @@ pub struct NpmAppState {
     /// Single-flight dedup for a tarball download's plugin run, keyed by
     /// artifact sha256. See the field's own doc line above.
     pub plugin_run_coordinator: Arc<ScanCoordinator>,
+    /// The fetch audit log. [`npm_packument_handler`] writes to this
+    /// directly (via [`super::audit_or_500`]) for the packument's own
+    /// `listing`/`listed` lines, and hands the one [`AuditContext`] it
+    /// builds per request on to [`super::npm_download::npm_download_handler`]
+    /// for the tarball's `served`/`refused` line — see that module's docs
+    /// for why the download handler cannot build its own `ConnectInfo`.
+    pub audit: Arc<AuditLog>,
 }
 
 /// Builds the npm deployment's router: `/-/ping`, the two audit stubs,
@@ -280,16 +289,34 @@ pub async fn npm_write_refused_handler() -> Response {
 /// routing as one segment and arrives here as a literal `/`. It is
 /// validated before anything else: an invalid name is a 400 and the
 /// scanner is never consulted, so it never reaches upstream.
+///
+/// On npm the filtered packument *is* the gate: a version the cascade
+/// denies is simply absent from the document, with no 403 anywhere a
+/// client (or a reader of this log) could find it by. The fetch audit
+/// log's `listing`/`listed` lines are what makes that denial visible at
+/// all, so they are written here, before the packument JSON goes out —
+/// see [`super::audit_or_500`]'s own doc comment for the fail-closed
+/// guarantee that depends on that order.
 pub async fn npm_packument_handler(
     State(state): State<NpmAppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(path): Path<String>,
 ) -> Response {
+    // Built from the real TCP peer, never a client-supplied header — see
+    // `crate::http::artifact::artifact_handler`'s own doc comment for why.
+    // Built once here, for both branches below: a tarball fetch and the
+    // packument fetch that preceded it are each complete on their own
+    // audit line, but both belong to the same request.
+    let ctx = AuditContext::new(NPM_ECOSYSTEM, peer);
+
     // A tarball request arrives on this same catch-all. See
     // `super::npm_download`'s module docs for why it cannot have a route
     // of its own: `matchit` permits a catch-all only as the final path
-    // segment, and a narrower route conflicts with this one.
+    // segment, and a narrower route conflicts with this one. It cannot
+    // build its own `ConnectInfo` either, since it is not a route — the
+    // context built above is handed in instead.
     if super::npm_download::looks_like_tarball(&path) {
-        return super::npm_download::npm_download_handler(&state, &path).await;
+        return super::npm_download::npm_download_handler(&state, &ctx, &path).await;
     }
 
     let name = match validate_name(&path) {
@@ -298,13 +325,26 @@ pub async fn npm_packument_handler(
     };
 
     match state.npm_scanner.decide_packument(&name).await {
-        NpmIndexDecision::Packument(doc) => packument_response(&doc),
+        NpmIndexDecision::Packument { doc, audit } => {
+            // Written before the packument JSON is rendered: a write
+            // failure must become a 500 with no packument, never a
+            // response that implies this listing was recorded when it
+            // was not. See `audit_or_500`'s own doc comment.
+            let records = audit.records(&ctx, &name);
+            if let Some(failure) = audit_or_500(&state.audit, &records) {
+                return failure;
+            }
+            packument_response(&doc)
+        }
         // Upstream has spoken: no such package. Distinct from the
-        // in-progress case below, and never retried the same way.
+        // in-progress case below, and never retried the same way. No
+        // fetch audit record either: on npm the packument is the gate,
+        // and there is no packument here to have evaluated anything from.
         NpmIndexDecision::NotFound => not_found_response(),
         // The same retryable status the PyPI and cargo paths use for a
         // scan still running. See `super::refusal`'s module docs for why
-        // it is 429 and not 503.
+        // it is 429 and not 503. No fetch audit record either: no
+        // verdict was reached, so there is nothing yet to describe.
         NpmIndexDecision::InProgress => in_progress_response(),
     }
 }

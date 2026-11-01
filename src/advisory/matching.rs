@@ -155,7 +155,14 @@ const SUMMARY_MAX_CHARS: usize = 200;
 /// bytes a response-splitting attack needs) and non-ASCII characters, then
 /// truncates to [`SUMMARY_MAX_CHARS`]. Everything else passes through
 /// unchanged.
-fn sanitize_detail_text(text: &str) -> String {
+///
+/// `pub(crate)` so [`crate::scan::npm`]'s own `cve:<advisory-id>` listing
+/// line can sanitize and cap an advisory summary the same way, rather than
+/// writing unbounded, unsanitized OSV text into a log whose volume the
+/// fetch-audit-log design already flags as a concern. There is one
+/// sanitizer for this text, not a second copy drifting out of sync with
+/// this one.
+pub(crate) fn sanitize_detail_text(text: &str) -> String {
     text.chars()
         .filter(|c| c.is_ascii() && !c.is_ascii_control())
         .take(SUMMARY_MAX_CHARS)

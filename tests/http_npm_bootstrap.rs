@@ -41,8 +41,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use zip::ZipWriter;
 
 use supply_chain_scanner::config::{
-    AiReviewConfig, AuditConfig, BlockOn, Config, CveLine, NpmRegistryConfig, PluginConfig,
-    UnknownSeverity,
+    AiReviewConfig, AuditConfig, AuditRotation, BlockOn, Config, CveLine, NpmRegistryConfig,
+    PluginConfig, UnknownSeverity,
 };
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::ecosystem::npm::packument_path;
@@ -297,6 +297,19 @@ fn npm_config(
     db_path: PathBuf,
     cache_dir: PathBuf,
 ) -> Config {
+    // `bootstrap_npm` now opens the audit log for real (this task), so
+    // this can no longer be `AuditConfig::default()`'s bare "audit.jsonl":
+    // that resolves relative to the test binary's current directory,
+    // which is the repo's working directory, and every test in this file
+    // would leave a real file behind there. Co-locating it next to this
+    // test's own `db_path` keeps it inside that test's tempdir, which is
+    // removed automatically when the `TempDir` guard drops. See
+    // `tests/http_cargo_bootstrap.rs`'s own `cargo_config` for the cargo
+    // path's identical fix.
+    let audit_path = db_path
+        .parent()
+        .expect("db_path has a parent directory")
+        .join("audit.jsonl");
     Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         db_path,
@@ -327,7 +340,11 @@ fn npm_config(
             max_packument_bytes: 67_108_864,
             min_release_age_days: None,
         }),
-        audit: AuditConfig::default(),
+        audit: AuditConfig {
+            path: audit_path,
+            rotation: AuditRotation::Daily,
+            max_files: 14,
+        },
     }
 }
 

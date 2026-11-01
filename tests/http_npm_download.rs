@@ -27,6 +27,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use supply_chain_scanner::artifact_cache::ArtifactCache;
+use supply_chain_scanner::audit::AuditLog;
 use supply_chain_scanner::config::{
     AllowEntry, AuditConfig, Config, ConfigHandle, CveLine, NpmRegistryConfig, PluginConfig,
     UnknownSeverity,
@@ -327,6 +328,11 @@ impl Harness {
             artifact_cache: Arc::clone(&artifact_cache),
             reviews: Arc::new(ReviewStore::new(db.clone())),
             plugin_run_coordinator: Arc::new(ScanCoordinator::new()),
+            // These tests are about the tarball gate's own behaviour, not
+            // the fetch audit log (that is `tests/http_audit_npm.rs`), so
+            // a discarding writer is enough to keep every request from
+            // 500ing on the new fail-closed write.
+            audit: Arc::new(AuditLog::with_writer(std::io::sink())),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

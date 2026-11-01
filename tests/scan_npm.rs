@@ -479,7 +479,7 @@ fn key(name: &str, vers: &str, shasum: &str) -> ArtifactKey {
 
 fn forwarded_versions(decision: &NpmIndexDecision) -> Vec<String> {
     match decision {
-        NpmIndexDecision::Packument(doc) => {
+        NpmIndexDecision::Packument { doc, .. } => {
             let mut vs: Vec<String> = doc["versions"]
                 .as_object()
                 .expect("versions object")
@@ -495,14 +495,16 @@ fn forwarded_versions(decision: &NpmIndexDecision) -> Vec<String> {
 
 fn latest_tag(decision: &NpmIndexDecision) -> Option<String> {
     match decision {
-        NpmIndexDecision::Packument(doc) => doc["dist-tags"]["latest"].as_str().map(str::to_string),
+        NpmIndexDecision::Packument { doc, .. } => {
+            doc["dist-tags"]["latest"].as_str().map(str::to_string)
+        }
         other => panic!("expected a Packument decision, got {other:?}"),
     }
 }
 
 fn tarball_url(decision: &NpmIndexDecision, vers: &str) -> String {
     match decision {
-        NpmIndexDecision::Packument(doc) => doc["versions"][vers]["dist"]["tarball"]
+        NpmIndexDecision::Packument { doc, .. } => doc["versions"][vers]["dist"]["tarball"]
             .as_str()
             .expect("tarball url")
             .to_string(),

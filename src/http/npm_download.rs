@@ -81,6 +81,7 @@ use axum::body::{Body, Bytes};
 use axum::http::{header, StatusCode};
 use axum::response::Response;
 
+use crate::audit::{AuditContext, AuditRecord};
 use crate::db::verdict::VerdictStore;
 use crate::ecosystem::npm::packument::{declared_digest, Dist};
 use crate::ecosystem::npm::upstream::UpstreamError;
@@ -93,7 +94,7 @@ use crate::scan::npm::{artifact_key, DownloadApproval};
 
 use super::npm_packument::NpmAppState;
 use super::refusal::{refusal_response, unverifiable_response};
-use super::{bad_request_response, not_found_response, why_url};
+use super::{audit_or_500, bad_request_response, not_found_response, why_url};
 
 /// The `Content-Type` sent for a `.tgz` body. npm does not branch on it;
 /// this is the honest description of the bytes for every other client.
@@ -122,9 +123,105 @@ struct Target<'a> {
     dist: &'a Dist,
 }
 
+/// What one tarball download request actually did, carried up from
+/// whichever gate decided it so [`npm_download_handler`] writes exactly
+/// one fetch audit record at the point the response is finalized — never
+/// earlier.
+///
+/// Mirrors [`crate::http::cargo_download`]'s own `DownloadOutcome`
+/// exactly, for the same reason: a packument-approved version
+/// ([`DownloadApproval::Approved`]) is not yet a *decided* download —
+/// the plugin gate still has to run, and it can still refuse the
+/// artifact. Writing a `served` record as soon as the packument gate's
+/// admission is matched, before the plugin gate has had its say, would
+/// log a request as served that the very same request later refused.
+/// So every function between the approval match and the final `Response`
+/// threads this type back up instead of writing audit records itself,
+/// and [`npm_download_handler`] is the only place that calls
+/// [`audit_or_500`] for a download.
+enum DownloadOutcome {
+    /// Bytes were served for this artifact key.
+    Served { key: ArtifactKey },
+    /// A refusal response was built from a reason. `filename` is the
+    /// requested tarball's own filename: unlike the cargo `.crate` route
+    /// (whose path carries only a version, so a never-admitted version
+    /// has no filename to name until an index entry is matched), npm's
+    /// tarball path *is* a filename, already validated by
+    /// [`version_from_filename`] against the requested package before
+    /// this point — so it is always known here, whether or not the
+    /// packument gate ever admitted this version. `why_id` is `Some`
+    /// only when a durable verdict backs this refusal and storing it
+    /// actually succeeded.
+    Refused {
+        package: String,
+        version: String,
+        filename: Option<String>,
+        reason: RefusalReason,
+        why_id: Option<String>,
+    },
+    /// No definite verdict was reached (a 404, an upstream outage, a
+    /// plugin that could not run, an internal I/O failure): there is
+    /// nothing yet for an audit line to describe, exactly as
+    /// `Decision::Unverifiable`/`Decision::InProgress` write nothing on
+    /// the PyPI path.
+    Silent,
+}
+
+impl DownloadOutcome {
+    /// The records [`AuditLog::write`](crate::audit::AuditLog::write)
+    /// needs for this outcome: zero or one.
+    fn into_records(self, ctx: &AuditContext) -> Vec<AuditRecord> {
+        match self {
+            DownloadOutcome::Served { key } => vec![AuditRecord::served(
+                ctx,
+                &key.package,
+                &key.version,
+                &key.filename,
+                &key.sha256,
+            )],
+            DownloadOutcome::Refused {
+                package,
+                version,
+                filename,
+                reason,
+                why_id,
+            } => vec![AuditRecord::refused(
+                ctx,
+                &package,
+                &version,
+                filename.as_deref(),
+                &reason,
+                why_id.as_deref(),
+            )],
+            DownloadOutcome::Silent => Vec::new(),
+        }
+    }
+}
+
+/// Writes the fetch audit record `outcome` implies (if any) and returns
+/// either `response` unchanged or the 500 [`audit_or_500`] substitutes
+/// for it on a write failure.
+fn finish_with_audit(
+    state: &NpmAppState,
+    ctx: &AuditContext,
+    response: Response,
+    outcome: DownloadOutcome,
+) -> Response {
+    let records = outcome.into_records(ctx);
+    if records.is_empty() {
+        return response;
+    }
+    match audit_or_500(&state.audit, &records) {
+        Some(failure) => failure,
+        None => response,
+    }
+}
+
 /// The tarball handler. `path` is the whole catch-all path, already
-/// percent-decoded by axum.
-pub async fn npm_download_handler(state: &NpmAppState, path: &str) -> Response {
+/// percent-decoded by axum. `ctx` is the one [`AuditContext`] the caller
+/// built from the real `ConnectInfo` peer address — this handler is not a
+/// route (see the module docs), so it cannot extract its own.
+pub async fn npm_download_handler(state: &NpmAppState, ctx: &AuditContext, path: &str) -> Response {
     let Some((raw_name, file)) = split_tarball_path(path) else {
         return bad_request_response("invalid npm tarball path");
     };
@@ -163,7 +260,9 @@ pub async fn npm_download_handler(state: &NpmAppState, path: &str) -> Response {
                 // without `approved_for_download` ever answering
                 // `Approved`, so it is also the one place that fetches the
                 // packument itself.
-                serve_with_plugin_dedup(state, &target, &fingerprint).await
+                let (response, outcome) =
+                    serve_with_plugin_dedup(state, &target, &fingerprint).await;
+                finish_with_audit(state, ctx, response, outcome)
             }
             Err(response) => response,
         };
@@ -184,20 +283,51 @@ pub async fn npm_download_handler(state: &NpmAppState, path: &str) -> Response {
                 version: &version,
                 dist: &dist,
             };
-            if plugin_checked(&state.verdicts, &key, &fingerprint).await {
+            let (response, outcome) = if plugin_checked(&state.verdicts, &key, &fingerprint).await {
                 serve_verified_bytes(state, &target).await
             } else {
                 serve_with_plugin_dedup(state, &target, &fingerprint).await
-            }
+            };
+            finish_with_audit(state, ctx, response, outcome)
         }
         DownloadApproval::Refused(reason, why_id) => {
-            let link = why_id.and_then(|id| why_url(&state.config.current(), &id));
-            refusal_response(&reason, link.as_deref())
+            let link = why_id
+                .clone()
+                .and_then(|id| why_url(&state.config.current(), &id));
+            let response = refusal_response(&reason, link.as_deref());
+            finish_with_audit(
+                state,
+                ctx,
+                response,
+                DownloadOutcome::Refused {
+                    package: name,
+                    version,
+                    filename: Some(file.to_string()),
+                    reason,
+                    why_id,
+                },
+            )
         }
         // The packument gate never admitted this version. Refuse without
-        // fetching anything, and never review inline.
+        // fetching anything, and never review inline. A refusal response
+        // still reaches the client here, and the design spec defines
+        // `refused` as exactly that ("a download that got a refusal
+        // response"), so this still writes one.
         DownloadApproval::NotApproved => {
-            refusal_response(&not_packument_approved_reason(&name, &version), None)
+            let reason = not_packument_approved_reason(&name, &version);
+            let response = refusal_response(&reason, None);
+            finish_with_audit(
+                state,
+                ctx,
+                response,
+                DownloadOutcome::Refused {
+                    package: name,
+                    version,
+                    filename: Some(file.to_string()),
+                    reason,
+                    why_id: None,
+                },
+            )
         }
         DownloadApproval::NotFound => not_found_response(),
         DownloadApproval::Unverifiable(reason) => unverifiable_response(&reason),
@@ -338,13 +468,24 @@ fn not_packument_approved_reason(name: &str, version: &str) -> RefusalReason {
 /// back, or a fresh download re-verified against the declared digest when
 /// the cache entry is gone. Used by the plugin-checked fast path and by a
 /// joiner that learned another request's plugin run already passed.
-async fn serve_verified_bytes(state: &NpmAppState, target: &Target<'_>) -> Response {
+async fn serve_verified_bytes(
+    state: &NpmAppState,
+    target: &Target<'_>,
+) -> (Response, DownloadOutcome) {
     match cache_get(state, target.key).await {
         Ok(Some(path)) => match tokio::fs::read(&path).await {
-            Ok(bytes) => tarball_response(bytes),
-            Err(err) => unverifiable_response(&internal_reason(&format!(
-                "reading the cached artifact: {err}"
-            ))),
+            Ok(bytes) => (
+                tarball_response(bytes),
+                DownloadOutcome::Served {
+                    key: target.key.clone(),
+                },
+            ),
+            Err(err) => (
+                unverifiable_response(&internal_reason(&format!(
+                    "reading the cached artifact: {err}"
+                ))),
+                DownloadOutcome::Silent,
+            ),
         },
         Ok(None) => {
             // The cache entry is gone. Re-download and re-verify, but no
@@ -353,20 +494,26 @@ async fn serve_verified_bytes(state: &NpmAppState, target: &Target<'_>) -> Respo
             let temp = match tempfile::tempdir() {
                 Ok(dir) => dir,
                 Err(err) => {
-                    return unverifiable_response(&internal_reason(&format!(
-                        "creating a temporary download directory: {err}"
-                    )))
+                    return (
+                        unverifiable_response(&internal_reason(&format!(
+                            "creating a temporary download directory: {err}"
+                        ))),
+                        DownloadOutcome::Silent,
+                    )
                 }
             };
             let dest = temp.path().join(&target.key.filename);
             match download_and_verify(state, target, &dest).await {
                 Ok(local) => serve_cached(state, &local, target).await,
-                Err(response) => response,
+                Err(response) => (response, DownloadOutcome::Silent),
             }
         }
-        Err(err) => unverifiable_response(&internal_reason(&format!(
-            "reading the artifact cache: {err:#}"
-        ))),
+        Err(err) => (
+            unverifiable_response(&internal_reason(&format!(
+                "reading the artifact cache: {err:#}"
+            ))),
+            DownloadOutcome::Silent,
+        ),
     }
 }
 
@@ -383,7 +530,7 @@ async fn serve_with_plugin_dedup(
     state: &NpmAppState,
     target: &Target<'_>,
     fingerprint: &str,
-) -> Response {
+) -> (Response, DownloadOutcome) {
     match state
         .plugin_run_coordinator
         .start_or_join(&target.key.sha256)
@@ -397,31 +544,45 @@ async fn serve_with_plugin_dedup(
                 Arc::clone(&state.plugin_run_coordinator),
                 target.key.sha256.clone(),
             );
-            let (response, verdict) = run_plugin_gate(state, target, fingerprint).await;
+            let (response, verdict, outcome) = run_plugin_gate(state, target, fingerprint).await;
             let _ = tx.send(verdict);
-            response
+            (response, outcome)
         }
         Err(rx) => match coordinator::wait_for_verdict(rx).await {
             Some(Verdict::Clean) => serve_verified_bytes(state, target).await,
             Some(Verdict::Blocked(reason)) => {
-                let link = stored_why_id(&state.verdicts, target.key, fingerprint)
-                    .await
+                let why_id = stored_why_id(&state.verdicts, target.key, fingerprint).await;
+                let link = why_id
+                    .clone()
                     .and_then(|id| why_url(&state.config.current(), &id));
-                refusal_response(&reason, link.as_deref())
+                (
+                    refusal_response(&reason, link.as_deref()),
+                    DownloadOutcome::Refused {
+                        package: target.key.package.clone(),
+                        version: target.key.version.clone(),
+                        filename: Some(target.key.filename.clone()),
+                        reason,
+                        why_id,
+                    },
+                )
             }
-            None => unverifiable_response(&scan_incomplete_reason()),
+            None => (
+                unverifiable_response(&scan_incomplete_reason()),
+                DownloadOutcome::Silent,
+            ),
         },
     }
 }
 
 /// Downloads, verifies, unpacks and runs every configured plugin over
 /// `target` once. Returns the owner's response plus the verdict to
-/// broadcast, which is `Some` only when that verdict was stored durably.
+/// broadcast, which is `Some` only when that verdict was stored durably,
+/// plus the [`DownloadOutcome`] the caller's fetch audit record needs.
 async fn run_plugin_gate(
     state: &NpmAppState,
     target: &Target<'_>,
     fingerprint: &str,
-) -> (Response, Option<Verdict>) {
+) -> (Response, Option<Verdict>, DownloadOutcome) {
     let temp = match tempfile::tempdir() {
         Ok(dir) => dir,
         Err(err) => {
@@ -430,13 +591,14 @@ async fn run_plugin_gate(
                     "creating a temporary download directory: {err}"
                 ))),
                 None,
+                DownloadOutcome::Silent,
             )
         }
     };
     let dest = temp.path().join(&target.key.filename);
     let local = match download_and_verify(state, target, &dest).await {
         Ok(local) => local,
-        Err(response) => return (response, None),
+        Err(response) => return (response, None, DownloadOutcome::Silent),
     };
 
     let unpacked = temp.path().join("unpacked");
@@ -450,6 +612,7 @@ async fn run_plugin_gate(
                     "unpacking the downloaded npm tarball: {err:#}"
                 ))),
                 None,
+                DownloadOutcome::Silent,
             )
         }
         Err(join_error) => {
@@ -458,6 +621,7 @@ async fn run_plugin_gate(
                     "the unpack task did not complete: {join_error}"
                 ))),
                 None,
+                DownloadOutcome::Silent,
             )
         }
     }
@@ -474,6 +638,7 @@ async fn run_plugin_gate(
                         "storing the clean verdict: {err:#}"
                     ))),
                     None,
+                    DownloadOutcome::Silent,
                 );
             }
             if let Err(err) = mark_plugin_checked(state, target.key, fingerprint).await {
@@ -482,10 +647,11 @@ async fn run_plugin_gate(
                         "marking the verdict plugin-checked: {err:#}"
                     ))),
                     None,
+                    DownloadOutcome::Silent,
                 );
             }
-            let response = serve_cached(state, &local, target).await;
-            (response, Some(Verdict::Clean))
+            let (response, outcome) = serve_cached(state, &local, target).await;
+            (response, Some(Verdict::Clean), outcome)
         }
         Some(reason) => {
             if is_check_failure(&reason) {
@@ -499,7 +665,11 @@ async fn run_plugin_gate(
                     code = %reason.code,
                     "an npm plugin could not run; answering unverifiable and storing nothing"
                 );
-                return (unverifiable_response(&reason), None);
+                return (
+                    unverifiable_response(&reason),
+                    None,
+                    DownloadOutcome::Silent,
+                );
             }
             let stored = store_verdict(
                 state,
@@ -520,14 +690,26 @@ async fn run_plugin_gate(
                     (None, None)
                 }
             };
-            let link = why_id.and_then(|id| why_url(&state.config.current(), &id));
+            let link = why_id
+                .clone()
+                .and_then(|id| why_url(&state.config.current(), &id));
             tracing::warn!(
                 package = %target.key.package,
                 version = %target.key.version,
                 code = %reason.code,
                 "an npm plugin blocked this artifact"
             );
-            (refusal_response(&reason, link.as_deref()), broadcast)
+            (
+                refusal_response(&reason, link.as_deref()),
+                broadcast,
+                DownloadOutcome::Refused {
+                    package: target.key.package.clone(),
+                    version: target.key.version.clone(),
+                    filename: Some(target.key.filename.clone()),
+                    reason,
+                    why_id,
+                },
+            )
         }
     }
 }
@@ -598,7 +780,7 @@ async fn serve_cached(
     state: &NpmAppState,
     local: &std::path::Path,
     target: &Target<'_>,
-) -> Response {
+) -> (Response, DownloadOutcome) {
     let cache = Arc::clone(&state.artifact_cache);
     let key_owned = target.key.clone();
     let file = local.to_path_buf();
@@ -628,10 +810,18 @@ async fn serve_cached(
     };
 
     match tokio::fs::read(&path).await {
-        Ok(bytes) => tarball_response(bytes),
-        Err(err) => unverifiable_response(&internal_reason(&format!(
-            "reading the verified artifact: {err}"
-        ))),
+        Ok(bytes) => (
+            tarball_response(bytes),
+            DownloadOutcome::Served {
+                key: target.key.clone(),
+            },
+        ),
+        Err(err) => (
+            unverifiable_response(&internal_reason(&format!(
+                "reading the verified artifact: {err}"
+            ))),
+            DownloadOutcome::Silent,
+        ),
     }
 }
 

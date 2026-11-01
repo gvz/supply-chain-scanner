@@ -60,13 +60,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::advisory::matching::sanitize_detail_text;
 use crate::advisory::matching_semver::affects;
 use crate::advisory::Advisory;
 use crate::ai::{AiReviewer, ReviewOutcome};
 use crate::artifact_cache::ArtifactCache;
+use crate::audit::{ListingAudit, VersionDecision};
 use crate::config::ConfigHandle;
 use crate::db::advisory::AdvisoryStore;
-use crate::db::verdict::{StoredVerdict, VerdictStore};
+use crate::db::verdict::{FileVerdict, StoredVerdict, VerdictStore};
 use crate::ecosystem::npm::packument::{
     declared_digest, filter_packument, DeclaredDigest, Dist, Packument, PackumentVersion,
 };
@@ -245,14 +247,36 @@ pub enum NpmIndexDecision {
     /// repointed at this proxy. Can carry zero versions; that is
     /// rendered exactly like a package with no usable version, never as
     /// an error.
-    Packument(serde_json::Value),
+    ///
+    /// `audit` is the fetch audit log's record of this same decision:
+    /// `versions_upstream` plus one [`VersionDecision`] per version the
+    /// cascade actually evaluated. It is built with the full picture
+    /// only at [`NpmScanner::run_cascade`]'s own `NpmNextStep::Forward`
+    /// arm, which is the only point every fact a `listed` line needs
+    /// (which versions were CVE-blocked, too-new, review-failed,
+    /// allowlisted, and which were ultimately forwarded) is in scope at
+    /// the same time — see [`NpmScanner::listing_audit`]'s own doc
+    /// comment. Every other path that produces this variant (an invalid
+    /// name, a package upstream does not have, an upstream outage, an
+    /// internal lookup failure) never ran that decision, so it carries a
+    /// minimal audit instead: the `versions_upstream` count it actually
+    /// knows, and no `listed` lines — the honest answer when nothing was
+    /// evaluated.
+    Packument {
+        doc: serde_json::Value,
+        audit: ListingAudit,
+    },
     /// Upstream answered: no such package. Distinct from an outage —
     /// callers must not treat this as "nothing passed yet" the way an
-    /// empty `Packument` would read.
+    /// empty `Packument` would read. No fetch audit record either: on
+    /// npm the packument *is* the gate, and there is no packument here
+    /// at all to have evaluated anything from.
     NotFound,
     /// The shared budget ran out mid-cascade. The caller tells the
     /// client to retry shortly. The reviews that already finished are
-    /// stored, so a retry resumes rather than restarts.
+    /// stored, so a retry resumes rather than restarts. No fetch audit
+    /// record either: no verdict was reached, so there is nothing yet
+    /// for a line to describe.
     InProgress,
 }
 
@@ -419,11 +443,14 @@ impl NpmScanner {
                 );
                 return match self.known_good(&normalized) {
                     Some(known) => self.decide_from_known_good(&normalized, &known).await,
-                    None => NpmIndexDecision::Packument(filter_packument(
-                        &empty_packument(&normalized),
-                        &[],
-                        &self.public_base(),
-                    )),
+                    None => NpmIndexDecision::Packument {
+                        doc: filter_packument(
+                            &empty_packument(&normalized),
+                            &[],
+                            &self.public_base(),
+                        ),
+                        audit: ListingAudit::default(),
+                    },
                 };
             }
         };
@@ -456,20 +483,25 @@ impl NpmScanner {
         packument: &Packument,
     ) -> NpmIndexDecision {
         if packument.versions.is_empty() {
-            return NpmIndexDecision::Packument(filter_packument(
-                packument,
-                &[],
-                &self.public_base(),
-            ));
+            return NpmIndexDecision::Packument {
+                doc: filter_packument(packument, &[], &self.public_base()),
+                audit: ListingAudit::default(),
+            };
         }
         let mut facts = match self.facts(normalized, packument).await {
             Ok(facts) => facts,
+            // An outage path's own lookup failure: no cascade decision
+            // was reached for any of these versions, so none of them were
+            // evaluated. See the `NpmIndexDecision::Packument` doc
+            // comment for why this is a minimal, not the rich, audit.
             Err(_) => {
-                return NpmIndexDecision::Packument(filter_packument(
-                    packument,
-                    &[],
-                    &self.public_base(),
-                ))
+                return NpmIndexDecision::Packument {
+                    doc: filter_packument(packument, &[], &self.public_base()),
+                    audit: ListingAudit {
+                        versions_upstream: packument.versions.len(),
+                        decisions: Vec::new(),
+                    },
+                }
             }
         };
 
@@ -495,11 +527,19 @@ impl NpmScanner {
         };
 
         match plan_npm_cascade(&input) {
-            NpmNextStep::Forward(versions) => NpmIndexDecision::Packument(filter_packument(
-                packument,
-                &versions,
-                &self.public_base(),
-            )),
+            // See the `NpmIndexDecision::Packument` doc comment: this
+            // outage path never has the full per-version picture
+            // `run_cascade`'s own `NpmNextStep::Forward` arm does (no
+            // `cve_blocked` set survives past this `input`, and nothing
+            // here was actually reviewed), so it reports only the count
+            // it does know, with no `listed` lines.
+            NpmNextStep::Forward(versions) => NpmIndexDecision::Packument {
+                doc: filter_packument(packument, &versions, &self.public_base()),
+                audit: ListingAudit {
+                    versions_upstream: packument.versions.len(),
+                    decisions: Vec::new(),
+                },
+            },
             // Unreachable: every non-forwardable survivor was just
             // marked failed. Answering with no survivors rather than
             // panicking keeps an outage path free of unwraps.
@@ -510,7 +550,13 @@ impl NpmScanner {
                     "the cascade wanted a review during an npm upstream outage; forwarding \
                      nothing"
                 );
-                NpmIndexDecision::Packument(filter_packument(packument, &[], &self.public_base()))
+                NpmIndexDecision::Packument {
+                    doc: filter_packument(packument, &[], &self.public_base()),
+                    audit: ListingAudit {
+                        versions_upstream: packument.versions.len(),
+                        decisions: Vec::new(),
+                    },
+                }
             }
         }
     }
@@ -533,11 +579,13 @@ impl NpmScanner {
                     error = %err,
                     "the npm advisory lookup failed; forwarding nothing"
                 );
-                return NpmIndexDecision::Packument(filter_packument(
-                    packument,
-                    &[],
-                    &self.public_base(),
-                ));
+                return NpmIndexDecision::Packument {
+                    doc: filter_packument(packument, &[], &self.public_base()),
+                    audit: ListingAudit {
+                        versions_upstream: packument.versions.len(),
+                        decisions: Vec::new(),
+                    },
+                };
             }
         };
 
@@ -563,7 +611,26 @@ impl NpmScanner {
                         forwarded = forward_versions.len(),
                         "the npm cascade forwarded this package"
                     );
-                    return NpmIndexDecision::Packument(doc);
+                    // The only point every fact a `listed` line needs is
+                    // in scope at once: `versions` (all of them, not just
+                    // survivors), `cve_blocked`, `facts.too_new`,
+                    // `facts.review_status` (just recovered above, so it
+                    // reflects every review this cascade run completed),
+                    // and `facts.allowlisted`. See
+                    // `NpmScanner::listing_audit`'s own doc comment.
+                    let audit = self
+                        .listing_audit(
+                            normalized,
+                            &versions,
+                            &facts.advisories,
+                            &cve_blocked,
+                            &facts.too_new,
+                            &facts.review_status,
+                            &facts.allowlisted,
+                            &forward_versions,
+                        )
+                        .await;
+                    return NpmIndexDecision::Packument { doc, audit };
                 }
                 NpmNextStep::NeedsReview(vers) => vers,
             };
@@ -588,11 +655,13 @@ impl NpmScanner {
                     "the npm cascade named a version that is not in the packument; forwarding \
                      nothing"
                 );
-                return NpmIndexDecision::Packument(filter_packument(
-                    packument,
-                    &[],
-                    &self.public_base(),
-                ));
+                return NpmIndexDecision::Packument {
+                    doc: filter_packument(packument, &[], &self.public_base()),
+                    audit: ListingAudit {
+                        versions_upstream: packument.versions.len(),
+                        decisions: Vec::new(),
+                    },
+                };
             };
 
             match self
@@ -653,6 +722,232 @@ impl NpmScanner {
             .filter(|vers| advisories.iter().any(|adv| self.advisory_blocks(adv, vers)))
             .cloned()
             .collect()
+    }
+
+    /// The advisory the fetch audit log cites for one CVE-blocked
+    /// version's `cve:<advisory-id>` reason code: the lowest-id advisory
+    /// among `advisories` that [`NpmScanner::advisory_blocks`] this
+    /// `version`, chosen deterministically when more than one blocks it
+    /// rather than by whatever order `advisories` happens to iterate in.
+    /// Mirrors [`crate::scan::cargo::CargoScanner::blocking_advisory`]
+    /// exactly, with the SemVer matcher in its `advisory_blocks` in place
+    /// of cargo's. `None` only when the caller's own `cve_blocked` set
+    /// disagrees with this same rule, which should not happen since both
+    /// are built from the same `advisories` list.
+    fn blocking_advisory<'a>(
+        &self,
+        advisories: &'a [Advisory],
+        version: &str,
+    ) -> Option<&'a Advisory> {
+        advisories
+            .iter()
+            .filter(|adv| self.advisory_blocks(adv, version))
+            .min_by(|a, b| a.id.cmp(&b.id))
+    }
+
+    /// Builds the fetch audit log's record of one listing response:
+    /// `versions_upstream` plus one [`VersionDecision`] per *evaluated*
+    /// version, in the vocabulary [`crate::audit`] defines.
+    ///
+    /// Called from exactly one place, [`NpmScanner::run_cascade`]'s own
+    /// `NpmNextStep::Forward` arm, because that is the only point this
+    /// cascade run's entire picture is in scope at once: every version
+    /// upstream published, which of them `cve_blocked`/`too_new`
+    /// removed, `review_status` as this run's reviews left it, the
+    /// operator's `allowlisted` set, and `forwarded` — the exact
+    /// versions the cascade decided to serve.
+    ///
+    /// Unlike cargo, there is no `yanked` check here: npm's own
+    /// `deprecated` field is not equivalent (see `scan::npm_cascade`'s
+    /// module docs), and a deprecated version stays an ordinary
+    /// candidate rather than being excluded up front, so it is denied or
+    /// forwarded by the same rules as any other version.
+    ///
+    /// A version not in `forwarded` and not caught by CVE or too-new is a
+    /// survivor the cascade marked `ReviewStatus::Failed` without a real
+    /// review ever running — the default stamp [`NpmScanner::facts`]
+    /// applies to every unreviewed survivor when no `[ai_review]`
+    /// reviewer is configured. Nothing was actually evaluated for it, so
+    /// it gets no [`VersionDecision`] at all, exactly like a version the
+    /// cascade never looked at. A review-failed version's reason text is
+    /// read back from [`VerdictStore::file_verdicts`] — one bulk read,
+    /// done here and nowhere else in this call — so a version with no
+    /// *blocked* row (including the default-stamped, never-really-
+    /// reviewed case above) correctly finds nothing, which is exactly the
+    /// signal used to treat it as never evaluated. See
+    /// `crate::scan::cargo::CargoScanner::listing_audit`'s own doc
+    /// comment for the full reasoning behind reading this back rather
+    /// than threading a reason up from inside the cascade loop; it
+    /// applies identically here.
+    ///
+    /// Every argument is a distinct fact the single caller already has in
+    /// scope at its own call site; bundling them into a struct would only
+    /// move the same list one level out, for no gain.
+    #[allow(clippy::too_many_arguments)]
+    async fn listing_audit(
+        &self,
+        normalized: &str,
+        versions: &[String],
+        advisories: &[Advisory],
+        cve_blocked: &HashSet<String>,
+        too_new: &HashSet<String>,
+        review_status: &HashMap<String, ReviewStatus>,
+        allowlisted: &HashSet<String>,
+        forwarded: &[String],
+    ) -> ListingAudit {
+        let forwarded_set: HashSet<&str> = forwarded.iter().map(String::as_str).collect();
+        let file_verdicts = self.file_verdicts_by_version(normalized).await;
+
+        let mut decisions = Vec::new();
+        for vers in versions {
+            if forwarded_set.contains(vers.as_str()) {
+                decisions.push(VersionDecision {
+                    version: vers.clone(),
+                    filename: None,
+                    allowed: true,
+                    reason_code: allowlisted
+                        .contains(vers)
+                        .then(|| "allowlisted".to_string()),
+                    reason_detail: None,
+                    why_id: None,
+                });
+                continue;
+            }
+
+            // Not forwarded: find the reason, in the cascade's own
+            // filtering order (CVE, then too-new — see
+            // `plan_npm_cascade`'s module docs), falling through to a
+            // real review failure last. A version matching none of these
+            // was never evaluated and gets no line at all.
+            let reason = if cve_blocked.contains(vers) {
+                // The reason vocabulary is reused verbatim rather than
+                // invented, per the design spec: `cve:<advisory-id>` is
+                // the exact spelling `src/advisory/matching.rs`'s own
+                // `refusal_reason` already uses for the PyPI path, so a
+                // Loki hit on this denial carries the same id a `/why`
+                // link (were one to exist for this code) would. When
+                // more than one advisory blocks the same version, the
+                // lowest id is chosen, deterministically rather than by
+                // whatever order `advisories` happens to iterate in. The
+                // summary is sanitized and capped through the same
+                // `sanitize_detail_text` the PyPI path already applies to
+                // this exact upstream text, so this line never carries
+                // unbounded or unsanitized OSV data.
+                Some(match self.blocking_advisory(advisories, vers) {
+                    Some(adv) => {
+                        let severity = match adv.severity {
+                            Some(score) => format!("{score}"),
+                            None => "unknown".to_string(),
+                        };
+                        let summary = sanitize_detail_text(&adv.summary);
+                        (
+                            format!("cve:{}", adv.id),
+                            Some(format!("{summary} (severity {severity})")),
+                            None,
+                        )
+                    }
+                    // Unreachable in practice: `cve_blocked` was built
+                    // from this same `advisories` list via the same
+                    // `advisory_blocks` rule a moment earlier in
+                    // `run_cascade`. Falls back to the bare code rather
+                    // than panicking if that invariant is ever broken.
+                    None => ("cve".to_string(), None, None),
+                })
+            } else if too_new.contains(vers) {
+                Some((
+                    "too-new".to_string(),
+                    Some(
+                        "this version was published too recently to meet the configured \
+                         minimum release age"
+                            .to_string(),
+                    ),
+                    None,
+                ))
+            } else if matches!(review_status.get(vers.as_str()), Some(ReviewStatus::Failed)) {
+                // `blocked` is checked rather than trusting that a row
+                // existing at all means "denied": this bulk read runs
+                // after `facts()`'s own per-version reads decided
+                // `review_status`, so a verdict a concurrent rescan
+                // flipped to `Clean` in between must not be reported as
+                // a denial with a stale or empty reason. Finding no
+                // *blocked* row here is folded into the same "never
+                // evaluated" outcome as finding no row at all.
+                file_verdicts
+                    .get(vers.as_str())
+                    .filter(|verdict| verdict.blocked)
+                    .map(|verdict| {
+                        (
+                            verdict.reason_code.clone(),
+                            Some(verdict.reason_detail.clone()),
+                            Some(verdict.why_id.clone()),
+                        )
+                    })
+            } else {
+                None
+            };
+
+            if let Some((reason_code, reason_detail, why_id)) = reason {
+                decisions.push(VersionDecision {
+                    version: vers.clone(),
+                    filename: None,
+                    allowed: false,
+                    reason_code: Some(reason_code),
+                    reason_detail,
+                    why_id,
+                });
+            }
+        }
+
+        ListingAudit {
+            versions_upstream: versions.len(),
+            decisions,
+        }
+    }
+
+    /// Every stored verdict for `normalized` under this scanner's running
+    /// policy fingerprint, keyed by version — npm decides per version,
+    /// not per file. Used only by [`NpmScanner::listing_audit`], as the
+    /// single source of the reason text a review-failed version's audit
+    /// line reports.
+    ///
+    /// A lookup failure is logged and answered as an empty map rather
+    /// than propagated: this is enrichment for the fetch audit log's
+    /// `listed` lines, not the gate itself, so a read error here must not
+    /// turn into a failure to serve the packument that is already
+    /// decided. The affected lines simply carry no reason text, which is
+    /// honest — not a wrong answer, an absent one.
+    async fn file_verdicts_by_version(&self, normalized: &str) -> HashMap<String, FileVerdict> {
+        let store = Arc::clone(&self.verdict_store);
+        let package = normalized.to_string();
+        let fingerprint = self.fingerprint();
+        match tokio::task::spawn_blocking(move || {
+            store.file_verdicts(ECOSYSTEM, &package, &fingerprint)
+        })
+        .await
+        {
+            Ok(Ok(verdicts)) => verdicts
+                .into_iter()
+                .map(|verdict| (verdict.version.clone(), verdict))
+                .collect(),
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    package = normalized,
+                    error = %format!("{err:#}"),
+                    "could not read stored verdicts for the listing audit; review-failed \
+                     reasons will be omitted from this response's audit lines"
+                );
+                HashMap::new()
+            }
+            Err(join_error) => {
+                tracing::warn!(
+                    package = normalized,
+                    error = %join_error,
+                    "the listing-audit verdict lookup task panicked; review-failed reasons \
+                     will be omitted from this response's audit lines"
+                );
+                HashMap::new()
+            }
+        }
     }
 
     /// Reads every per-version fact one cascade iteration needs, on the

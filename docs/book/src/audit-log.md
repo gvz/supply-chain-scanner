@@ -63,9 +63,11 @@ Emitted by the PEP 503 simple page (`src/http/simple.rs`), the cargo sparse inde
 | Field | Meaning |
 |---|---|
 | `version` | always present |
-| `filename` | present whenever an index/packument entry was actually matched; absent for cargo's `not-index-approved` and npm's `not-packument-approved`, where no entry was ever matched to name one from |
+| `filename` | present whenever an index/packument entry was actually matched, or — on npm only — whenever the request path itself names one; absent for cargo's `not-index-approved`, where neither is true |
 | `reason_code`, `reason_detail` | the refusal, in the vocabulary below |
 | `why_id` | present when a durable verdict backs the refusal |
+
+**Cargo and npm are asymmetric here, deliberately.** Cargo's `.crate` route carries only a version in its path; there is no filename to report until an index entry has actually been matched, so `not-index-approved` leaves `filename` absent. npm's tarball route is different: its path segment is already an `{name}-{version}.tgz`-shaped filename, split out by `split_tarball_path` before any packument lookup runs (`src/http/npm_download.rs`). So a `not-packument-approved` refusal still carries `filename` — taken straight from that request path, not from a matched `dist` entry — and it is the same value a `served` line for the same request would have carried. An operator comparing the two ecosystems' `refused` lines will notice cargo omits it and npm does not; this is why, not an inconsistency to chase down.
 
 ## `versions_upstream` counts different units per ecosystem — on purpose
 

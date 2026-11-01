@@ -35,7 +35,7 @@ use supply_chain_scanner::artifact_cache::ArtifactCache;
 use supply_chain_scanner::audit::AuditLog;
 use supply_chain_scanner::config::{
     AiReviewConfig, AuditConfig, AuditRotation, BlockOn, CargoRegistryConfig, Config, ConfigHandle,
-    CveLine, UnknownSeverity,
+    CveLine, PluginConfig, UnknownSeverity,
 };
 use supply_chain_scanner::db::advisory::AdvisoryStore;
 use supply_chain_scanner::db::cargo_vet::CargoVetStore;
@@ -356,12 +356,26 @@ struct Harness {
     addr: SocketAddr,
 }
 
+/// [`start_with_sandbox`] with [`NeverCalledSandbox`]: every test except
+/// `a_fresh_plugin_block_on_an_approved_version_writes_a_refused_line`
+/// configures no plugins at all (an empty plugin list never calls its
+/// sandbox) and never reaches a live AI review either, so the sandbox
+/// must never run.
+async fn start(server: MockServer, cfg: Config, audit: Arc<AuditLog>) -> Harness {
+    start_with_sandbox(server, cfg, audit, Arc::new(NeverCalledSandbox)).await
+}
+
 /// Builds the real cargo router, with `audit` wired into its
 /// `CargoAppState`, served over real HTTP/1.1 on an ephemeral loopback
 /// port via `into_make_service_with_connect_info`, exactly as `main.rs`'s
 /// `serve` does — without that, `ConnectInfo<SocketAddr>` extraction in
 /// `cargo_index_handler`/`cargo_download_handler` fails on every request.
-async fn start(server: MockServer, cfg: Config, audit: Arc<AuditLog>) -> Harness {
+async fn start_with_sandbox(
+    server: MockServer,
+    cfg: Config,
+    audit: Arc<AuditLog>,
+    sandbox: Arc<dyn SandboxRunner>,
+) -> Harness {
     let (db_dir, db) = open_db();
     let cache_dir = tempfile::tempdir().expect("create cache temp dir");
 
@@ -412,7 +426,7 @@ async fn start(server: MockServer, cfg: Config, audit: Arc<AuditLog>) -> Harness
         config: config_handle,
         upstream: Arc::new(download_upstream),
         verdicts: Arc::new(VerdictStore::new(db.clone())),
-        plugins: Arc::new(PluginRunner::new(Arc::new(NeverCalledSandbox))),
+        plugins: Arc::new(PluginRunner::new(Arc::clone(&sandbox))),
         artifact_cache: Arc::new(
             ArtifactCache::new(db.clone(), cache_dir.path().join("artifacts"))
                 .expect("create artifact cache"),
@@ -719,6 +733,88 @@ async fn a_refused_cargo_download_writes_a_refused_line() {
         .find(|line| line["event"] == "refused")
         .expect("a refused record was written");
     assert_eq!(record["event"], "refused");
+    assert_eq!(record["reason_code"], "plugin:yara");
+    assert!(record["why_id"].is_string());
+}
+
+/// A sandbox stub that always reports a plugin block, for
+/// `a_fresh_plugin_block_on_an_approved_version_writes_a_refused_line`
+/// below: the one test in this file that configures a real plugin and
+/// needs the sandbox to actually run.
+struct BlockingSandbox;
+impl SandboxRunner for BlockingSandbox {
+    fn run(&self, _spec: &SandboxSpec) -> anyhow::Result<SandboxOutcome> {
+        Ok(SandboxOutcome {
+            exit_code: Some(1),
+            output: "malware found".to_string(),
+            timed_out: false,
+            signal: None,
+        })
+    }
+}
+
+/// An index-approved version (a stored `Clean` verdict, exactly as
+/// `a_cargo_crate_download_writes_a_served_line` seeds) is not yet a
+/// *decided* download: the plugin gate still has to run, and here it
+/// blocks. The response must be a refusal, and the audit line must say
+/// `refused`, never `served` — pinning the very defect
+/// `cargo_download.rs`'s `DownloadOutcome` threading exists to prevent:
+/// writing `served` as soon as the index gate's admission is matched,
+/// before the plugin gate has had its say.
+#[tokio::test]
+async fn a_fresh_plugin_block_on_an_approved_version_writes_a_refused_line() {
+    let server = MockServer::start().await;
+    let name = "serde";
+    let bytes = crate_bytes(name, "1.0.0");
+    let cksum = sha256_hex(&bytes);
+    mount_index(&server, name, &[line("1.0.0", &cksum, false)]).await;
+    mount_download(&server, name, "1.0.0", &bytes).await;
+
+    let plugin_dir = tempfile::tempdir().expect("create plugin temp dir");
+    let plugin_binary = plugin_dir.path().join("yara");
+    std::fs::write(&plugin_binary, b"pretend plugin binary").expect("write plugin binary");
+
+    let mut cfg = base_config(&server);
+    cfg.plugins = vec![PluginConfig {
+        name: "yara".to_string(),
+        binary: plugin_binary,
+        timeout: Duration::from_secs(5),
+    }];
+
+    let (audit_dir, audit) = audit_log_over_tempdir();
+    let harness = start_with_sandbox(server, cfg, audit, Arc::new(BlockingSandbox)).await;
+
+    // Index-admitted, not yet plugin-checked: exactly the state a real
+    // `.crate` download runs in before its first plugin pass.
+    let artifact_key = key(name, "1.0.0", &cksum);
+    VerdictStore::new(harness.db.clone())
+        .put(&artifact_key, &Verdict::Clean, &harness.fingerprint)
+        .expect("seed the index gate's clean verdict");
+
+    let response = reqwest::get(format!(
+        "http://{}/crates/{name}/1.0.0/download",
+        harness.addr
+    ))
+    .await
+    .expect("request crate download");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a fresh plugin block must be a 403"
+    );
+
+    let lines = read_audit_lines(audit_dir.path(), "audit.jsonl");
+    assert!(
+        lines.iter().all(|line| line["event"] != "served"),
+        "an approval the plugin gate went on to refuse must never be logged served: {lines:?}"
+    );
+    let record = lines
+        .iter()
+        .find(|line| line["event"] == "refused")
+        .expect("a refused record was written for the fresh plugin block");
+    assert_eq!(record["package"], name);
+    assert_eq!(record["version"], "1.0.0");
+    assert_eq!(record["filename"], format!("{name}-1.0.0.crate"));
     assert_eq!(record["reason_code"], "plugin:yara");
     assert!(record["why_id"].is_string());
 }

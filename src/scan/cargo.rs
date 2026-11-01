@@ -869,13 +869,24 @@ impl CargoScanner {
                     None,
                 ))
             } else if matches!(review_status.get(vers), Some(ReviewStatus::Failed)) {
-                file_verdicts.get(vers).map(|verdict| {
-                    (
-                        verdict.reason_code.clone(),
-                        Some(verdict.reason_detail.clone()),
-                        Some(verdict.why_id.clone()),
-                    )
-                })
+                // `blocked` is checked rather than trusting that a row
+                // existing at all means "denied": this bulk read runs
+                // after `facts()`'s own per-entry reads decided
+                // `review_status`, so a verdict a concurrent rescan
+                // flipped to `Clean` in between must not be reported as
+                // a denial with a stale or empty reason. Finding no
+                // *blocked* row here is folded into the same "never
+                // evaluated" outcome as finding no row at all.
+                file_verdicts
+                    .get(vers)
+                    .filter(|verdict| verdict.blocked)
+                    .map(|verdict| {
+                        (
+                            verdict.reason_code.clone(),
+                            Some(verdict.reason_detail.clone()),
+                            Some(verdict.why_id.clone()),
+                        )
+                    })
             } else {
                 None
             };

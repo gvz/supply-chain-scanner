@@ -928,14 +928,124 @@ async fn cargo_config_json_and_refusals_write_no_audit_lines() {
     assert_eq!(lines.len(), 0);
 }
 
+/// Mounts a one-version, cargo-vet-covered crate identical in shape to
+/// the one `a_failed_audit_write_on_a_cargo_index_returns_500_and_no_entries`
+/// and `a_failed_audit_write_on_a_cargo_download_returns_500_and_no_bytes`
+/// use for their failing-writer case, so each can be driven against a
+/// working audit log too — the positive control that proves an empty
+/// body/empty bytes in the failing case is actually attributable to the
+/// audit write, not to some other reason this exact request might 500 or
+/// come back empty regardless of the audit log.
+async fn mount_vet_covered_crate(server: &MockServer, name: &str, vers: &str, cksum: &str) {
+    mount_index(server, name, &[line(vers, cksum, false)]).await;
+}
+
+fn seed_vet_coverage(db: &Db, name: &str, vers: &str) {
+    CargoVetStore::new(db.clone())
+        .replace_source(
+            "test",
+            &[supply_chain_scanner::cargovet::parse::AuditEntry::Full {
+                package: name.to_string(),
+                version: vers.to_string(),
+                who: vec!["trusted-auditor".to_string()],
+                criteria: vec!["safe-to-deploy".to_string()],
+                source: "test".to_string(),
+            }],
+        )
+        .expect("store the cargo-vet audit");
+}
+
 /// A failed audit write on a cargo index listing fails the whole request
 /// closed: a 500 with an empty body, never the index entries the cascade
 /// would otherwise have served.
+///
+/// Carries its own positive control: the same crate, cargo-vet coverage
+/// and request driven a second time through a harness with a *working*
+/// audit log must actually serve the forwarded entry. Without that
+/// control, `body.is_empty()` on the failing-writer harness could pass
+/// for a reason that has nothing to do with the audit write at all (a
+/// typo in the mount, a cascade that never forwards this crate) — the
+/// control proves this exact scenario really does produce real bytes
+/// when the only thing that changes is the audit writer.
 #[tokio::test]
 async fn a_failed_audit_write_on_a_cargo_index_returns_500_and_no_entries() {
-    let server = MockServer::start().await;
     let name = "demo-crate";
-    mount_index(&server, name, &[line("1.0.0", "cksum-1.0.0", false)]).await;
+    let vers = "1.0.0";
+    let cksum = "cksum-1.0.0";
+
+    let failing_server = MockServer::start().await;
+    mount_vet_covered_crate(&failing_server, name, vers, cksum).await;
+    let cfg = base_config(&failing_server);
+    let failing_harness = start(
+        failing_server,
+        cfg,
+        Arc::new(AuditLog::with_writer(AlwaysFailingWriter)),
+    )
+    .await;
+    seed_vet_coverage(&failing_harness.db, name, vers);
+
+    let response = reqwest::get(format!(
+        "http://{}/{}",
+        failing_harness.addr,
+        index_path_for(name)
+    ))
+    .await
+    .expect("request cargo index");
+    let status = response.status();
+    let body = response.bytes().await.expect("read response body");
+
+    assert_eq!(status, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(body.is_empty(), "no index entries may be served: {body:?}");
+    assert_ne!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "a write failure must not read as a refusal"
+    );
+
+    // Positive control: the identical scenario, with a working audit log,
+    // must actually serve the forwarded entry — proving the empty body
+    // above is the audit failure's doing, not some other reason this
+    // crate/version never reaches the client.
+    let working_server = MockServer::start().await;
+    mount_vet_covered_crate(&working_server, name, vers, cksum).await;
+    let cfg = base_config(&working_server);
+    let (_working_audit_dir, working_audit) = audit_log_over_tempdir();
+    let working_harness = start(working_server, cfg, working_audit).await;
+    seed_vet_coverage(&working_harness.db, name, vers);
+
+    let control_response = reqwest::get(format!(
+        "http://{}/{}",
+        working_harness.addr,
+        index_path_for(name)
+    ))
+    .await
+    .expect("request cargo index on the control harness");
+    assert_eq!(control_response.status(), reqwest::StatusCode::OK);
+    let control_body = control_response
+        .text()
+        .await
+        .expect("read control response body");
+    assert!(
+        control_body.contains(vers),
+        "the control harness (a working audit writer) must actually serve the \
+         forwarded version, or the empty body above proves nothing about the \
+         audit write: {control_body:?}"
+    );
+}
+
+/// The download path's own fail-closed guarantee: a failed audit write
+/// on a `.crate` download must 500 with no crate bytes, never serve the
+/// artifact and never read as a refusal. This is the one place the
+/// fail-closed rule protects package *bytes* rather than index entries —
+/// the guarantee the whole feature rests on.
+#[tokio::test]
+async fn a_failed_audit_write_on_a_cargo_download_returns_500_and_no_bytes() {
+    let server = MockServer::start().await;
+    let name = "serde";
+    let bytes = crate_bytes(name, "1.0.0");
+    let cksum = sha256_hex(&bytes);
+    mount_index(&server, name, &[line("1.0.0", &cksum, false)]).await;
+    mount_download(&server, name, "1.0.0", &bytes).await;
 
     let cfg = base_config(&server);
     let harness = start(
@@ -944,27 +1054,27 @@ async fn a_failed_audit_write_on_a_cargo_index_returns_500_and_no_entries() {
         Arc::new(AuditLog::with_writer(AlwaysFailingWriter)),
     )
     .await;
-    CargoVetStore::new(harness.db.clone())
-        .replace_source(
-            "test",
-            &[supply_chain_scanner::cargovet::parse::AuditEntry::Full {
-                package: name.to_string(),
-                version: "1.0.0".to_string(),
-                who: vec!["trusted-auditor".to_string()],
-                criteria: vec!["safe-to-deploy".to_string()],
-                source: "test".to_string(),
-            }],
-        )
-        .expect("store the cargo-vet audit");
 
-    let response = reqwest::get(format!("http://{}/{}", harness.addr, index_path_for(name)))
-        .await
-        .expect("request cargo index");
+    // The state a real download runs in: the index gate already admitted
+    // this version (a stored `Clean` verdict), not yet plugin-checked —
+    // exactly `a_cargo_crate_download_writes_a_served_line`'s own setup,
+    // so the only variable between the two tests is the audit writer.
+    let artifact_key = key(name, "1.0.0", &cksum);
+    VerdictStore::new(harness.db.clone())
+        .put(&artifact_key, &Verdict::Clean, &harness.fingerprint)
+        .expect("seed the index gate's clean verdict");
+
+    let response = reqwest::get(format!(
+        "http://{}/crates/{name}/1.0.0/download",
+        harness.addr
+    ))
+    .await
+    .expect("request crate download");
     let status = response.status();
     let body = response.bytes().await.expect("read response body");
 
     assert_eq!(status, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
-    assert!(body.is_empty(), "no index entries may be served: {body:?}");
+    assert!(body.is_empty(), "no crate bytes may be served: {body:?}");
     assert_ne!(
         status,
         reqwest::StatusCode::FORBIDDEN,

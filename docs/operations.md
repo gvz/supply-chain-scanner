@@ -427,6 +427,22 @@ fetch must never happen; there is no "logging off" default to fall back to.
 | `rotation` | `daily` | `daily` or `hourly`. |
 | `max_files` | `14` | Rotated files kept before the oldest is deleted. |
 
+**Changing `rotation` orphans the old files.** Pruning only ever considers
+files whose suffix parses under the *currently configured* granularity — a
+daily deployment switched to `hourly` (or back) stops counting, and stops
+deleting, every file written under the old granularity. Those files are not
+harmful, but they sit on disk indefinitely outside `max_files`' accounting
+until an operator clears them by hand; budget disk accordingly before
+changing this setting on a long-running deployment.
+
+**`max_files` is a best-effort cap, not a hard one.** The file currently
+being written to is never pruned, no matter how it sorts by name — which
+matters after a clock step backward or a rotation change, where the live
+file can sort *oldest* among its siblings. In that case the deployment can
+briefly hold `max_files + 1` files rather than `max_files`, until the
+oldest ages out naturally. Do not treat `max_files` as a guarantee when
+sizing a disk right at the edge.
+
 **Restart-only.** `[audit]` joins `bind` and `db_path` among the fields a
 `SIGHUP` reload rejects in full, naming `audit`, rather than applying — the
 open file handle is built once at startup, and there is no "close the old

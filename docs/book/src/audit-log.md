@@ -84,10 +84,10 @@ The codes actually emitted:
 | `cve:<advisory-id>` | blocked by the CVE line. When several advisories match, the lexicographically smallest id is chosen, deterministically. |
 | `too-new` | younger than the configured `min_release_age_days`. |
 | `yanked` | cargo only. npm's cascade keeps deprecated versions as candidates (ordinary installs depend on resolving them), so there is no npm equivalent. |
-| `allowlisted` | on an **allowed** line — the version survived the cascade, or stayed visible on the PyPI page, only because an operator allowlisted it. |
+| `allowlisted` | on an **allowed** line. The meaning differs subtly by ecosystem: on **PyPI** it fires only when the entry was actually blocked and the allowlist overrode that block — it genuinely means "survived only because an operator allowlisted it." On **cargo and npm** it fires for *any* forwarded version that happens to be in the allowlist, whether or not that version would also have passed the cascade on its own merits — an allowlisted version skips the review gate entirely (it was never evaluated), so this code means "forwarded without review," not necessarily "would otherwise have been denied." Do not count cargo/npm `allowlisted` lines as proof the allowlist rescued a version the gate would have blocked. |
 | `not-index-approved` | cargo only: a `.crate` download for a version the sparse-index cascade never admitted. |
 | `not-packument-approved` | npm only: a tarball download for a version the packument cascade never admitted. |
-| `hash-mismatch` | the downloaded bytes did not match the registry-declared digest. Logged on every ecosystem's download path. This is the highest-signal line this log carries: bytes that do not match what the registry itself declared. |
+| `hash-mismatch` | the downloaded bytes did not match the registry-declared digest. Reachable on PyPI's and cargo's download paths. On npm it is defense-in-depth, documented as dead code elsewhere: npm's upstream client re-derives the declared digest from the same `dist` object and self-verifies before this proxy ever gets the bytes, so a mismatch there folds into a 503 (unverifiable) rather than ever reaching this code path over HTTP. This is otherwise the highest-signal line this log carries: bytes that do not match what the registry itself declared. |
 | `plugin:*` | an organization-supplied plugin refused the artifact, or failed to run. |
 | `ai:*` | the AI reviewer refused the artifact (`ai:malicious`, `ai:suspicious`, `ai:coverage`, `ai:opaque-executable`). |
 
@@ -95,7 +95,7 @@ The codes actually emitted:
 
 A `listed` line requires a verdict; a `served`/`refused` line requires a response that was actually reached by evaluating something. So:
 
-- **A 403 refusal is always logged** as `refused` — including a hash-mismatch refusal, and including cargo's `not-index-approved` and npm's `not-packument-approved`, both of which refuse without ever matching an index entry.
+- **Every 403 on a package fetch route is always logged** as `refused` — including a hash-mismatch refusal, and including cargo's `not-index-approved` and npm's `not-packument-approved`, both of which refuse without ever matching an index entry. (npm's write/auth refusals below are also 403s, but they are not package fetches, so they are the one kind of 403 this log does not carry.)
 - **A 503 "unverifiable" is never logged.** Nothing was verified and no verdict was reached — there is nothing yet for a line to describe. The same request logs its own line later, if a retry resolves to `Serve` or `Refuse`.
 - **A 404 is never logged.** Upstream has already said "no such package" or "no such version"; this proxy evaluated nothing.
 - **A 429 "still in progress" is never logged**, for the same reason as the 503 case: the scan that will eventually produce a verdict has not finished yet.

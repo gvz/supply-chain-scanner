@@ -127,7 +127,9 @@ The client IP exists in exactly **one** place in this proxy: this file. It is ne
 
 `X-Forwarded-For` is never read. Nothing sits in front of this proxy, so the header could only be a client forging its own identity, and honouring it would let a developer write someone else's address into a security log. The logged address is always the raw TCP peer, via axum's `ConnectInfo`.
 
-This file now holds network-attributable data about real developers — source IP, package, version, timestamp — which the stdout access log never did. It deserves its own filesystem permissions and its own retention policy, separate from the rest of this proxy's logs.
+This file now holds network-attributable data about real developers — source IP, package, version, timestamp — which the stdout access log never did. So the proxy does not leave its permissions to the ambient umask: the file is created mode `0600`, and any directory it has to create for it mode `0700`, owned by the user the proxy runs as. The modes apply only at creation, so a mode you set yourself on an existing path survives; and since each rotated file is created the same way, there is no one-off `chmod` to remember — which is the point, because a `chmod` applied once would not have covered tomorrow's file.
+
+The consequence worth planning for: **a log shipper running as a different user cannot read this file as created**, losing both directory traversal and file read. Either run the shipper as the same user as the proxy, or add a shared group and widen the directory once. A shipper that quietly stops shipping leaves exactly the silent hole this log is built to rule out, so it is worth checking after the first rotation rather than after the first incident. Retention remains yours to set, separately from this proxy's other logs.
 
 ## Volume
 

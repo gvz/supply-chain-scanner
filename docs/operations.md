@@ -469,8 +469,18 @@ developers whose fetches are logged. `X-Forwarded-For` is never read: nothing
 sits in front of this proxy, so the header could only be a client forging its
 own identity, and the logged address is always the real TCP peer. This file
 now holds network-attributable data about real developers that the stdout
-log above never did, and it deserves its own filesystem permissions and its
-own retention policy, separate from the rest of this proxy's logs.
+log above never did, so the proxy creates it restrictively rather than leaving
+it to the ambient umask: the file is created mode `0600` and any directory the
+proxy has to create for it mode `0700`, owned by the user the proxy runs as.
+Those modes apply only at creation, so a mode you set yourself on an existing
+file or directory survives — and because every rotated file is created the same
+way, a one-off `chmod` is not needed and would not have protected tomorrow's
+file anyway. **A log shipper running as a different user cannot read this file
+as created** — it loses both directory traversal and file read. Run the shipper
+as the same user as the proxy, or add a shared group and widen the directory
+once; a shipper that silently stops shipping is the failure this file exists to
+prevent. Retention is still yours to set, separate from the rest of this proxy's
+logs.
 
 **Volume.** One `listing` line plus one `listed` line per evaluated version,
 per listing request — tens of lines, not the thousand-plus versions a

@@ -8,7 +8,6 @@
 //! passed in matches the one stored, so a policy change forces a rescan
 //! rather than silently reusing a verdict made under different rules.
 
-use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -72,8 +71,7 @@ pub struct BlockedVerdict {
 }
 
 /// Every verdict on record for one package under `fingerprint`, keyed by
-/// filename. Carries what an audit line needs that
-/// [`VerdictStore::blocked_filenames`] drops: whether it was blocked,
+/// filename. Carries what an audit line needs: whether it was blocked,
 /// why, and its `why_id`. `version` rides along too (selected straight
 /// off the `verdicts` table's own `version` column) because PyPI's
 /// listing audit needs both: a PyPI `listed` record carries `version`
@@ -339,46 +337,14 @@ impl VerdictStore {
         Ok(blocked)
     }
 
-    /// Lists the filenames currently blocked for `(ecosystem, package)`
-    /// under the given policy `fingerprint`. Used to filter the package
-    /// index so a developer never sees a download link for a blocked
-    /// artifact in the first place.
-    pub fn blocked_filenames(
-        &self,
-        ecosystem: &str,
-        package: &str,
-        fingerprint: &str,
-    ) -> anyhow::Result<HashSet<String>> {
-        let conn = self.db.conn()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT filename FROM verdicts
-                 WHERE ecosystem = ?1 AND package = ?2 AND fingerprint = ?3 AND blocked = 1",
-            )
-            .context("preparing blocked_filenames query")?;
-        let rows = stmt
-            .query_map(rusqlite::params![ecosystem, package, fingerprint], |row| {
-                row.get::<_, String>(0)
-            })
-            .context("querying blocked filenames")?;
-
-        let mut filenames = HashSet::new();
-        for row in rows {
-            filenames.insert(row.context("reading blocked filename row")?);
-        }
-        Ok(filenames)
-    }
-
     /// Every verdict on record for `(ecosystem, package)` under the given
-    /// policy `fingerprint`, one row per scanned filename.
-    ///
-    /// This is [`VerdictStore::blocked_filenames`]'s query without the
-    /// `blocked = 1` clause, carrying what an audit line needs that
-    /// `blocked_filenames` deliberately drops: whether each filename was
-    /// blocked, why, and its `why_id`. `blocked_filenames` only has to
-    /// answer "hide this or not", so it discards the reason the moment
-    /// it has the filename; a listing audit record has to say *which*
-    /// evaluated entries were denied and why, so this keeps it.
+    /// policy `fingerprint`, one row per scanned filename. Used both to
+    /// filter the package index (via each row's `blocked` flag, so a
+    /// developer never sees a download link for a blocked artifact in
+    /// the first place) and to build a listing's audit record, which
+    /// needs to say *which* evaluated entries were denied and why —
+    /// hence carrying `reason_code`/`reason_detail`/`why_id` alongside
+    /// `blocked` rather than a bare set of blocked filenames.
     pub fn file_verdicts(
         &self,
         ecosystem: &str,

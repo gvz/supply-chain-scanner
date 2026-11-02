@@ -35,7 +35,7 @@ The final task of the current plan — index and artifact handlers, the `Ecosyst
 - The `Ecosystem` trait does not exist. PyPI-specific code lives in `src/ecosystem/pypi/` waiting to be generalized behind it.
 - There is no `tests/e2e.rs`, no PEP 658 `.metadata` passthrough, no config-reload signal handler, no startup advisory sync or cache-eviction tickers.
 
-The pieces that task 12 will compose — `Scanner::decide`, `blocked_filenames` for index filtering, the refusal response builders, `/why` — all exist and are tested individually.
+The pieces that task 12 will compose — `Scanner::decide`, `file_verdicts` for index filtering, the refusal response builders, `/why` — all exist and are tested individually.
 
 ## Deliberately deferred (outside this version)
 

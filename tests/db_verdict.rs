@@ -211,53 +211,6 @@ fn two_artifacts_of_same_version_are_stored_separately() {
 }
 
 #[test]
-fn blocked_filenames_lists_only_blocked_current_fingerprint_rows() {
-    let (_dir, db) = open_db();
-    let store = VerdictStore::new(db);
-
-    let clean_wheel = key(
-        "example_package-1.2.3-py3-none-any.whl",
-        "1".repeat(64).as_str(),
-    );
-    let blocked_sdist = key("example_package-1.2.3.tar.gz", "2".repeat(64).as_str());
-    let stale_blocked = key(
-        "example_package-1.2.3-cp311-cp311-linux_x86_64.whl",
-        "3".repeat(64).as_str(),
-    );
-
-    store
-        .put(&clean_wheel, &Verdict::Clean, FINGERPRINT_A)
-        .expect("put clean wheel");
-
-    let reason = RefusalReason {
-        code: "cve:high".to_string(),
-        detail: "blocked".to_string(),
-    };
-    store
-        .put(
-            &blocked_sdist,
-            &Verdict::Blocked(reason.clone()),
-            FINGERPRINT_A,
-        )
-        .expect("put blocked sdist");
-
-    // Blocked under the OLD fingerprint; policy has since changed, so it
-    // must not show up under the current fingerprint.
-    store
-        .put(&stale_blocked, &Verdict::Blocked(reason), FINGERPRINT_B)
-        .expect("put stale blocked artifact");
-
-    let blocked = store
-        .blocked_filenames("pypi", "example-package", FINGERPRINT_A)
-        .expect("blocked_filenames should succeed");
-
-    assert_eq!(blocked.len(), 1);
-    assert!(blocked.contains("example_package-1.2.3.tar.gz"));
-    assert!(!blocked.contains("example_package-1.2.3-py3-none-any.whl"));
-    assert!(!blocked.contains("example_package-1.2.3-cp311-cp311-linux_x86_64.whl"));
-}
-
-#[test]
 fn open_is_idempotent_and_migrations_rerun_cleanly() {
     let dir = tempfile::tempdir().expect("create temp dir");
     let path = dir.path().join("scanner.db");
@@ -422,7 +375,7 @@ fn file_verdicts_returns_clean_and_blocked_rows_with_their_reasons() {
         .expect("put blocked sdist");
 
     // Stored under a different fingerprint: must not show up when
-    // querying under FINGERPRINT_A, exactly like `blocked_filenames`.
+    // querying under FINGERPRINT_A.
     store
         .put(&stale, &Verdict::Clean, FINGERPRINT_B)
         .expect("put stale clean artifact");

@@ -344,8 +344,8 @@ async fn simple_page_omits_known_blocked_artifacts() {
     seed_blocking_advisory(&wired.db, "demo-package", "2.0.0");
 
     // Trigger a real scan of the blocked artifact so a verdict is
-    // actually stored: `blocked_filenames` only ever reflects stored
-    // verdicts, never a live advisory lookup.
+    // actually stored: the index listing's filtering only ever reflects
+    // stored verdicts, never a live advisory lookup.
     let blocked_response = reqwest::get(format!(
         "{base_url}files/demo-package/2.0.0/{blocked_filename}"
     ))

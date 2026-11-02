@@ -44,7 +44,6 @@ pub mod coordinator;
 pub mod npm;
 pub mod npm_cascade;
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -350,60 +349,12 @@ impl Scanner {
         }
     }
 
-    /// Lists the filenames currently blocked for `(ecosystem, package)`
-    /// under today's policy, for filtering the simple index page. This is
-    /// a display-only convenience — the real gate is [`Scanner::decide`],
-    /// which every download request still goes through regardless of
-    /// what the index page showed — so a lookup failure here fails back
-    /// to an empty set rather than propagating an error that this
-    /// signature has no way to report.
-    pub async fn blocked_filenames(&self, ecosystem: &str, package: &str) -> HashSet<String> {
-        let fingerprint = self.fingerprint();
-        let store = Arc::clone(&self.verdict_store);
-        let ecosystem_owned = ecosystem.to_string();
-        let package_owned = package.to_string();
-
-        let result = tokio::task::spawn_blocking(move || {
-            store.blocked_filenames(&ecosystem_owned, &package_owned, &fingerprint)
-        })
-        .await;
-
-        match result {
-            Ok(Ok(filenames)) => filenames,
-            Ok(Err(err)) => {
-                tracing::warn!(
-                    ecosystem,
-                    package,
-                    error = %err,
-                    "blocked_filenames lookup failed; the index listing for this \
-                     package will not be filtered until this is resolved, though \
-                     decide() independently refuses any blocked artifact regardless"
-                );
-                HashSet::new()
-            }
-            Err(join_error) => {
-                tracing::warn!(
-                    ecosystem,
-                    package,
-                    error = %join_error,
-                    "blocked_filenames lookup task panicked; the index listing for \
-                     this package will not be filtered until this is resolved, \
-                     though decide() independently refuses any blocked artifact \
-                     regardless"
-                );
-                HashSet::new()
-            }
-        }
-    }
-
     /// Every verdict on record for `(ecosystem, package)` under today's
     /// policy — the lookup `src/http/simple.rs` needs to build the PyPI
-    /// listing audit. `blocked_filenames` above only tells the caller
-    /// which filenames to hide; this instead returns a `FileVerdict` per
-    /// scanned filename, carrying the `blocked`/`reason_code`/
-    /// `reason_detail`/`why_id` an audit line has to report.
-    ///
-    /// Degrades exactly like `blocked_filenames`: this is display/audit
+    /// listing audit. Returns a `FileVerdict` per scanned filename,
+    /// carrying the `blocked`/`reason_code`/`reason_detail`/`why_id` an
+    /// audit line has to report, as well as whether it was blocked at
+    /// all (for filtering the simple index page). This is display/audit
     /// data, not the gate (`decide()` remains the real gate regardless
     /// of what a listing page or its audit record said), so a lookup
     /// failure here warns and returns an empty vec rather than failing

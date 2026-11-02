@@ -389,8 +389,54 @@ fn suffix_is_valid(rotation: AuditRotation, suffix: &str) -> bool {
     }
 }
 
+/// Opens (creating if needed) the audit file at `path` for append.
+///
+/// On creation the file is given mode `0o600` rather than the
+/// umask-dependent default `OpenOptions` would otherwise leave it at
+/// (typically world-readable) — this file records "network-attributable
+/// data about developers" per this project's own docs, and any other
+/// local account on the host (a CI runner, a monitoring agent) must not
+/// be able to read "which developer pulled which package when". The mode
+/// only takes effect when the file does not already exist: `.mode(...)`
+/// is consulted by the OS only at `O_CREAT` time, so a pre-existing file
+/// an operator has already chmod'd keeps whatever mode it has — which is
+/// correct, since this call must not silently fight an operator's own
+/// choice on every rotation's reopen of a file that already exists.
+#[cfg(unix)]
+fn open_append(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
 fn open_append(path: &Path) -> io::Result<fs::File> {
     fs::OpenOptions::new().create(true).append(true).open(path)
+}
+
+/// Creates `directory` (and any missing parents) if it does not already
+/// exist, with mode `0o700` on the directories actually created — for the
+/// same reason [`open_append`] sets `0o600` on the file: this directory
+/// holds personal-data audit files, and a default, umask-dependent mode
+/// would otherwise typically leave it world-readable/-listable. As with
+/// the file, the mode only applies to directories actually created here;
+/// an already-existing directory (and thus any mode an operator already
+/// set on it) is left untouched.
+#[cfg(unix)]
+fn create_audit_dir_all(directory: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)
+}
+
+#[cfg(not(unix))]
+fn create_audit_dir_all(directory: &Path) -> io::Result<()> {
+    fs::create_dir_all(directory)
 }
 
 /// An injectable source of "now", so [`RotatingFile`]'s own tests can
@@ -432,7 +478,7 @@ impl RotatingFile {
     /// this module's own tests call this directly.
     fn open_with_clock(config: &AuditConfig, now: ClockFn) -> anyhow::Result<Self> {
         let (directory, prefix) = directory_and_prefix(&config.path)?;
-        fs::create_dir_all(&directory).with_context(|| {
+        create_audit_dir_all(&directory).with_context(|| {
             format!(
                 "failed to create the directory for audit log {}",
                 config.path.display()
@@ -594,6 +640,18 @@ impl AuditLog {
     /// the module docs). Flushes once at the end. Any error —
     /// serialization, the write itself, the flush, or a poisoned lock
     /// from an earlier panic — is returned, never swallowed.
+    ///
+    /// A poisoned lock is permanent and unrecoverable within this
+    /// process: once a panic poisons it, every subsequent call returns
+    /// `Err` forever, and since the fail-closed design (`audit_or_500`
+    /// in `src/http/mod.rs`) turns that `Err` into a 500, every later
+    /// request on this process — not just the one that panicked — 500s
+    /// until restart. That is arguably correct fail-closed behavior (an
+    /// un-logged fetch still never happens), and the panic itself should
+    /// be close to unreachable, but it is the one failure mode an
+    /// operator debugging "every request 500s and the disk is fine"
+    /// needs a pointer to: the fix is a process restart, not a disk or
+    /// permissions check.
     pub fn write(&self, records: &[AuditRecord]) -> anyhow::Result<()> {
         let mut guard = self
             .inner
@@ -1001,6 +1059,53 @@ mod tests {
         assert!(
             dir.path().join(format!("{prefix}.2026-11-01")).exists(),
             "the live file must never be pruned, regardless of sort position"
+        );
+    }
+
+    /// The audit file and its directory record "network-attributable data
+    /// about developers" per the project's own docs, so a freshly created
+    /// file must never be left at the umask-dependent default (typically
+    /// world-readable) — any other local account on the host could read
+    /// "which developer pulled which package when".
+    #[cfg(unix)]
+    #[test]
+    fn a_freshly_created_audit_file_and_directory_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("create tempdir");
+        // Nested, so `create_dir_all` actually creates the directory
+        // rather than finding it already there.
+        let audit_dir = dir.path().join("nested").join("audit-dir");
+        let config = AuditConfig {
+            path: audit_dir.join("audit.jsonl"),
+            rotation: AuditRotation::Daily,
+            max_files: 14,
+        };
+        let now = Utc
+            .with_ymd_and_hms(2026, 11, 1, 0, 0, 0)
+            .single()
+            .expect("valid datetime");
+        let (_clock_cell, clock) = shared_clock(now);
+        let _rotating = RotatingFile::open_with_clock(&config, clock).expect("open succeeds");
+
+        let file_mode = fs::metadata(audit_dir.join("audit.jsonl.2026-11-01"))
+            .expect("audit file exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "the created audit file must be mode 0o600, not umask-dependent"
+        );
+
+        let dir_mode = fs::metadata(&audit_dir)
+            .expect("audit directory exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "the created audit directory must be mode 0o700, not umask-dependent"
         );
     }
 }

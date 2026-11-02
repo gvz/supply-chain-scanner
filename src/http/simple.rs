@@ -13,7 +13,7 @@
 //! showed.
 //!
 //! **One lookup, not two.** A predecessor of this handler read the
-//! blocked set from [`crate::scan::Scanner::blocked_filenames`] and the
+//! blocked set from a since-deleted `Scanner::blocked_filenames` and the
 //! audit reasons from [`crate::scan::Scanner::file_verdicts`] as two
 //! separate, sequential DB round-trips. That let a verdict write landing
 //! between the two awaits (a concurrent re-scan flipping a verdict) make
@@ -22,9 +22,9 @@
 //! feature exists to rule out. `file_verdicts` already carries `blocked`
 //! per filename, so the filtering decision below is derived from the
 //! same single read the audit decision uses: one row, one `blocked`
-//! bool, both consumers. `Scanner::blocked_filenames` and
-//! `VerdictStore::blocked_filenames` are untouched and keep their own
-//! tests; this handler simply no longer calls them.
+//! bool, both consumers. The now-redundant `Scanner::blocked_filenames`
+//! and `VerdictStore::blocked_filenames` were removed along with their
+//! last use.
 //!
 //! **The audit side of this handler.** PyPI has no cascade: most of
 //! upstream's entries have never been scanned at all, so "evaluated"
@@ -170,7 +170,7 @@ pub async fn simple_handler(
         decisions,
     };
     let records = listing_audit.records(&ctx, &package);
-    if let Some(failure) = audit_or_500(&state.audit, &records) {
+    if let Some(failure) = audit_or_500(&state.audit, &records).await {
         return failure;
     }
 

@@ -104,7 +104,7 @@ pub async fn artifact_handler(
         Decision::Serve(path) => {
             let record =
                 AuditRecord::served(&ctx, &key.package, &key.version, &key.filename, &key.sha256);
-            if let Some(failure) = audit_or_500(&state.audit, &[record]) {
+            if let Some(failure) = audit_or_500(&state.audit, &[record]).await {
                 return failure;
             }
             serve_file(&path).await
@@ -118,7 +118,7 @@ pub async fn artifact_handler(
                 &reason,
                 why_id.as_deref(),
             );
-            if let Some(failure) = audit_or_500(&state.audit, &[record]) {
+            if let Some(failure) = audit_or_500(&state.audit, &[record]).await {
                 return failure;
             }
             let link = why_id.and_then(|id| why_url(&state.config.current(), &id));

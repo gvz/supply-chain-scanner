@@ -201,7 +201,7 @@ impl DownloadOutcome {
 /// Writes the fetch audit record `outcome` implies (if any) and returns
 /// either `response` unchanged or the 500 [`audit_or_500`] substitutes
 /// for it on a write failure.
-fn finish_with_audit(
+async fn finish_with_audit(
     state: &NpmAppState,
     ctx: &AuditContext,
     response: Response,
@@ -211,7 +211,7 @@ fn finish_with_audit(
     if records.is_empty() {
         return response;
     }
-    match audit_or_500(&state.audit, &records) {
+    match audit_or_500(&state.audit, &records).await {
         Some(failure) => failure,
         None => response,
     }
@@ -262,7 +262,7 @@ pub async fn npm_download_handler(state: &NpmAppState, ctx: &AuditContext, path:
                 // packument itself.
                 let (response, outcome) =
                     serve_with_plugin_dedup(state, &target, &fingerprint).await;
-                finish_with_audit(state, ctx, response, outcome)
+                finish_with_audit(state, ctx, response, outcome).await
             }
             Err(response) => response,
         };
@@ -288,7 +288,7 @@ pub async fn npm_download_handler(state: &NpmAppState, ctx: &AuditContext, path:
             } else {
                 serve_with_plugin_dedup(state, &target, &fingerprint).await
             };
-            finish_with_audit(state, ctx, response, outcome)
+            finish_with_audit(state, ctx, response, outcome).await
         }
         DownloadApproval::Refused(reason, why_id) => {
             let link = why_id
@@ -307,6 +307,7 @@ pub async fn npm_download_handler(state: &NpmAppState, ctx: &AuditContext, path:
                     why_id,
                 },
             )
+            .await
         }
         // The packument gate never admitted this version. Refuse without
         // fetching anything, and never review inline. A refusal response
@@ -328,6 +329,7 @@ pub async fn npm_download_handler(state: &NpmAppState, ctx: &AuditContext, path:
                     why_id: None,
                 },
             )
+            .await
         }
         DownloadApproval::NotFound => not_found_response(),
         DownloadApproval::Unverifiable(reason) => unverifiable_response(&reason),

@@ -299,7 +299,7 @@ pub async fn cargo_index_handler(
             // implies this listing was recorded when it was not. See
             // `audit_or_500`'s own doc comment.
             let records = audit.records(&ctx, &name);
-            if let Some(failure) = audit_or_500(&state.audit, &records) {
+            if let Some(failure) = audit_or_500(&state.audit, &records).await {
                 return failure;
             }
             index_response(&entries)

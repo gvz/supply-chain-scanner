@@ -215,32 +215,57 @@ fn plain_text_response(status: StatusCode, body: &str) -> Response {
 /// so a caller cannot forward the 500 without the cause also reaching
 /// the operator's logs.
 ///
+/// The write runs on the blocking pool (`tokio::task::spawn_blocking`),
+/// not on the calling async worker thread, for the same reason every
+/// other synchronous I/O in this codebase does (`Scanner::file_verdicts`
+/// and `file_verdicts_by_version` included): [`AuditLog::write`] takes a
+/// `std::sync::Mutex` and does a synchronous `write_all`/`flush` and,
+/// on a period boundary, an `open` + `metadata` + a pruning `read_dir`.
+/// A degraded filesystem — the exact condition this feature exists to
+/// notice, e.g. the volume remounted read-only — would otherwise block
+/// one async worker thread per in-flight request while holding that
+/// lock, and with workers equal to core count a listing-heavy request
+/// storm could stall the whole runtime rather than just the audit path.
+/// This call still awaits the write before returning, so fail-closed is
+/// unchanged: a `JoinError` (the blocking task panicked) is treated as a
+/// failure exactly like an `io::Error` would be, never as success.
+///
 /// Returns `None` on success, so the caller's own response path runs
 /// completely unchanged; `artifact::artifact_handler` is the first
 /// caller, and a later task's cargo and npm download handlers call this
 /// same function rather than each growing their own copy of this
 /// tradeoff.
-pub(crate) fn audit_or_500(audit: &AuditLog, records: &[AuditRecord]) -> Option<Response> {
-    match audit.write(records) {
-        Ok(()) => None,
-        Err(err) => {
-            tracing::error!(
-                error = %err,
-                "failed to write a fetch audit record; refusing to serve rather than let this \
-                 fetch go unlogged"
-            );
-            Some(
-                Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(axum::body::Body::empty())
-                    .unwrap_or_else(|_| {
-                        let mut response = Response::new(axum::body::Body::empty());
-                        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                        response
-                    }),
-            )
+pub(crate) async fn audit_or_500(
+    audit: &Arc<AuditLog>,
+    records: &[AuditRecord],
+) -> Option<Response> {
+    let audit = Arc::clone(audit);
+    let records = records.to_vec();
+    let outcome = tokio::task::spawn_blocking(move || audit.write(&records)).await;
+
+    let err = match outcome {
+        Ok(Ok(())) => return None,
+        Ok(Err(err)) => err,
+        Err(join_err) => {
+            anyhow::anyhow!(join_err).context("the audit write task panicked on the blocking pool")
         }
-    }
+    };
+
+    tracing::error!(
+        error = %err,
+        "failed to write a fetch audit record; refusing to serve rather than let this \
+         fetch go unlogged"
+    );
+    Some(
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(axum::body::Body::empty())
+            .unwrap_or_else(|_| {
+                let mut response = Response::new(axum::body::Body::empty());
+                *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                response
+            }),
+    )
 }
 
 // ---------------------------------------------------------------------------

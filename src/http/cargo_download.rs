@@ -200,7 +200,7 @@ impl DownloadOutcome {
 /// Writes the fetch audit record `outcome` implies (if any) and returns
 /// either `response` unchanged or the 500 [`audit_or_500`] substitutes
 /// for it on a write failure.
-fn finish_with_audit(
+async fn finish_with_audit(
     state: &CargoAppState,
     ctx: &AuditContext,
     response: Response,
@@ -210,7 +210,7 @@ fn finish_with_audit(
     if records.is_empty() {
         return response;
     }
-    match audit_or_500(&state.audit, &records) {
+    match audit_or_500(&state.audit, &records).await {
         Some(failure) => failure,
         None => response,
     }
@@ -254,7 +254,7 @@ pub async fn cargo_download_handler(
         return match allowlisted_entry(&state, &name, &raw_version).await {
             Ok((key, entry)) => {
                 let (response, outcome) = serve_gated(&state, &key, &entry, true).await;
-                finish_with_audit(&state, &ctx, response, outcome)
+                finish_with_audit(&state, &ctx, response, outcome).await
             }
             Err(response) => response,
         };
@@ -269,7 +269,7 @@ pub async fn cargo_download_handler(
             let fingerprint = state.cargo_scanner.fingerprint();
             let run_plugins = !plugin_checked(&state.verdicts, &key, &fingerprint).await;
             let (response, outcome) = serve_gated(&state, &key, &entry, run_plugins).await;
-            finish_with_audit(&state, &ctx, response, outcome)
+            finish_with_audit(&state, &ctx, response, outcome).await
         }
         CargoDownloadApproval::Refused {
             key,
@@ -296,6 +296,7 @@ pub async fn cargo_download_handler(
                     why_id,
                 },
             )
+            .await
         }
         // No stored verdict exists for this version at all: the index
         // gate never admitted it, so there is no artifact key to name a
@@ -322,6 +323,7 @@ pub async fn cargo_download_handler(
                     why_id: None,
                 },
             )
+            .await
         }
         CargoDownloadApproval::NotFound => not_found_response(),
         CargoDownloadApproval::Unverifiable(reason) => unverifiable_response(&RefusalReason {

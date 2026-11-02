@@ -276,13 +276,22 @@ async fn mount_download(server: &MockServer, name: &str, vers: &str, bytes: &[u8
 /// of `require_fix_available`.
 fn seed_cve(db: &Db, package: &str, version: &str) {
     let store = AdvisoryStore::new(db.clone());
+    // A long summary with an embedded control character: sanitizing must
+    // strip the newline entirely (not merely stop at it) and then cap
+    // the result, so the final text is exactly 200 of the 300
+    // non-control characters, not 150 (stopping at the newline) and not
+    // 301 (left unsanitized and uncapped). Mirrors npm's
+    // `a_cve_blocked_npm_version_is_denied_with_the_lowest_advisory_id_sanitized_and_capped`,
+    // since cargo's CVE detail must go through the same
+    // `sanitize_detail_text` npm's does.
+    let summary = format!("{}\n{}", "x".repeat(150), "y".repeat(150));
     store
         .replace_all(
             "cargo",
             &[Advisory {
                 id: "OSV-TEST-0001".to_string(),
                 package: package.to_string(),
-                summary: "test vulnerability".to_string(),
+                summary,
                 severity: Some(9.0),
                 versions: vec![version.to_string()],
                 ranges: Vec::new(),
@@ -587,6 +596,34 @@ async fn a_cargo_index_listing_logs_forwarded_and_filtered_versions_with_reasons
     // a bare "cve", so a Loki hit on this denial carries the same id a
     // `/why` link would.
     assert_eq!(codes_by_version["1.5.0"], "cve:OSV-TEST-0001");
+
+    // The detail must be sanitized (no embedded control characters) and
+    // capped at `SUMMARY_MAX_CHARS`, exactly like npm's equivalent line
+    // for the identical upstream OSV summary shape.
+    let cve_line = listed
+        .iter()
+        .find(|line| line["version"] == "1.5.0")
+        .expect("the cve-blocked version has a listed line");
+    let detail = cve_line["reason_detail"]
+        .as_str()
+        .expect("reason_detail is a string");
+    assert!(
+        !detail.contains('\n'),
+        "the advisory summary must be sanitized of control characters: {detail:?}"
+    );
+    assert!(
+        detail.starts_with(&"x".repeat(150)),
+        "the sanitized text must retain the leading non-control characters: {detail:?}"
+    );
+    let non_severity_part = detail
+        .split(" (severity")
+        .next()
+        .expect("detail has a severity suffix");
+    assert_eq!(
+        non_severity_part.chars().count(),
+        200,
+        "the summary must be capped at SUMMARY_MAX_CHARS, not left unbounded: {detail:?}"
+    );
 
     let allowed = listed
         .iter()

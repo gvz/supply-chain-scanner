@@ -40,6 +40,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::advisory::matching::sanitize_detail_text;
 use crate::advisory::matching_semver::affects;
 use crate::advisory::Advisory;
 use crate::ai::{AiReviewer, ReviewOutcome};
@@ -879,16 +880,21 @@ impl CargoScanner {
                 // link (were one to exist for this code) would. When
                 // more than one advisory blocks the same version, the
                 // lowest id is chosen, deterministically rather than by
-                // whatever order `advisories` happens to iterate in.
+                // whatever order `advisories` happens to iterate in. The
+                // summary is sanitized and capped through the same
+                // `sanitize_detail_text` the npm and PyPI paths already
+                // apply to this exact upstream text, so this line never
+                // carries unbounded or unsanitized OSV data.
                 Some(match self.blocking_advisory(advisories, vers) {
                     Some(adv) => {
                         let severity = match adv.severity {
                             Some(score) => format!("{score}"),
                             None => "unknown".to_string(),
                         };
+                        let summary = sanitize_detail_text(&adv.summary);
                         (
                             format!("cve:{}", adv.id),
-                            Some(format!("{} (severity {severity})", adv.summary)),
+                            Some(format!("{summary} (severity {severity})")),
                             None,
                         )
                     }

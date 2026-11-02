@@ -262,10 +262,19 @@ pub struct AuditContext {
 
 impl AuditContext {
     /// `request_id` is freshly generated: 16 lowercase hex characters.
+    ///
+    /// `client_ip` is canonicalized (`to_canonical`) rather than recorded
+    /// verbatim: a dual-stack bind (e.g. `[::]:8080`, a plausible choice
+    /// for an org-wide deployment) delivers IPv4 peers to this process as
+    /// IPv4-mapped IPv6 addresses. Left unnormalized, the audit file would
+    /// read `::ffff:10.1.2.3` for a machine the security team's own
+    /// inventory knows as `10.1.2.3` — the one query this log exists to
+    /// answer, "who fetched this", would silently miss it. Genuine IPv6
+    /// addresses pass through unchanged.
     pub fn new(ecosystem: &str, client: SocketAddr) -> Self {
         Self {
             ecosystem: ecosystem.to_string(),
-            client_ip: client.ip(),
+            client_ip: client.ip().to_canonical(),
             client_port: client.port(),
             request_id: generate_request_id(),
         }

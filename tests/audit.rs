@@ -324,6 +324,32 @@ fn an_ipv6_peer_address_serializes_as_address_and_port_separately() {
 }
 
 #[test]
+fn an_ipv4_mapped_ipv6_peer_address_is_normalized_to_plain_ipv4() {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let log = AuditLog::with_writer(SharedBuf(buf.clone()));
+
+    let client: SocketAddr = "[::ffff:10.1.2.3]:51234"
+        .parse()
+        .expect("valid socket addr");
+    let ctx = AuditContext::new("npm", client);
+    let record = AuditRecord::served(
+        &ctx,
+        "lodash",
+        "4.17.21",
+        "lodash-4.17.21.tgz",
+        &"cd".repeat(32),
+    );
+
+    log.write(&[record]).expect("write succeeds");
+
+    let lines = lines_of(&buf);
+    let value = parse(&lines[0]);
+
+    assert_eq!(value["client_ip"], "10.1.2.3");
+    assert_eq!(value["client_port"], 51234);
+}
+
+#[test]
 fn a_failing_writer_surfaces_its_error_rather_than_swallowing_it() {
     let log = AuditLog::with_writer(AlwaysErrors);
 

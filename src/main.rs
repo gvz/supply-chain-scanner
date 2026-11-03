@@ -52,7 +52,10 @@ use supply_chain_scanner::config::Config;
 use supply_chain_scanner::ecosystem::install_surface::install_surface_for;
 use supply_chain_scanner::http::cargo_bootstrap::CARGO_ADVISORY_ECOSYSTEM;
 use supply_chain_scanner::http::npm_packument::NPM_ECOSYSTEM;
-use supply_chain_scanner::http::{bootstrap, bootstrap_cargo, bootstrap_npm, watch_for_reload};
+use supply_chain_scanner::http::{
+    bootstrap, bootstrap_cargo, bootstrap_npm, watch_for_reload, RELOADABLE_FIELDS,
+    RESTART_ONLY_FIELDS,
+};
 
 /// An HTTP proxy that scans PyPI artifacts before serving them.
 #[derive(Debug, Parser)]
@@ -238,10 +241,15 @@ async fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
             // Say up front which fields a later SIGHUP can and cannot
             // change, so an operator learns it from the log rather than
             // from a reload that appeared to succeed.
+            //
+            // Read from the same constants the reload path enforces,
+            // never from a copy of them: this banner once carried its own
+            // hardcoded lists and silently fell out of date when `audit`
+            // became restart-only, telling every operator the opposite of
+            // what a SIGHUP would actually do.
             tracing::info!(
-                reloadable = "cve, plugins, allowlist, public_url, scan_budget, ai_review",
-                restart_only = "bind, db_path, cache_dir, upstream_url, advisory_source_url, \
-                                advisory_sync_interval, cache_ttl, download, max_concurrent_scans",
+                reloadable = %RELOADABLE_FIELDS.join(", "),
+                restart_only = %RESTART_ONLY_FIELDS.join(", "),
                 "SIGHUP reloads the fields under `reloadable` (rebuilding the policy, the \
                  fingerprint, the plugin sandbox and, when present, the ai reviewer); a \
                  SIGHUP whose file changes any field under `restart_only` is rejected in \

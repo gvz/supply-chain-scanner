@@ -520,7 +520,7 @@ pub fn default_sandbox_factory() -> SandboxFactory {
 /// part of a file while logging "configuration reloaded" is how an
 /// operator comes to believe a tightened CVE line is live when it is not.
 /// Rejecting, and naming the field, sends them to a restart instead.
-const RESTART_ONLY_FIELDS: &[&str] = &[
+pub const RESTART_ONLY_FIELDS: &[&str] = &[
     "bind",
     "db_path",
     "cache_dir",
@@ -535,7 +535,7 @@ const RESTART_ONLY_FIELDS: &[&str] = &[
 
 /// Configuration fields a reload genuinely applies, for the log line that
 /// says so.
-const RELOADABLE_FIELDS: &[&str] = &[
+pub const RELOADABLE_FIELDS: &[&str] = &[
     "cve",
     "plugins",
     "allowlist",

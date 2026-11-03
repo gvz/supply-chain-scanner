@@ -4,9 +4,15 @@ Drawio sources for the scanner's architecture and request flows. Open any file
 with [draw.io](https://app.diagrams.net) or the VS Code draw.io extension. Every
 file is plain, editable XML with no external assets.
 
-Rendered copies live in [`png/`](png/). Each PNG embeds a full copy of its
-diagram in a `zTXt` chunk, so it is both a viewable image and an editable drawio
-file. See [Editing and regenerating](#editing-and-regenerating).
+PNGs are **not committed**: run [`build-png.sh`](build-png.sh) to generate them
+into `png/`, which needs draw.io desktop and `xvfb-run` on PATH. Each generated
+PNG embeds a full copy of its diagram in a `zTXt` chunk, so it is both a viewable
+image and an editable drawio file. See [Editing and regenerating](#editing-and-regenerating).
+
+The one diagram that does render without any tooling is the high-level overview
+in the [root README](../../README.md), kept as Mermaid so GitHub draws it inline.
+It is a condensed view of `01-system-overview.drawio`; when one changes, change
+the other.
 
 | File | What it shows |
 |---|---|

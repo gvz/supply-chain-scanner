@@ -1,0 +1,7 @@
+# The build happens inside the image; shipping the host's build directory
+# would send gigabytes and risk mixing host artifacts into the image.
+target/
+.git/
+.github/
+.superpowers/
+docs/book/book/

@@ -1,0 +1,17 @@
+bind = "0.0.0.0:8080"
+db_path = "/var/lib/supply-chain-scanner/scanner.db"
+cache_dir = "/var/lib/supply-chain-scanner/cache"
+upstream_url = "https://pypi.org"
+public_url = "http://proxy:8080"
+scan_budget = "12s"
+cache_ttl = "24h"
+advisory_sync_interval = "24h"
+advisory_source_url = "http://127.0.0.1:9000/osv/all.zip"
+
+[audit]
+path = "/var/log/scanner/audit.jsonl"
+
+[cve]
+min_severity = 7.0
+require_fix_available = false
+unknown_severity = "allow"

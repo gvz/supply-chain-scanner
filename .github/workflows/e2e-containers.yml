@@ -1,0 +1,79 @@
+# Two containers, a real install.
+#
+# One container runs the proxy; another runs pip, npm or cargo against it and
+# installs a real package from the real registry. The unit and integration
+# suites already cover the proxy against a mocked upstream; what they cannot
+# show is that a package manager -- with its own retry rules, timeouts and
+# index expectations -- is actually satisfied by what this proxy serves.
+#
+# One process serves exactly one ecosystem (`Config::validate` rejects a file
+# carrying two registry tables), so each ecosystem gets its own proxy
+# instance rather than one shared container.
+#
+# Each ecosystem runs two cases, because "the bytes arrived" would also pass
+# against a proxy that forwarded everything unchecked:
+#
+#   positive  a real install through the proxy must succeed
+#   negative  with the gate configured to refuse, the install must fail, and
+#             the audit log must attribute the refusal to the expected code
+name: End-to-end containers
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - src/**
+      - Cargo.toml
+      - Cargo.lock
+      - Dockerfile
+      - .dockerignore
+      - ci/e2e/**
+      - .github/workflows/e2e-containers.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: proxy + client containers
+    runs-on: ubuntu-latest
+    # A cold release build of the proxy image dominates; the three legs
+    # themselves take a couple of minutes each.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Built once and reused by all three legs. This is the same Dockerfile
+      # that would ship, not a test-only image, so a packaging mistake fails
+      # here rather than in production.
+      - name: Build the proxy image
+        run: docker build -t scs-proxy:e2e .
+
+      # Every leg runs even if an earlier one fails: knowing that pip passes
+      # while npm does not is the useful outcome, and stopping at the first
+      # failure hides it.
+      - name: pypi, npm and cargo through the proxy
+        run: |
+          set -u
+          failed=()
+          for eco in pypi npm cargo; do
+            echo "::group::$eco"
+            if bash ci/e2e/run.sh "$eco" scs-proxy:e2e; then
+              echo "$eco: passed"
+            else
+              echo "$eco: FAILED"
+              failed+=("$eco")
+            fi
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "failed ecosystems: ${failed[*]}" >&2
+            exit 1
+          fi
+          echo "all three ecosystems installed through the proxy and refused when gated"

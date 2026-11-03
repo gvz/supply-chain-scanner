@@ -2,6 +2,12 @@
 name = "supply_chain_scanner"
 version = "0.1.0"
 edition = "2021"
+# `description` and `license` are not decoration: cargo-deb refuses to build a
+# package without them, and the Debian control file is generated from them.
+description = "An HTTP proxy that scans every package artifact once and refuses to serve anything that failed a check"
+license = "AGPL-3.0-only"
+repository = "https://github.com/gvz/supply-chain-scanner"
+readme = "README.md"
 
 [lib]
 name = "supply_chain_scanner"
@@ -72,3 +78,42 @@ opt-level = 2
 
 [profile.dev.package.miniz_oxide]
 opt-level = 2
+
+# Debian packaging, consumed by `cargo deb` (see .github/workflows/debian.yml).
+[package.metadata.deb]
+# The crate is `supply_chain_scanner`, but Debian package names may only
+# contain lowercase letters, digits, `+`, `-` and `.` — an underscore is
+# invalid. Without this override every build would produce an unusable name.
+name = "supply-chain-scanner"
+maintainer = "Georg von Zengen <github@vz-ge.org>"
+# A proxy in front of package registries: `net`, not `admin` or `devel`.
+section = "net"
+priority = "optional"
+# The full AGPL text becomes /usr/share/doc/supply-chain-scanner/copyright.
+license-file = ["LICENSE", "0"]
+extended-description = """
+A proxy that sits in front of PyPI, crates.io or the npm registry and gates
+what a package manager is allowed to install. Every artifact is scanned once
+against known advisories, a release-age policy, organization plugins and an
+optional AI review; anything that fails is refused rather than forwarded, and
+every refusal is explained at /why/<id>.
+
+One process serves exactly one ecosystem, selected by which registry table
+the configuration file carries.
+"""
+# Resolved per-distribution by dpkg-shlibdeps at build time rather than
+# hardcoded: the binary links glibc and little else (rustls, not OpenSSL;
+# rusqlite is bundled and static), and the exact glibc version differs across
+# the four target releases.
+depends = "$auto"
+# Plugins and the AI reviewer run their sandbox through bubblewrap. The proxy
+# starts and serves without it, refusing only the checks that need it, so this
+# is a recommendation and not a hard dependency.
+recommends = "bubblewrap"
+assets = [
+    ["target/release/supply-chain-scanner", "usr/bin/", "755"],
+    ["config.example.toml", "usr/share/doc/supply-chain-scanner/examples/", "644"],
+    ["README.md", "usr/share/doc/supply-chain-scanner/", "644"],
+    ["MISSION.md", "usr/share/doc/supply-chain-scanner/", "644"],
+    ["docs/operations.md", "usr/share/doc/supply-chain-scanner/", "644"],
+]

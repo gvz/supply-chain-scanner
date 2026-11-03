@@ -1,0 +1,84 @@
+# The same gate README.md tells a developer to run before pushing:
+#
+#     cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
+#
+# run on every push to main and every pull request. Steps are ordered
+# cheapest-first instead of in README's order, so a formatting slip fails in
+# seconds rather than after a full test compile; the set of checks is
+# identical.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# This workflow only reads the repository. Nothing here publishes, comments,
+# or touches releases, so it gets no token scope beyond checkout.
+permissions:
+  contents: read
+
+# A second push to the same branch makes the first run's result irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    # The bundled rusqlite and the rustls stack dominate a cold build; 30
+    # minutes is generous for that and still catches a hang.
+    timeout-minutes: 30
+    steps:
+      # Third-party actions are pinned to a commit SHA, not a tag. A tag is
+      # mutable and a compromised upstream can move it onto new code; this
+      # repository exists to stop exactly that class of attack, so its own
+      # CI does not float. The trailing comment records which release each
+      # SHA was, because the SHA alone is unreadable.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # No setup-toolchain action: rust-toolchain.toml pins 1.88.0 with
+      # rustfmt and clippy, and rustup installs exactly that on the first
+      # cargo invocation. One less third-party action in the supply chain,
+      # and the version can only ever come from the file in the repo.
+      - name: Show the toolchain rust-toolchain.toml selected
+        run: |
+          rustup show active-toolchain
+          cargo --version
+          rustc --version
+          cargo clippy --version
+          cargo fmt --version
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          # Keyed on Cargo.lock, so a dependency change cannot be served a
+          # stale build directory.
+          key: cargo-${{ runner.os }}-rust1.88.0-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-rust1.88.0-
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      # `--locked` on both compiling steps: a build that would rewrite
+      # Cargo.lock fails instead of silently resolving something new. That
+      # matters here beyond tidiness — Cargo.toml pins `uuid = "=1.11.0"`
+      # because uuid 1.28 requires rustc 1.89 while this repo pins 1.88.0,
+      # and an unnoticed re-resolve is how that pin gets lost.
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # The six `#[ignore]`d tests are not run: they need `bwrap` and usable
+      # unprivileged user namespaces, which GitHub's Ubuntu images restrict.
+      # `cargo test` skips them, which is what the documented gate does too.
+      - name: cargo test
+        run: cargo test --locked

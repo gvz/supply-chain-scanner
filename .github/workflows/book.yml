@@ -1,0 +1,143 @@
+# Builds docs/book and publishes it to GitHub Pages.
+#
+# Split out of ci.yml so the test gate keeps a read-only token: only this
+# workflow needs `pages: write` and `id-token: write`, and only in its publish
+# job.
+#
+# Requires one repository setting this workflow cannot make for itself:
+# Settings -> Pages -> Build and deployment -> Source = "GitHub Actions".
+name: Book
+
+on:
+  # Verification only. Scoped to changes that can actually break the book —
+  # a chapter, SUMMARY.md, book.toml, or this workflow.
+  pull_request:
+    paths:
+      - docs/book/**
+      - .github/workflows/book.yml
+
+  # Publication. Chained to CI rather than triggered directly by the push,
+  # because a site built from a commit whose tests fail would misrepresent the
+  # code it documents, and `needs:` cannot reach across workflow files. This
+  # fires once CI finishes on main, and the job below runs only if CI passed.
+  #
+  # Two consequences worth knowing: the workflow definition used here is the
+  # one on the default branch, not the one in the triggering commit, and
+  # publication lands a little after the push rather than alongside it.
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+  # Manual publication, for re-deploying the current main without pushing a
+  # commit. This path does not consult CI — see the job's own comment.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Pages has a single live deployment, so a newer publish supersedes an older
+  # one. In-flight runs are *not* cancelled: cancelling mid-deploy can leave
+  # the Pages environment half-updated.
+  group: book-pages
+  cancel-in-progress: false
+
+env:
+  MDBOOK_VERSION: 0.5.4
+
+jobs:
+  # Pull requests: prove the book still builds. No artifact, no deployment,
+  # no write-scoped token.
+  build:
+    name: build the book
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Restore the mdbook binary
+        id: mdbook-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cargo/bin/mdbook
+          key: mdbook-${{ runner.os }}-${{ env.MDBOOK_VERSION }}-rust1.88.0
+
+      # Built from source with `--locked` rather than pulling a prebuilt
+      # release tarball: the version is pinned, the build is reproducible from
+      # crates.io, and it is one fewer unverified binary entering the
+      # pipeline. Verified that 0.5.4 compiles on the 1.88.0 toolchain this
+      # repo pins and renders this book.
+      - name: Install mdbook ${{ env.MDBOOK_VERSION }}
+        if: steps.mdbook-cache.outputs.cache-hit != 'true'
+        run: cargo install mdbook --locked --version "${MDBOOK_VERSION}"
+
+      - name: mdbook build
+        run: mdbook build docs/book
+
+  publish:
+    name: publish to Pages
+    # Fires either after a successful CI run on main, or on an explicit manual
+    # dispatch. The manual path deliberately skips the CI check: it exists to
+    # re-publish the current main on demand, and an operator asking for that
+    # has already decided.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The only write-scoped token in this repository's CI, and only for Pages.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # On a workflow_run event the default checkout would take the default
+      # branch's tip, which may already have moved past the commit CI actually
+      # tested. Pin to the exact commit that passed.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+
+      - name: Report what is being published
+        run: |
+          echo "trigger: ${{ github.event_name }}"
+          echo "commit:  $(git rev-parse HEAD)"
+          echo "subject: $(git log -1 --format=%s)"
+
+      - name: Restore the mdbook binary
+        id: mdbook-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cargo/bin/mdbook
+          key: mdbook-${{ runner.os }}-${{ env.MDBOOK_VERSION }}-rust1.88.0
+
+      - name: Install mdbook ${{ env.MDBOOK_VERSION }}
+        if: steps.mdbook-cache.outputs.cache-hit != 'true'
+        run: cargo install mdbook --locked --version "${MDBOOK_VERSION}"
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+
+      # A project site is served from /<repo>/, not the domain root, so the
+      # base path has to be compiled in: without `site-url` mdbook emits a 404
+      # page carrying no base path and its links resolve against the wrong
+      # root. `configure-pages` reports the real base path, which is also
+      # correct when a custom domain makes it "/".
+      - name: mdbook build
+        env:
+          MDBOOK_output__html__site_url: ${{ steps.pages.outputs.base_path }}/
+        run: mdbook build docs/book
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          path: docs/book/book
+
+      - name: Deploy to Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5

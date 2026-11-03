@@ -562,16 +562,34 @@ rescan of the whole crate ecosystem. `min_release_age_days` is part of the
 fingerprint too, for the same reason `required_criterion` is: changing the
 threshold changes what the cascade admits.
 
-**The release-age gate is best-effort, not fail-closed.** Unlike CVE filtering
-and AI review, a version the cascade cannot determine a publish time for — the
-registry API has no `api` base in `config.json`, or the lookup fails outright —
-is not treated as too new. The cascade logs a warning and skips the gate for
-that one request rather than refusing every version, because this is a
-secondary hygiene control layered on top of the CVE and AI-review/cargo-vet
-gates, which keep their existing fail-closed behavior unaffected. The same
-rule applies to the PyPI deployment's own `min_release_age_days`, sourced from
-the PEP 700 JSON simple index: an upstream that predates PEP 700 never reports
-an `upload-time`, and that is not reason enough to block everything.
+**On cargo, a release-age gate that cannot be evaluated withholds the
+listing.** If `min_release_age_days` is set and the publication dates cannot be
+read — the registry API is unreachable or refuses, or `config.json` advertises
+no `api` base at all (a sparse-index-only mirror) — the index request is
+answered `503` with reason code `unverifiable:release-age`, and no version is
+forwarded. It is deliberately *not* an empty `200`: an empty index tells cargo
+the crate has no usable version, which is a claim this proxy cannot support
+when a check never ran. The 503 is retryable, so a transient outage delays
+installs rather than letting unvetted versions through.
+
+This was best-effort until it bit: crates.io answers `403` to any request
+without an identifying User-Agent, the proxy sent none, so the lookup failed on
+every call and a configured gate was silently unenforced behind a warning
+nobody reads. Expect the same trade every other gate here makes — while the
+registry API is down, a deployment with this gate on serves no listings.
+
+One narrow case stays permissive, on purpose: if the API answers but omits a
+single version's `created_at`, that version is not flagged. Withholding the
+whole listing over one missing field is disproportionate, and withholding just
+that version would need a reason code of its own — "too-new" would be a lie,
+since the age is unknown rather than short. crates.io reports a date for every
+version, so a conforming registry does not produce this shape.
+
+**PyPI's `min_release_age_days` is unchanged and still permissive about missing
+data.** It is sourced from the PEP 700 JSON simple index, and an upstream that
+predates PEP 700 never reports an `upload-time` at all. That is a protocol
+feature rather than a failure, so a file with no reported time is not treated as
+too new.
 
 **Two sync tickers, on two intervals.** The crates.io advisory mirror re-syncs
 every `advisory_sync_interval`, from `advisory_source_url`. The cargo-vet audit

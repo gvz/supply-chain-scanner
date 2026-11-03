@@ -449,6 +449,9 @@ fn versions_of(decision: &CargoIndexDecision) -> Vec<String> {
             entries.iter().map(|entry| entry.vers.clone()).collect()
         }
         CargoIndexDecision::InProgress => panic!("expected entries, got InProgress"),
+        CargoIndexDecision::Unverifiable(reason) => {
+            panic!("expected entries, got Unverifiable({})", reason.code)
+        }
     }
 }
 

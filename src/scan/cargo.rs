@@ -109,6 +109,15 @@ pub enum CargoIndexDecision {
     /// written for this: no verdict was reached, so there is nothing yet
     /// for a line to describe.
     InProgress,
+    /// A configured gate could not be evaluated, so nothing is known
+    /// about any version and nothing may be forwarded.
+    ///
+    /// Deliberately distinct from an empty `Entries`, which asserts that
+    /// the crate has no usable version — a claim this proxy has no
+    /// grounds to make when a check did not run. Rendered as a retryable
+    /// 503, never a 200 carrying an empty index. No fetch audit record,
+    /// for the same reason `InProgress` writes none.
+    Unverifiable(RefusalReason),
 }
 
 /// What [`CargoScanner::approved_for_download`] tells the `.crate`
@@ -187,6 +196,36 @@ pub struct CargoScanner {
     last_good_index: Arc<Mutex<HashMap<String, Vec<CargoIndexEntry>>>>,
 }
 
+/// What the release-age gate concluded for one listing: which versions it
+/// removed, or why it could not run at all.
+struct AgeGate {
+    too_new: HashSet<String>,
+    /// `Some` when the gate is configured but could not be evaluated. The
+    /// cascade must answer [`CargoIndexDecision::Unverifiable`] with this
+    /// reason instead of forwarding anything.
+    unverifiable: Option<RefusalReason>,
+}
+
+impl AgeGate {
+    /// The gate is not configured: nothing removed, nothing unverifiable.
+    fn off() -> Self {
+        Self {
+            too_new: HashSet::new(),
+            unverifiable: None,
+        }
+    }
+
+    fn unverifiable(detail: String) -> Self {
+        Self {
+            too_new: HashSet::new(),
+            unverifiable: Some(RefusalReason {
+                code: "unverifiable:release-age".to_string(),
+                detail,
+            }),
+        }
+    }
+}
+
 /// The per-version facts one cascade iteration needs, all fetched from
 /// the stores in one blocking-pool call.
 struct Facts {
@@ -194,9 +233,13 @@ struct Facts {
     review_status: HashMap<String, ReviewStatus>,
     vet_covered: HashSet<String>,
     /// Versions the release-age gate removed this round. Always empty
-    /// when `CargoRegistryConfig::min_release_age_days` is unset, and
-    /// best-effort when it is set: see [`CargoScanner::too_new_versions`].
+    /// when `CargoRegistryConfig::min_release_age_days` is unset; see
+    /// [`CargoScanner::age_gate`].
     too_new: HashSet<String>,
+    /// `Some` when the release-age gate is configured but could not be
+    /// evaluated. Both cascade entry points check this before planning
+    /// anything and answer [`CargoIndexDecision::Unverifiable`].
+    age_unverifiable: Option<RefusalReason>,
     /// Versions the operator has allowlisted for this crate. Computed once
     /// per cascade, not per iteration: an allowlist read is a config
     /// snapshot, and every iteration of one cascade must see the same one.
@@ -437,6 +480,14 @@ impl CargoScanner {
             }
         };
 
+        // A configured gate that could not run is decisive even here: an
+        // outage already means less is known, and forwarding a last-good
+        // listing whose release ages were never checked would enforce the
+        // policy only when the registry happened to be reachable.
+        if let Some(reason) = facts.age_unverifiable {
+            return CargoIndexDecision::Unverifiable(reason);
+        }
+
         // Nothing can be reviewed during an outage, so every version with
         // no verdict and no vet coverage is "nothing left to try" for
         // this pass. It is not written to any store, so the next
@@ -517,6 +568,12 @@ impl CargoScanner {
                 };
             }
         };
+
+        // A configured gate that could not be evaluated decides the whole
+        // listing: see `CargoIndexDecision::Unverifiable`.
+        if let Some(reason) = facts.age_unverifiable.take() {
+            return CargoIndexDecision::Unverifiable(reason);
+        }
 
         // `ReviewStatus` is Task 4's type, and it carries no `Clone`.
         // Each iteration moves the two maps into the input. It then takes
@@ -733,7 +790,7 @@ impl CargoScanner {
         let allowlisted = self.allowlisted_for(&entries);
         // Network I/O, so it happens here rather than inside the
         // blocking-pool closure below.
-        let too_new = self.too_new_versions(&normalized, &entries).await;
+        let age = self.age_gate(&normalized, &entries).await;
 
         tokio::task::spawn_blocking(move || {
             let mut advisories: Vec<Advisory> = Vec::new();
@@ -777,7 +834,8 @@ impl CargoScanner {
                 advisories,
                 review_status,
                 vet_covered,
-                too_new,
+                too_new: age.too_new,
+                age_unverifiable: age.unverifiable,
                 allowlisted,
             })
         })
@@ -1004,19 +1062,37 @@ impl CargoScanner {
     /// The versions of `entries` published too recently under
     /// `CargoRegistryConfig::min_release_age_days`.
     ///
-    /// Best-effort, not fail-closed like the CVE filter: when the gate is
-    /// unset, when the registry API is unreachable, or when it reports
-    /// no `api` base at all (a sparse-index-only registry), this returns
-    /// an empty set and logs rather than treating the outage as a
-    /// reason to forward nothing. The release-age gate is a secondary
-    /// hygiene control layered on top of the CVE and AI-review/cargo-vet
-    /// gates, which stay fail-closed exactly as before; an outage here
-    /// only means age stops being checked for this one request.
-    async fn too_new_versions(
-        &self,
-        normalized: &str,
-        entries: &[CargoIndexEntry],
-    ) -> HashSet<String> {
+    /// Fail-closed, like every other gate: when the gate is configured
+    /// but cannot be evaluated, this reports *why* instead of an empty
+    /// set, and the caller answers [`CargoIndexDecision::Unverifiable`]
+    /// rather than forwarding.
+    ///
+    /// This used to be best-effort — an unreachable registry API logged a
+    /// warning and the gate skipped itself for that request. That made a
+    /// configured `min_release_age_days` silently unenforced whenever the
+    /// API hiccuped, and crates.io answers `403` to any request without
+    /// an identifying User-Agent, so for a long while it hiccuped on
+    /// every single call and nobody could tell from the outside. A policy
+    /// the operator switched on must not evaporate quietly; "cannot
+    /// verify" is an answer this proxy already knows how to give.
+    ///
+    /// The cost is deliberate: while the registry API is unreachable, a
+    /// deployment with this gate on serves no listings at all. That is
+    /// the same trade every other gate here makes, and the 503 is
+    /// retryable, so a transient outage delays installs rather than
+    /// letting unvetted versions through.
+    ///
+    /// One narrow residue remains on purpose: if the API answers but
+    /// omits a single version's publication date, that version is not
+    /// flagged. See the comment at that branch for why closing it needs a
+    /// reason code of its own rather than a relabelling.
+    ///
+    /// A registry that reports no `api` base (a sparse-index-only
+    /// mirror) can never satisfy this gate. That configuration cannot be
+    /// rejected at startup, because the base is read from the index's own
+    /// `config.json` at request time, so it surfaces here as the same
+    /// unverifiable answer with a reason that names it.
+    async fn age_gate(&self, normalized: &str, entries: &[CargoIndexEntry]) -> AgeGate {
         let Some(min_days) = self
             .config
             .current()
@@ -1024,7 +1100,7 @@ impl CargoScanner {
             .as_ref()
             .and_then(|cargo| cargo.min_release_age_days)
         else {
-            return HashSet::new();
+            return AgeGate::off();
         };
 
         let times = match self.upstream.release_times(normalized).await {
@@ -1033,25 +1109,58 @@ impl CargoScanner {
                 tracing::warn!(
                     package = normalized,
                     error = %err,
-                    "could not fetch release times for the release-age gate; \
-                     skipping it for this request"
+                    "could not fetch release times, so the configured release-age gate \
+                     cannot be evaluated; refusing to forward this listing rather than \
+                     serving it unchecked"
                 );
-                return HashSet::new();
+                return AgeGate::unverifiable(format!(
+                    "the release-age gate is configured but this crate's publication \
+                     dates could not be read from the registry API: {err}"
+                ));
             }
         };
 
         let min_age = chrono::Duration::days(min_days as i64);
         let now = chrono::Utc::now();
-        entries
-            .iter()
-            .filter(|entry| match times.get(&entry.vers) {
-                Some(released) => now.signed_duration_since(*released) < min_age,
-                // No reported creation time for this version: cannot
-                // tell, so it is not flagged.
-                None => false,
-            })
-            .map(|entry| entry.vers.clone())
-            .collect()
+        let mut too_new = HashSet::new();
+        for entry in entries {
+            match times.get(&entry.vers) {
+                Some(released) => {
+                    if now.signed_duration_since(*released) < min_age {
+                        too_new.insert(entry.vers.clone());
+                    }
+                }
+                // The API answered, but reported no publication date for
+                // this one version, so its age is unknown and it is not
+                // flagged.
+                //
+                // This is the one residue of the old best-effort gate,
+                // kept deliberately and scoped as narrowly as it can be.
+                // Failing the whole listing closed here would withhold
+                // every other version over one missing field, and
+                // withholding just this version would have to label it in
+                // the audit log -- where "too-new" would be a lie, since
+                // the age is unknown rather than short, and there is no
+                // honest per-version code for "could not tell" in the
+                // `listed` vocabulary. crates.io reports `created_at` for
+                // every version, so this is a shape a conforming registry
+                // does not produce. If it ever has to be closed, it needs
+                // a reason code of its own carried through the cascade,
+                // not a relabelling of this one.
+                None => {
+                    tracing::warn!(
+                        package = normalized,
+                        version = %entry.vers,
+                        "the registry API reported no publication date for this version, \
+                         so the release-age gate could not evaluate it and it is not flagged"
+                    );
+                }
+            }
+        }
+        AgeGate {
+            too_new,
+            unverifiable: None,
+        }
     }
 
     /// The versions of the crate that the operator has allowlisted.

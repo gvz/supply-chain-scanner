@@ -1182,3 +1182,65 @@ async fn a_failed_audit_write_on_a_cargo_download_returns_500_and_no_bytes() {
         "a write failure must not read as a refusal"
     );
 }
+
+/// The release-age gate used to be best-effort: if the registry API could
+/// not be reached, the gate skipped itself and the listing was forwarded
+/// unchecked. crates.io answers 403 to any request without an identifying
+/// User-Agent, so for a while that was *every* request, and a configured
+/// `min_release_age_days` was silently unenforced with only a WARN to say
+/// so. A gate that cannot run must now withhold the listing.
+///
+/// The status matters as much as the refusal. An empty 200 would tell
+/// cargo this crate has no usable version, which is a claim nothing here
+/// can support; 503 says "cannot verify, try again", which is true and
+/// retryable.
+#[tokio::test]
+async fn an_unevaluable_release_age_gate_makes_the_listing_unverifiable_not_empty() {
+    let server = MockServer::start().await;
+    let name = "demo-crate";
+    let cksum = sha256_hex(b"1.0.0");
+    mount_index(&server, name, &[line("1.0.0", &cksum, false)]).await;
+    // `api` is advertised, so the gate will try the registry API...
+    mount_config_json_with_api(&server).await;
+    // ...but nothing answers `GET /api/v1/crates/{name}`, which is what an
+    // unreachable or refusing API looks like from here.
+
+    let mut cfg = base_config(&server);
+    cfg.cargo_registry.as_mut().unwrap().min_release_age_days = Some(30);
+
+    let (audit_dir, audit) = audit_log_over_tempdir();
+    let harness = start(server, cfg, audit).await;
+
+    let response = reqwest::get(format!("http://{}/{}", harness.addr, index_path_for(name)))
+        .await
+        .expect("request cargo index");
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "a gate that could not be evaluated must answer 503, not serve the listing"
+    );
+    let reason = response
+        .headers()
+        .get("x-scanner-refusal")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_default();
+    let body = response.text().await.expect("read body");
+    assert!(
+        reason.contains("unverifiable:release-age") || body.contains("unverifiable:release-age"),
+        "the refusal must name the gate that could not run; header={reason:?} body={body:?}"
+    );
+    assert!(
+        !body.contains("\"vers\""),
+        "no index entry may be served when the gate did not run: {body:?}"
+    );
+
+    // 503 is "nothing was decided", so it writes no fetch audit line, the
+    // same as an in-progress scan.
+    let lines = read_audit_lines(audit_dir.path(), "audit.jsonl");
+    assert!(
+        lines.is_empty(),
+        "an unverifiable listing reaches no verdict, so it records none: {lines:?}"
+    );
+}

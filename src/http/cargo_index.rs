@@ -76,7 +76,7 @@ use crate::plugin::PluginRunner;
 use crate::scan::cargo::{CargoIndexDecision, CargoScanner};
 
 use super::cargo_download::cargo_download_handler;
-use super::refusal::in_progress_response;
+use super::refusal::{in_progress_response, unverifiable_response};
 use super::{audit_or_500, bad_request_response};
 
 /// Shared state for every handler in this module and for
@@ -309,6 +309,13 @@ pub async fn cargo_index_handler(
         // and not 503. No fetch audit record either: no verdict was
         // reached, so there is nothing yet to describe.
         CargoIndexDecision::InProgress => in_progress_response(),
+        // A configured gate could not be evaluated, so this proxy knows
+        // nothing about any version of this crate. 503 and a reason, not
+        // an empty 200: an empty index would tell cargo the crate has no
+        // usable version, which is a claim nothing here can support. No
+        // fetch audit record, exactly as for `InProgress` -- no verdict
+        // was reached, so there is nothing for a line to describe.
+        CargoIndexDecision::Unverifiable(reason) => unverifiable_response(&reason),
     }
 }
 

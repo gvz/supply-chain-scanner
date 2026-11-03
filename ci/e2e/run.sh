@@ -22,6 +22,13 @@ fi
 ECO="$1"
 IMAGE="${2:-scs-proxy:e2e}"
 NET="scs-e2e-$ECO-$$"
+# A third container owns the network namespace that the stub and the proxy
+# both join. Without it the ordering is circular: the proxy must be running
+# before the stub can join its namespace, but the PyPI path performs its
+# initial advisory sync during startup and refuses to boot when the feed --
+# served by that same stub -- is unreachable. Whoever wins that race decides
+# whether the run works, which is no way to build a test.
+HOLDER="scs-net-$ECO-$$"
 PROXY="scs-proxy-$ECO-$$"
 STUB="scs-stub-$ECO-$$"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,7 +42,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SECURITY_OPTS=(--security-opt seccomp=unconfined --security-opt systempaths=unconfined)
 
 cleanup() {
-  docker rm -f "$PROXY" "$STUB" >/dev/null 2>&1 || true
+  docker rm -f "$PROXY" "$STUB" "$HOLDER" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -43,19 +50,34 @@ trap cleanup EXIT
 start_proxy() {
   local config="$1"
   local stub_verdict="${2:-clean}"
-  docker rm -f "$PROXY" "$STUB" >/dev/null 2>&1 || true
-  docker run -d --name "$PROXY" --network "$NET" --network-alias proxy \
-    "${SECURITY_OPTS[@]}" \
-    -v "$HERE/config/$config:/etc/supply-chain-scanner/config.toml:ro" \
-    "$IMAGE" >/dev/null
-  # The stub joins the proxy's network namespace rather than sitting beside it
-  # on the bridge: the proxy refuses a plaintext http:// reviewer URL unless
-  # the host is loopback, because an API key would otherwise cross the network
-  # in clear text. Sharing the namespace makes 127.0.0.1:9000 that loopback.
-  docker run -d --name "$STUB" --network "container:$PROXY" \
+  docker rm -f "$PROXY" "$STUB" "$HOLDER" >/dev/null 2>&1 || true
+
+  # The holder carries the `proxy` alias and the namespace; the stub and the
+  # proxy are both tenants of it. Sharing a namespace is what makes the stub
+  # loopback to the proxy, which the proxy requires: it refuses a plaintext
+  # http:// reviewer URL unless the host is loopback, since an API key would
+  # otherwise cross the network in clear text.
+  docker run -d --name "$HOLDER" --network "$NET" --network-alias proxy \
+    alpine:3.21 sleep infinity >/dev/null
+
+  # Stub before proxy, and waited for: the proxy's own startup reads the
+  # advisory feed from it.
+  docker run -d --name "$STUB" --network "container:$HOLDER" \
     -e "STUB_VERDICT=$stub_verdict" \
     -v "$HERE/stub_reviewer.py:/stub.py:ro" \
     python:3.13-slim python /stub.py >/dev/null
+  for _ in $(seq 1 60); do
+    if docker run --rm --network "container:$HOLDER" curlimages/curl:latest \
+        -fsS -o /dev/null http://127.0.0.1:9000/healthz 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+
+  docker run -d --name "$PROXY" --network "container:$HOLDER" \
+    "${SECURITY_OPTS[@]}" \
+    -v "$HERE/config/$config:/etc/supply-chain-scanner/config.toml:ro" \
+    "$IMAGE" >/dev/null
 
   for _ in $(seq 1 60); do
     if docker run --rm --network "$NET" curlimages/curl:latest \
@@ -116,7 +138,23 @@ docker network create "$NET" >/dev/null
 
 echo "=== $ECO: positive case, the install must succeed ==="
 start_proxy "$ECO.toml"
-client
+# A first fetch triggers the scan, and a cascade that outruns its budget
+# answers 429 "SCAN IN PROGRESS - please retry shortly". That is the proxy's
+# documented contract, not a failure: the reviews that finished are stored, so
+# a retry resumes rather than restarts. pip and cargo do not retry a 429 at
+# all and npm gives up quickly, so the retry belongs here. Each attempt is a
+# fresh client, exactly as a developer re-running the command would be.
+attempt=0
+until client; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 8 ]; then
+    echo "the install never succeeded after $attempt attempts" >&2
+    docker logs "$PROXY" 2>&1 | tail -30 >&2
+    exit 1
+  fi
+  echo "attempt $attempt did not succeed yet; the scan may still be running, retrying"
+  sleep 15
+done
 # The audit log is the feature this proxy exists to provide; an install that
 # worked but recorded nothing would be a silent hole.
 if [ -z "$(audit_lines)" ]; then

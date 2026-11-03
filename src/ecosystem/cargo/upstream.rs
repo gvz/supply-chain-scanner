@@ -57,6 +57,21 @@ pub enum UpstreamError {
     Other(#[from] anyhow::Error),
 }
 
+/// Identifies this proxy to crates.io, which **requires** it: a request
+/// carrying no User-Agent, or one naming only an HTTP library, is answered
+/// `403 Forbidden` with a body explaining the policy. The sparse index
+/// tolerated the omission, but `release_times` calls the registry API, so
+/// without this the release-age gate could never read a publication date --
+/// it logged "could not fetch release times ... skipping it for this
+/// request" on every crate, and a configured `min_release_age_days` went
+/// quietly unenforced. `crate::cargovet` carries its own, separate agent for
+/// the same reason.
+const USER_AGENT: &str = concat!(
+    "supply-chain-scanner/",
+    env!("CARGO_PKG_VERSION"),
+    " (cargo index and registry API)"
+);
+
 /// The parts of the sparse index's `config.json` this client uses.
 ///
 /// Other fields are ignored: serde drops fields a struct does not
@@ -125,6 +140,7 @@ impl CargoUpstream {
     /// root) with `download_limits` for the `.crate` download path.
     pub fn with_limits(index_base: Url, download_limits: &DownloadLimits) -> anyhow::Result<Self> {
         let index_client = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -136,6 +152,7 @@ impl CargoUpstream {
         // resets on every read. `download_max_duration` bounds the whole
         // call from outside.
         let download_client = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(download_limits.stall_timeout)
             .build()

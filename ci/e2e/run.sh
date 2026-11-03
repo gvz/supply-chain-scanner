@@ -202,16 +202,14 @@ audit_lines | tail -3
 
 echo
 echo "=== $ECO: negative case, the gate must refuse ==="
-# pypi and npm take their age data from the index and the packument, so the
-# release-age gate refuses deterministically there. cargo reads release times
-# from the crates.io API, which answers 403 to this proxy and makes the gate
-# skip itself — so cargo's negative case comes from the AI gate instead, with
-# the stub configured to return a malicious verdict.
-case "$ECO" in
-  cargo) EXPECT_CODE="ai:malicious"; STUB_VERDICT="malicious" ;;
-  *)     EXPECT_CODE="too-new";      STUB_VERDICT="clean" ;;
-esac
-start_proxy "$ECO-blocked.toml" "$STUB_VERDICT"
+# All three now refuse through the release-age gate. cargo reads release times
+# from the crates.io registry API, which used to answer 403 because the client
+# sent no identifying User-Agent -- the gate then skipped itself and forwarded
+# the crate. Driving cargo's negative case through that same gate means this
+# test fails if that regresses. The AI reviewer is still exercised, by the
+# positive npm and cargo cases, which cannot forward a version without it.
+EXPECT_CODE="too-new"
+start_proxy "$ECO-blocked.toml" clean
 if client; then
   echo "the install succeeded while every version should have been too new" >&2
   exit 1

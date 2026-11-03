@@ -39,7 +39,7 @@ jobs:
       # repository exists to stop exactly that class of attack, so its own
       # CI does not float. The trailing comment records which release each
       # SHA was, because the SHA alone is unreadable.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       # No setup-toolchain action: rust-toolchain.toml pins 1.88.0 with
       # rustfmt and clippy, and rustup installs exactly that on the first

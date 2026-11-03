@@ -39,7 +39,17 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # paths break the proc mount. These two relaxations are the minimum that lets
 # the sandbox run; they are a property of running the sandbox under Docker in
 # a test, not a recommendation for production deployment.
-SECURITY_OPTS=(--security-opt seccomp=unconfined --security-opt systempaths=unconfined)
+# seccomp:     Docker's default profile blocks clone(CLONE_NEWUSER).
+# apparmor:    Ubuntu hosts confine unprivileged user namespaces, which shows
+#              up as "bwrap: Failed to make / slave: Permission denied".
+# systempaths: Docker masks paths under /proc, which breaks the proc mount.
+# All three are properties of running this sandbox under Docker in a test,
+# not a recommendation for a production deployment.
+SECURITY_OPTS=(
+  --security-opt seccomp=unconfined
+  --security-opt apparmor=unconfined
+  --security-opt systempaths=unconfined
+)
 
 cleanup() {
   docker rm -f "$PROXY" "$STUB" "$HOLDER" >/dev/null 2>&1 || true
@@ -83,12 +93,38 @@ start_proxy() {
     if docker run --rm --network "$NET" curlimages/curl:latest \
         -fsS -o /dev/null http://proxy:8080/healthz 2>/dev/null; then
       echo "proxy healthy ($config)"
+      check_sandbox
       return 0
     fi
     sleep 1
   done
   echo "proxy did not become healthy with $config" >&2
   docker logs "$PROXY" >&2 || true
+  return 1
+}
+
+# npm cannot forward anything without a reviewer, and the reviewer's
+# collector runs under bubblewrap. If the sandbox cannot start, every review
+# comes back "unverifiable" and the proxy answers 429 forever -- correct
+# fail-closed behaviour, but indistinguishable from a slow scan unless we look.
+# Probing once up front turns eleven minutes of doomed retries into one clear
+# message naming the cause.
+check_sandbox() {
+  case "$ECO" in
+    pypi) return 0 ;;  # no reviewer, no sandbox needed
+  esac
+  if docker exec "$PROXY" bwrap --unshare-all --dev-bind / / /bin/true 2>/tmp/bwrap.err; then
+    echo "sandbox usable (bubblewrap can unshare and remount)"
+    return 0
+  fi
+  echo "the sandbox cannot run in this container, so no review can ever complete:" >&2
+  sed 's/^/  /' /tmp/bwrap.err >&2 || true
+  cat >&2 <<'MSG'
+  On an Ubuntu host this is usually the AppArmor restriction on unprivileged
+  user namespaces. Either relax it on the host:
+      sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+  or run the proxy container with --privileged.
+MSG
   return 1
 }
 
@@ -147,13 +183,13 @@ start_proxy "$ECO.toml"
 attempt=0
 until client; do
   attempt=$((attempt + 1))
-  if [ "$attempt" -ge 8 ]; then
+  if [ "$attempt" -ge 4 ]; then
     echo "the install never succeeded after $attempt attempts" >&2
     docker logs "$PROXY" 2>&1 | tail -30 >&2
     exit 1
   fi
   echo "attempt $attempt did not succeed yet; the scan may still be running, retrying"
-  sleep 15
+  sleep 20
 done
 # The audit log is the feature this proxy exists to provide; an install that
 # worked but recorded nothing would be a silent hole.

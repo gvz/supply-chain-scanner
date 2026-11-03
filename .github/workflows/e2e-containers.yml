@@ -55,6 +55,18 @@ jobs:
       - name: Build the proxy image
         run: docker build -t scs-proxy:e2e .
 
+      # The reviewer's collector runs under bubblewrap, which needs an
+      # unprivileged user namespace. GitHub's Ubuntu images confine those with
+      # AppArmor, which surfaces inside the container as
+      # "bwrap: Failed to make / slave: Permission denied". Relaxing it on the
+      # runner is the documented remedy and is scoped to this ephemeral VM.
+      - name: Allow unprivileged user namespaces
+        run: |
+          set -eux
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || \
+            echo "could not relax the restriction; the sandbox probe will report if it matters"
+
       # Every leg runs even if an earlier one fails: knowing that pip passes
       # while npm does not is the useful outcome, and stopping at the first
       # failure hides it.

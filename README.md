@@ -86,4 +86,31 @@ cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
 
 ## Status
 
-Python/PyPI is the only supported ecosystem. Tasks 1–11 of the implementation plan are built and tested. The HTTP router wiring (task 12) is not implemented yet — see the [roadmap chapter](docs/book/src/roadmap.md).
+All three ecosystems serve traffic. A PyPI deployment answers the PEP 503 simple
+index and artifact downloads; a cargo deployment answers the sparse index and
+`.crate` downloads; an npm deployment answers the packument and tarball
+downloads. One process serves exactly one ecosystem. Every fetch and every
+withheld version is recorded in the [audit log](https://gvz.github.io/supply-chain-scanner/audit-log.html),
+with the client address that asked.
+
+CI runs the full gate on every push and pull request, builds `.deb` packages for
+Debian 12 and 13 and Ubuntu 26.04 and 26.10, publishes the book, and — for each
+of the three ecosystems — installs a real package from the real registry through
+a proxy container, then asserts the install fails when the gate is configured to
+refuse.
+
+Known limitations, in rough order of how likely they are to matter:
+
+- **`SIGHUP` configuration reload is a PyPI-path feature.** A cargo or npm
+  deployment logs a warning at startup saying so; changing its configuration
+  needs a restart.
+- **The `.deb` packages carry no systemd unit and no service user**, and are
+  built for amd64 only. They install the binary, the example configuration and
+  the docs; wiring it up as a service is still the operator's job.
+- **On cargo, a version whose publication date the registry omits is not
+  age-checked.** A gate that cannot be evaluated at all now withholds the whole
+  listing, but this one narrow case stays permissive — see the release-age
+  section of [`docs/operations.md`](docs/operations.md) for why.
+- **The [roadmap chapter](docs/book/src/roadmap.md) is out of date.** It
+  describes the state of the original PyPI-only plan and predates the cargo, npm
+  and audit-log work; read it as history, not as a list of what is missing.

@@ -111,6 +111,7 @@ Known limitations, in rough order of how likely they are to matter:
   age-checked.** A gate that cannot be evaluated at all now withholds the whole
   listing, but this one narrow case stays permissive — see the release-age
   section of [`docs/operations.md`](docs/operations.md) for why.
-- **The [roadmap chapter](docs/book/src/roadmap.md) is out of date.** It
-  describes the state of the original PyPI-only plan and predates the cargo, npm
-  and audit-log work; read it as history, not as a list of what is missing.
+
+The [roadmap chapter](docs/book/src/roadmap.md) carries the full list: what is
+built, what is deliberately not built, the known gaps inside what is built, and
+where the documentation is still thin.

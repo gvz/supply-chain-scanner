@@ -47,7 +47,7 @@
           <mxGeometry x="500" y="255" width="360" height="24" as="geometry" />
         </mxCell>
 
-        <mxCell id="g1" value="1. Release age&#10;(best effort)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
+        <mxCell id="g1" value="1. Release age" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
           <mxGeometry x="500" y="285" width="112" height="62" as="geometry" />
         </mxCell>
         <mxCell id="g2" value="2. CVE line&#10;(OSV mirror)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=center;" vertex="1" parent="1">
